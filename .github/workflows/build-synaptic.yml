@@ -28,8 +28,13 @@ jobs:
         run: cargo build --release --target aarch64-unknown-linux-gnu
       - name: Build release (aarch64 musl cross)
         run: |
-          curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/musl-cross.tgz
+          # 交叉 C 工具链：musl.cc 原站 + more.musl.cc 镜像多源尝试（原站曾超时）
+          for url in https://more.musl.cc/aarch64-linux-musl-cross.tgz https://musl.cc/aarch64-linux-musl-cross.tgz; do
+            echo "try: $url"
+            curl -sL --connect-timeout 15 --max-time 150 "$url" -o /tmp/musl-cross.tgz && tar tzf /tmp/musl-cross.tgz >/dev/null 2>&1 && break
+          done
           tar xzf /tmp/musl-cross.tgz -C /opt
+          ls /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc  # 验证工具链就位
           export PATH="/opt/aarch64-linux-musl-cross/bin:$PATH"
           export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
           export AR_aarch64_unknown_linux_musl=aarch64-linux-musl-ar
