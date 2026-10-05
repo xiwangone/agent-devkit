@@ -27,10 +27,15 @@ jobs:
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --target aarch64-unknown-linux-gnu
       - name: Build release (aarch64 musl cross)
+        # cross 容器内 glibc 较老（< 2.30），stable Rust（1.87+）编出的 build script
+        # 需要 GLIBC_2.30+ 而跑不起来；此步固定用 Rust 1.85（产物兼容老 glibc）
         run: |
-          # cross 容器（镜像是 ghcr.io/cross-rs/aarch64-unknown-linux-musl，预装 musl 交叉工具链）
-          cargo install cross --locked
+          rustup toolchain install 1.85 --profile minimal
+          rustup target add aarch64-unknown-linux-musl --toolchain 1.85
+          cargo +1.85 install cross --locked
+          rustup override set 1.85
           cross build --release --target aarch64-unknown-linux-musl
+          rustup override unset
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
