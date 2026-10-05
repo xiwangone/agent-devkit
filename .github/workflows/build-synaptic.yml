@@ -1,20 +1,40 @@
 name: build-synaptic
-# CI 构建 Synaptic 二进制（x86_64 + aarch64 交叉编译，产物上传 artifact）
+# CI 构建 Synaptic 二进制（x86_64 + aarch64 交叉编译）。
+#   始终：上传 artifact（30 天）
+#   手动触发且填了 release_tag 时：编译完**直接创建 Release 并上传资产** —— 全程在 CI 内网完成，
+#   不经任何人的上行带宽（比"下载 artifact 再手动 gh release create"快且可复现）。
 on:
   push:
     branches: [main]
     paths:
       - '.github/workflows/build-synaptic.yml'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '填了 → 编译后创建该 tag 的 Release 并上传资产（例 synaptic-v1.2.2）；留空 → 只产 artifact'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
 
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           repository: synaptic-graph/synaptic
           ref: master
+      - name: Read version
+        id: ver
+        run: |
+          V="$(sed -nE 's/^version *= *"(.*)"/\1/p' Cargo.toml | head -1)"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "synaptic version: ${V:-unknown}"
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Add targets + linker
@@ -47,3 +67,34 @@ jobs:
             target/aarch64-unknown-linux-gnu/release/synaptic
             target/aarch64-unknown-linux-musl/release/synaptic
           retention-days: 30
+
+  release:
+    needs: build-linux
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: synaptic-linux-binaries
+          path: art
+      - name: Prepare assets
+        run: |
+          set -euo pipefail
+          VER="${{ needs.build-linux.outputs.version }}"
+          [ -n "$VER" ] || VER=unknown
+          mkdir -p rel
+          cp art/release/synaptic                             "rel/synaptic-${VER}-x86_64-unknown-linux-gnu"
+          cp art/aarch64-unknown-linux-musl/release/synaptic   "rel/synaptic-${VER}-aarch64-unknown-linux-musl"
+          cp art/aarch64-unknown-linux-gnu/release/synaptic    "rel/synaptic-${VER}-aarch64-unknown-linux-gnu"
+          chmod +x rel/*
+          ls -lh rel/
+          echo "VER=$VER" >> "$GITHUB_ENV"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.release_tag }}" rel/* \
+            --repo "${{ github.repository }}" \
+            --title "Synaptic ${VER} (Linux binaries)" \
+            --notes-file .github/synaptic-release-notes.md
