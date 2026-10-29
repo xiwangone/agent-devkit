@@ -1,0 +1,58 @@
+name: build-rtk
+# 构建 rtk（命令输出压缩 CLI）的 aarch64-musl 静态二进制，供 Alpine 沙箱直接使用。
+#   上游只发 aarch64-unknown-linux-gnu（musl 仅 x86_64），gnu 版在 musl 上缺 fcntl64/__res_init。
+#   只上传 artifact（30 天），**不建 Release**：rtk 的 engine 是 BUSL-1.1，二进制只供自己设备取用。
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-rtk.yml'
+  workflow_dispatch:
+    inputs:
+      rtk_ref:
+        description: 'rtk 源码 tag（默认 v1.1.0）'
+        required: false
+        type: string
+        default: 'v1.1.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build-aarch64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: rtk-ai/rtk
+          ref: ${{ inputs.rtk_ref || 'v1.1.0' }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build (aarch64 musl)
+        # cross 的 :main 镜像基座更新（旧镜像 glibc 太老，build script 跑不起来）
+        env:
+          CROSS_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_IMAGE: ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
+        run: cross build --release -p rtk --target aarch64-unknown-linux-musl
+
+      - name: Verify static binary
+        run: |
+          BIN=target/aarch64-unknown-linux-musl/release/rtk
+          file "$BIN"
+          ls -lh "$BIN"
+          sha256sum "$BIN" | tee rtk.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rtk-aarch64-musl
+          path: |
+            target/aarch64-unknown-linux-musl/release/rtk
+            rtk.sha256
+          retention-days: 30
