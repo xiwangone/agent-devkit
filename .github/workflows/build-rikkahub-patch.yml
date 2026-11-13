@@ -116,7 +116,10 @@ jobs:
         run: df -h .
 
       - name: 编译 + 单测
+        # 必须加 pipefail：没有它，`./gradlew ... | tee 日志` 的退出码是 tee 的 0，
+        # Gradle 失败也会被吞成 job 成功（2026-11-13 首跑实测：BUILD FAILED 却报 success）。
         run: |
+          set -o pipefail
           ./gradlew ${GRADLE_TASKS} --no-daemon --no-configuration-cache -x :web:buildWebUi -Pkotlin.compiler.execution.strategy=in-process --max-workers=2 2>&1 | tee gradle-verify.log
 
       - name: 磁盘用量（跑后）
