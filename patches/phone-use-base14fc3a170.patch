@@ -1,0 +1,2702 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index e6dbd6055..96663e464 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -437,6 +437,8 @@ dependencies {
+ 
+     // tests
+     testImplementation(libs.junit)
++    // runTest with virtual time for suspending tool tests (PhoneUseToolTest).
++    testImplementation(libs.kotlinx.coroutines.test)
+     // Robolectric：在 host JVM（PC）上跑 Android framework 相关逻辑——WebView 回调、文件落盘、Log，
+     // 不必连设备或模拟器。用 @Config(sdk = [34]) 钉住 android-all 镜像版本。
+     testImplementation(libs.robolectric)
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 365c32813..1de65552c 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -353,6 +353,21 @@
+         android:resource="@xml/accessibility_service_config" />
+     </service>
+ 
++    <!-- Phone Use：只在 Android 11 及以上启用，系统的无障碍设置里才会出现这一项 -->
++    <service
++      android:name=".phoneuse.PhoneUseAccessibilityService"
++      android:enabled="@bool/phone_use_supported"
++      android:exported="true"
++      android:label="@string/phone_use_accessibility_label"
++      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
++      <intent-filter>
++        <action android:name="android.accessibilityservice.AccessibilityService" />
++      </intent-filter>
++      <meta-data
++        android:name="android.accessibilityservice"
++        android:resource="@xml/phone_use_accessibility" />
++    </service>
++
+     <service
+       android:name=".service.RikkaNotificationListenerService"
+       android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt
+index 3d6f7859e..80bff8cc6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt
+@@ -52,6 +52,7 @@ object LocalToolCatalog {
+                     LocalToolOption.AppLauncher,
+                     LocalToolOption.SystemIntents,
+                     LocalToolOption.ScreenAutomation,
++                    LocalToolOption.PhoneUse,
+                     LocalToolOption.Notification,
+                     LocalToolOption.NotificationListener,
+                 ),
+@@ -188,6 +189,7 @@ object LocalToolCatalog {
+             LocalToolOption.Shizuku -> R.string.mcp_tool_shizuku
+             LocalToolOption.TelegramBot -> R.string.mcp_tool_telegram_bot
+             LocalToolOption.ScreenAutomation -> R.string.mcp_tool_screen_automation
++            LocalToolOption.PhoneUse -> R.string.mcp_tool_phone_use
+             LocalToolOption.AppLauncher -> R.string.mcp_tool_app_launcher
+             LocalToolOption.Termux -> R.string.mcp_tool_termux
+             LocalToolOption.NotificationListener -> R.string.mcp_tool_notification_listener
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolOption.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolOption.kt
+index f38cd7b16..7177610d6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolOption.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolOption.kt
+@@ -95,6 +95,7 @@ sealed class LocalToolOption {
+     @Serializable @SerialName("browser")             data object Browser            : LocalToolOption()
+     @Serializable @SerialName("web_fetch")           data object WebFetch           : LocalToolOption()
+     @Serializable @SerialName("chart_display")       data object ChartDisplay       : LocalToolOption()
++    @Serializable @SerialName("phone_use")           data object PhoneUse           : LocalToolOption()
+ 
+     // Phase 25 — Phase 3 second cut + ExternalStorage + Archive.
+     @Serializable @SerialName("sms_send")             data object SmsSend             : LocalToolOption()
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+index 4fa9315ac..f502c16c1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+@@ -4,6 +4,7 @@ import android.content.Context
+ import kotlinx.serialization.json.add
+ import me.rerere.ai.core.Tool
+ import me.rerere.rikkahub.data.ai.tools.local.BiometricResultBuffer
++import me.rerere.rikkahub.data.ai.tools.local.buildPhoneUseTool
+ import me.rerere.rikkahub.data.ai.tools.local.CameraResultBuffer
+ import me.rerere.rikkahub.data.ai.tools.local.InteractiveToolStreamer
+ import me.rerere.rikkahub.data.ai.tools.local.buildChartDisplayTool
+@@ -100,6 +101,10 @@ import me.rerere.rikkahub.data.ai.tools.local.batchMoveTool
+ import me.rerere.rikkahub.data.ai.tools.local.batchDeleteTool
+ import me.rerere.rikkahub.data.ai.tools.local.webFetchTool
+ import me.rerere.rikkahub.data.event.AppEventBus
++import me.rerere.rikkahub.data.files.FilesManager
++import me.rerere.rikkahub.phoneuse.PhoneUseManager
++import me.rerere.rikkahub.phoneuse.isFloatingChatWindowOn
++import org.koin.core.context.GlobalContext
+ 
+ 
+ class LocalTools(
+@@ -164,6 +169,23 @@ class LocalTools(
+     val ttsTool by lazy { buildTtsTool(eventBus) }
+     val askUserTool by lazy { buildAskUserTool() }
+ 
++    val phoneUseTool by lazy {
++        buildPhoneUseTool(
++            ownPackageName = context.packageName,
++            manager = PhoneUseManager,
++            isFloatingWindowOn = { isFloatingChatWindowOn(context, settingsStore.settingsFlow.value) },
++            saveScreenshot = { bytes ->
++                // FilesManager 不在构造函数里注入：参数表已由 detekt 基线按完整签名登记，
++                // 加参数会失配；工具首次使用时再从 Koin 取单例。
++                GlobalContext.get().get<FilesManager>().createChatFilesByByteArrays(
++                    byteArrays = listOf(bytes),
++                    displayName = "screenshot.jpg",
++                    mimeType = "image/jpeg",
++                ).first().toString()
++            },
++        )
++    }
++
+     // 拆分为域分组函数，拼接顺序与原来完全一致，仅为满足行数限制。
+     private fun toolRegistry(): List<ToolEntry> =
+         coreDeviceToolEntries() +
+@@ -341,6 +363,12 @@ class LocalTools(
+         tools.add(takeScreenshotTool(context)) // take_screenshot IS the screenshot; skip auto-stream
+         tools.add(me.rerere.rikkahub.data.ai.tools.local.wakeScreenTool(context))
+     },
++    ToolEntry(LocalToolOption.PhoneUse) { tools, _ ->
++        // 不支持的系统版本上，之前在别处开过（比如导入的备份）也不提供
++        if (PhoneUseManager.isSupported) {
++            tools.add(phoneUseTool)
++        }
++    },
+     ToolEntry(LocalToolOption.AppLauncher) { tools, invocationContext ->
+         tools.add(me.rerere.rikkahub.data.ai.tools.local.launchAppTool(context, invocationContext, interactiveToolStreamer))
+         tools.add(me.rerere.rikkahub.data.ai.tools.local.listInstalledAppsTool(context))
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt
+index 8b686f6eb..ffb42a561 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt
+@@ -77,6 +77,7 @@ object ToolApprovalDefaults {
+         "click_node",
+         "click_and_read",  // click + post-click tree read: same side effect as click_node
+         "global_action",
++        "phone_use",       // operates other apps through its own accessibility service; same trust footprint as tap
+         "launch_app",
+         "launch_activity",   // launches a specific activity, same trust footprint as launch_app
+         "open_url",          // can dial tel:, draft mailto:, hand a URI to any app
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BlockedApps.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BlockedApps.kt
+new file mode 100644
+index 000000000..79540b922
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BlockedApps.kt
+@@ -0,0 +1,43 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import kotlinx.serialization.json.JsonObject
++import me.rerere.rikkahub.data.ai.tools.ToolErrors
++import me.rerere.rikkahub.service.RikkaAccessibilityService
++
++/**
++ * 不允许 AI 操作的应用：支付和银行类。
++ * Phone Use 与散工具（tap、find_node 等）共用同一份名单：这些应用不能打开、不能读屏、
++ * 不能操作，只能返回或回到桌面。
++ */
++internal val PHONE_USE_BLOCKED_APPS = setOf(
++    "com.eg.android.AlipayGphone", // 支付宝
++    "com.unionpay", // 云闪付
++    "com.tencent.mm", // 微信
++    "com.paypal.android.p2pmobile", // PayPal
++    "com.google.android.apps.walletnfcrel", // Google Wallet
++    "com.google.android.apps.nbu.paisa.user", // Google Pay
++    "com.icbc", // 工商银行
++    "com.chinamworld.main", // 建设银行
++    "com.android.bankabc", // 农业银行
++    "com.chinamworld.bocmbci", // 中国银行
++    "com.bankcomm.Bankcomm", // 交通银行
++    "cmb.pb", // 招商银行
++    "com.yitong.mbank.psbc", // 邮储银行
++)
++
++internal fun isBlockedAutomationApp(packageName: String?): Boolean = packageName in PHONE_USE_BLOCKED_APPS
++
++/**
++ * 前台应用在禁止列表里时返回拒绝信封，否则返回 null。散工具在执行前调用。
++ * 无障碍服务没连接时拿不到前台包名，不拦截，交给各工具自己的服务未开启处理。
++ */
++internal fun blockedForegroundEnvelope(): JsonObject? {
++    val foreground =
++        RikkaAccessibilityService.instance?.rootInActiveWindow?.packageName?.toString() ?: return null
++    if (!isBlockedAutomationApp(foreground)) return null
++    return ToolErrors.envelopeFor(
++        error = "blocked_app",
++        message = "$foreground is blocked for safety: you cannot read or operate anything while it is in the foreground.",
++        recovery = "Press back or home to leave $foreground, and tell the user to finish this step themselves.",
++    )
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CompoundUiTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CompoundUiTools.kt
+index 0c1b66904..efd31a1cc 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CompoundUiTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CompoundUiTools.kt
+@@ -59,6 +59,7 @@ fun clickAndReadTool(
+     """.trimIndent().replace("\n", " "),
+     parameters = { clickAndReadParameters() },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         AgentTurnTracker.recordAutomationAction()
+         RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val (by, value, pkgFilter) = parseSelector(input)
+@@ -288,6 +289,7 @@ fun waitForTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         val (by, value, pkgFilter) = parseSelector(input)
+         val timeoutMs = input.jsonObject["timeout_ms"]?.jsonPrimitive?.longOrNull ?: WAIT_FOR_DEFAULT_TIMEOUT_MS
+         val intervalMs = input.jsonObject["interval_ms"]?.jsonPrimitive?.longOrNull ?: WAIT_FOR_DEFAULT_INTERVAL_MS
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
+index e13670d2f..142a9cb43 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
+@@ -60,7 +60,7 @@ fun findNodeTool(
+         Find accessibility nodes in the active window matching a selector. by: text |
+         content_description | view_id_resource_name. Returns {matches: [...]} with at most 50
+         node summaries. Use read_window_tree first to see what's available, then this for
+-        targeted lookups.
++        targeted lookups. Prefer phone_use for everyday phone operation.
+     """.trimIndent().replace("\n", " "),
+     parameters = {
+         InputSchema.Obj(
+@@ -83,6 +83,7 @@ fun findNodeTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val (by, value, pkgFilter) = parseSelector(input)
+         if (by == null || by !in ALLOWED_BY || value == null) {
+@@ -154,6 +155,7 @@ fun clickNodeTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         AgentTurnTracker.recordAutomationAction()
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val (by, value, pkgFilter) = parseSelector(input)
+@@ -267,6 +269,7 @@ fun setTextTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         AgentTurnTracker.recordAutomationAction()
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val (by, value, pkgFilter) = parseSelector(input)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/PhoneUseTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/PhoneUseTool.kt
+new file mode 100644
+index 000000000..e46b945e3
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/PhoneUseTool.kt
+@@ -0,0 +1,413 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.ProcessLifecycleOwner
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.coroutines.withContext
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.add
++import kotlinx.serialization.json.buildJsonArray
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.contentOrNull
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import kotlinx.serialization.json.put
++import me.rerere.ai.core.InputSchema
++import me.rerere.ai.core.Tool
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.phoneuse.PhoneController
++import me.rerere.rikkahub.phoneuse.PhoneElement
++import me.rerere.rikkahub.phoneuse.PhoneKey
++import me.rerere.rikkahub.phoneuse.PhoneScreen
++import me.rerere.rikkahub.phoneuse.PhoneUseManager
++import java.util.Locale
++
++const val PHONE_USE_TOOL_NAME = "phone_use"
++
++// 坐标统一用 0-1000 的网格：截图发给模型前会被缩放，像素坐标对不上
++private const val GRID = 1000
++
++// 悬浮窗收到通知后要过一帧才真正从屏幕上消失
++private const val OVERLAY_HIDE_MS = 120L
++
++// 操作之后等界面稳定再读屏幕，结果直接带回新界面，省掉模型再调一次 observe
++private const val SETTLE_MS = 800L
++private const val OPEN_APP_SETTLE_MS = 1500L
++private const val TAP_MS = 60L
++private const val LONG_PRESS_MS = 700L
++private const val SWIPE_MS = 350L
++private const val SCREENSHOT_MAX_SIDE = 1568
++
++private val ACTIONS = listOf(
++    "observe", "screenshot", "tap", "long_press", "swipe", "scroll", "type", "press", "open_app", "list_apps", "wait",
++)
++
++/** 悬浮窗和通知里显示当前在做哪个动作；参数还在流式输出时解析不出来，返回 null */
++fun phoneUseActionOf(input: String): String? = runCatching {
++    Json.parseToJsonElement(input).jsonObject["action"]?.jsonPrimitive?.contentOrNull
++}.getOrNull()
++
++/**
++ * [saveScreenshot] 把 JPEG 存成聊天文件并返回地址；[isSelfInForeground] 判断本应用是否在前台，单测里替换。
++ */
++internal fun buildPhoneUseTool(
++    ownPackageName: String,
++    manager: PhoneUseManager,
++    saveScreenshot: (ByteArray) -> String,
++    isFloatingWindowOn: () -> Boolean,
++    isSelfInForeground: suspend () -> Boolean = ::isAppInForeground,
++): Tool {
++    val session = PhoneUseSession(ownPackageName, manager, saveScreenshot, isFloatingWindowOn, isSelfInForeground)
++    return Tool(
++        name = "phone_use",
++        description = """
++            Operate the user's Android phone: read the screen, tap, swipe, type and open apps.
++            Workflow: open_app (or press home) first, then observe to get the on-screen elements, then act.
++            Every action that changes the screen returns the new element list, so you rarely need to call observe again.
++            Prefer targeting elements by their index from the latest element list; indexes are only valid for that list.
++            Coordinates are on a $GRID x $GRID grid: (0,0) is the top-left of the screen and ($GRID,$GRID) the bottom-right,
++            in both the element list and screenshots.
++            Use screenshot only when the element list is not enough (images, canvas, games, custom views).
++            This app itself cannot be operated; leave it with open_app or press home before acting.
++            Payment and banking apps are blocked: you cannot open, read or operate them. If a task ends up in one,
++            press back or home and tell the user to finish that step themselves.
++            Stop and ask the user before irreversible steps such as paying, sending messages or deleting data,
++            unless they already told you to do exactly that.
++            For everyday phone operation prefer this tool over the pixel-coordinate tools (tap, find_node, take_screenshot);
++            those are only for cases that need precise positioning.
++        """.trimIndent().replace("\n", " "),
++        parameters = {
++            InputSchema.Obj(
++                properties = buildJsonObject {
++                    put("action", buildJsonObject {
++                        put("type", "string")
++                        put("enum", buildJsonArray { ACTIONS.forEach { add(it) } })
++                        put(
++                            "description",
++                            "observe: list on-screen elements. screenshot: capture the screen as an image. " +
++                                "tap / long_press: on 'element' or at 'x','y'. " +
++                                "swipe: drag from 'x','y' to 'to_x','to_y'. " +
++                                "scroll: scroll the content in 'direction', optionally inside 'element'. " +
++                                "type: replace the text of an input field ('element', or the focused field) with 'text'. " +
++                                "press: press 'key'. open_app: launch an app by 'app' (name or package). " +
++                                "list_apps: list installed apps. wait: wait 'seconds' for loading."
++                        )
++                    })
++                    put("element", buildJsonObject {
++                        put("type", "integer")
++                        put("description", "Element index from the latest element list")
++                    })
++                    put("x", buildJsonObject { put("type", "number"); put("description", "0-$GRID") })
++                    put("y", buildJsonObject { put("type", "number"); put("description", "0-$GRID") })
++                    put("to_x", buildJsonObject { put("type", "number"); put("description", "0-$GRID, swipe end") })
++                    put("to_y", buildJsonObject { put("type", "number"); put("description", "0-$GRID, swipe end") })
++                    put("direction", buildJsonObject {
++                        put("type", "string")
++                        put("enum", buildJsonArray { listOf("up", "down", "left", "right").forEach { add(it) } })
++                        put("description", "For scroll: 'down' reveals content further down the page")
++                    })
++                    put("text", buildJsonObject { put("type", "string"); put("description", "Text for type") })
++                    put("submit", buildJsonObject {
++                        put("type", "boolean")
++                        put("description", "For type: press enter afterwards (search, send)")
++                    })
++                    put("key", buildJsonObject {
++                        put("type", "string")
++                        put("enum", buildJsonArray { PhoneKey.entries.forEach { add(it.name.lowercase(Locale.ROOT)) } })
++                    })
++                    put("app", buildJsonObject {
++                        put("type", "string")
++                        put("description", "App name or package name for open_app")
++                    })
++                    put("seconds", buildJsonObject { put("type", "number"); put("description", "For wait, up to 10") })
++                },
++                required = listOf("action"),
++            )
++        },
++        execute = { session.execute(it.jsonObject) },
++    )
++}
++
++private suspend fun isAppInForeground(): Boolean = withContext(Dispatchers.Main) {
++    ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
++}
++
++private class PhoneUseSession(
++    private val ownPackageName: String,
++    private val manager: PhoneUseManager,
++    private val saveScreenshot: (ByteArray) -> String,
++    private val isFloatingWindowOn: () -> Boolean,
++    private val isSelfInForeground: suspend () -> Boolean,
++) {
++    // 模型可能一次发出多个调用，手势和元素编号都依赖顺序
++    private val mutex = Mutex()
++
++    // 元素编号和坐标换算都以模型最后看到的那份为准
++    private var lastScreen: PhoneScreen? = null
++
++    suspend fun execute(params: JsonObject): List<UIMessagePart> = mutex.withLock {
++        // 开启工具时已经要求过，这里防的是之后又把悬浮窗或它的权限关掉
++        check(isFloatingWindowOn()) {
++            "The background floating window is turned off, so the user cannot watch or stop you. " +
++                "Ask them to turn it on in Settings > Notifications (and grant the overlay permission) first."
++        }
++        val controller = manager.controller.value ?: error(
++            "Phone Use is not enabled. Ask the user to turn on \"RikkaHub Phone Use\" in the system accessibility settings."
++        )
++        when (val action = params.string("action") ?: error("action is required")) {
++            "list_apps" -> listApps(controller)
++
++            "open_app" -> openApp(controller, params)
++
++            "wait" -> waitAndDescribe(controller, params)
++
++            "press" -> press(controller, params)
++
++            "observe" -> {
++                ensureOperable(controller)
++                text(describeCurrent(controller))
++            }
++
++            "screenshot" -> screenshot(controller)
++
++            "tap", "long_press" -> tapOrLongPress(controller, params, action)
++
++            "swipe" -> swipe(controller, params)
++
++            "scroll" -> scroll(controller, params)
++
++            "type" -> type(controller, params)
++
++            else -> error("unknown action: $action, must be one of $ACTIONS")
++        }
++    }
++
++    private suspend fun listApps(controller: PhoneController): List<UIMessagePart> = text(
++        controller.listApps()
++            .filterNot { it.packageName in PHONE_USE_BLOCKED_APPS }
++            .joinToString("\n") { "${it.label} (${it.packageName})" }
++    )
++
++    private suspend fun openApp(controller: PhoneController, params: JsonObject): List<UIMessagePart> {
++        val app = resolveApp(controller, params.string("app") ?: error("app is required"))
++        check(app.packageName != ownPackageName) { "This app itself cannot be operated." }
++        check(app.packageName !in PHONE_USE_BLOCKED_APPS) {
++            "${app.label} is blocked for safety. Tell the user to do this step themselves."
++        }
++        check(controller.openApp(app.packageName)) { "Failed to open ${app.label}" }
++        delay(OPEN_APP_SETTLE_MS)
++        return text("Opened ${app.label}.\n" + describeCurrent(controller))
++    }
++
++    private suspend fun waitAndDescribe(controller: PhoneController, params: JsonObject): List<UIMessagePart> {
++        delay(((params.number("seconds") ?: 2.0).coerceIn(0.5, 10.0) * 1000).toLong())
++        return text(describeCurrent(controller))
++    }
++
++    private suspend fun press(controller: PhoneController, params: JsonObject): List<UIMessagePart> {
++        val key = params.string("key")?.let { name -> PhoneKey.entries.find { it.name.equals(name, true) } }
++            ?: error("key must be one of ${PhoneKey.entries.joinToString { it.name.lowercase(Locale.ROOT) }}")
++        when (key) {
++            // 回到桌面是离开本应用和被禁应用的办法
++            PhoneKey.HOME -> {}
++            // 返回也能离开被禁的应用，但本应用在前台时会落在本应用上
++            PhoneKey.BACK -> ensureNotSelf()
++            else -> ensureOperable(controller)
++        }
++        return act(controller, "press ${key.name.lowercase(Locale.ROOT)}") { controller.pressKey(key) }
++    }
++
++    private suspend fun screenshot(controller: PhoneController): List<UIMessagePart> {
++        ensureOperable(controller)
++        val screen = capture(controller)
++        val bytes = hidingOverlays { controller.screenshot(SCREENSHOT_MAX_SIDE) }
++        return listOf(
++            UIMessagePart.Image(url = saveScreenshot(bytes)),
++            UIMessagePart.Text(
++                "Screenshot of ${screen.appName()}. Locate points on a $GRID x $GRID grid: " +
++                    "x = horizontal position / image width * $GRID, y = vertical position / image height * $GRID."
++            ),
++        )
++    }
++
++    private suspend fun tapOrLongPress(
++        controller: PhoneController,
++        params: JsonObject,
++        action: String,
++    ): List<UIMessagePart> {
++        ensureOperable(controller)
++        val (x, y) = targetPoint(controller, params)
++        val duration = if (action == "tap") TAP_MS else LONG_PRESS_MS
++        return act(controller, action) { controller.gesture(x, y, x, y, duration) }
++    }
++
++    private suspend fun swipe(controller: PhoneController, params: JsonObject): List<UIMessagePart> {
++        ensureOperable(controller)
++        val screen = lastScreen ?: capture(controller)
++        val (fromX, fromY) = targetPoint(controller, params)
++        val toX = screen.gridToX(params.number("to_x") ?: error("to_x is required"))
++        val toY = screen.gridToY(params.number("to_y") ?: error("to_y is required"))
++        return act(controller, "swipe") { controller.gesture(fromX, fromY, toX, toY, SWIPE_MS) }
++    }
++
++    private suspend fun scroll(controller: PhoneController, params: JsonObject): List<UIMessagePart> {
++        ensureOperable(controller)
++        val screen = lastScreen ?: capture(controller)
++        val area = params.int("element")?.let { screen.element(it) }
++        val left = area?.left ?: 0
++        val top = area?.top ?: 0
++        val width = area?.let { it.right - it.left } ?: screen.width
++        val height = area?.let { it.bottom - it.top } ?: screen.height
++        val centerX = left + width / 2f
++        val centerY = top + height / 2f
++        // 手指移动方向和内容滚动方向相反；只滑中间一段，避开屏幕边缘的系统手势
++        val dx = width * 0.3f
++        val dy = height * 0.3f
++        val (fromX, fromY, toX, toY) = when (params.string("direction") ?: "down") {
++            "down" -> listOf(centerX, centerY + dy, centerX, centerY - dy)
++            "up" -> listOf(centerX, centerY - dy, centerX, centerY + dy)
++            "right" -> listOf(centerX + dx, centerY, centerX - dx, centerY)
++            "left" -> listOf(centerX - dx, centerY, centerX + dx, centerY)
++            else -> error("direction must be one of up, down, left, right")
++        }
++        return act(controller, "scroll") { controller.gesture(fromX, fromY, toX, toY, SWIPE_MS) }
++    }
++
++    private suspend fun type(controller: PhoneController, params: JsonObject): List<UIMessagePart> {
++        ensureOperable(controller)
++        val input = params.string("text") ?: error("text is required")
++        val element = params.int("element")?.also { (lastScreen ?: capture(controller)).element(it) }
++        return act(controller, "type") {
++            controller.setText(element, input) &&
++                (params.boolean("submit") != true || controller.pressKey(PhoneKey.ENTER))
++        }
++    }
++
++    /** 执行一个会改变界面的动作，返回执行后的新界面 */
++    private suspend fun act(
++        controller: PhoneController,
++        name: String,
++        block: suspend () -> Boolean,
++    ): List<UIMessagePart> {
++        val done = hidingOverlays { block() }
++        if (!done) {
++            return text("$name failed: the system rejected it. Observe the screen and try another way.")
++        }
++        delay(SETTLE_MS)
++        return text("$name done.\n" + describeCurrent(controller))
++    }
++
++    private suspend fun <T> hidingOverlays(block: suspend () -> T): T {
++        manager.setActing(true)
++        try {
++            delay(OVERLAY_HIDE_MS)
++            return block()
++        } finally {
++            manager.setActing(false)
++        }
++    }
++
++    private suspend fun capture(controller: PhoneController): PhoneScreen =
++        controller.captureScreen().also { lastScreen = it }
++
++    // 本应用在前台时不操作：模型不能替用户点自己的工具审批，也不该改动应用设置
++    private suspend fun ensureNotSelf() {
++        check(!isSelfInForeground()) {
++            "This app is in the foreground and cannot be operated. Use open_app or press home first."
++        }
++    }
++
++    // 每次操作前都看一眼屏幕上有谁：被禁的应用可能是从别的应用跳转进来的（比如购物应用拉起支付）。
++    // 要看所有可见窗口：分屏或下拉通知栏时最上层是别的应用，被禁应用的界面照样会被读到、点到、截进图里
++    private suspend fun ensureOperable(controller: PhoneController) {
++        ensureNotSelf()
++        controller.visiblePackages().blocked()?.let { error(blockedMessage(it)) }
++    }
++
++    /** 读取并描述当前界面；到了被禁的应用里不把界面内容交给模型 */
++    private suspend fun describeCurrent(controller: PhoneController): String {
++        val screen = capture(controller)
++        return screen.packages.blocked()?.let(::blockedMessage) ?: describe(screen)
++    }
++
++    private fun Set<String>.blocked(): String? = firstOrNull { it in PHONE_USE_BLOCKED_APPS }
++
++    private fun blockedMessage(packageName: String) =
++        "$packageName is now on screen and is blocked for safety: you cannot read or operate anything " +
++            "while it is visible. Press back or home, and tell the user to finish this step themselves."
++
++    private suspend fun targetPoint(controller: PhoneController, params: JsonObject): Pair<Float, Float> {
++        val screen = lastScreen ?: capture(controller)
++        params.int("element")?.let { index ->
++            val element = screen.element(index)
++            return (element.left + element.right) / 2f to (element.top + element.bottom) / 2f
++        }
++        val x = params.number("x") ?: error("element or x,y is required")
++        val y = params.number("y") ?: error("element or x,y is required")
++        return screen.gridToX(x) to screen.gridToY(y)
++    }
++
++    private fun resolveApp(controller: PhoneController, query: String) = controller.listApps().let { apps ->
++        apps.find { it.packageName == query }
++            ?: apps.find { it.label.equals(query, ignoreCase = true) }
++            ?: apps.find { it.label.contains(query, ignoreCase = true) }
++            ?: error("App not found: $query. Use list_apps to see installed apps.")
++    }
++}
++
++private fun text(text: String) = listOf(UIMessagePart.Text(text))
++
++private fun PhoneScreen.element(index: Int): PhoneElement =
++    elements.getOrNull(index) ?: error("Element $index is not in the latest element list. Observe the screen again.")
++
++private fun PhoneScreen.gridToX(value: Double) = (value.coerceIn(0.0, GRID.toDouble()) / GRID * width).toFloat()
++
++private fun PhoneScreen.gridToY(value: Double) = (value.coerceIn(0.0, GRID.toDouble()) / GRID * height).toFloat()
++
++private fun PhoneScreen.appName() = when {
++    packageName == null -> "unknown app"
++    appLabel != null -> "$appLabel ($packageName)"
++    else -> packageName
++}
++
++internal fun describe(screen: PhoneScreen): String = buildString {
++    appendLine("App: ${screen.appName()}")
++    if (screen.keyboardVisible) appendLine("Keyboard: visible")
++    if (screen.elements.isEmpty()) {
++        append("No elements found. The screen may still be loading (wait), or needs a screenshot.")
++        return@buildString
++    }
++    appendLine("Elements as [index] type \"label\" (or #resource-id when unlabeled) flags @(x,y):")
++    screen.elements.forEach { element ->
++        append("[${element.index}] ${element.className}")
++        if (element.label.isNotEmpty()) {
++            append(" \"${element.label}\"")
++        } else {
++            // 没有文字的图标按钮只剩资源 ID 能说明用途；有文字时不带，省些篇幅
++            element.resourceId?.let { append(" #$it") }
++        }
++        if (element.clickable) append(" clickable")
++        if (element.editable) append(" editable")
++        if (element.scrollable) append(" scrollable")
++        element.checked?.let { append(if (it) " checked" else " unchecked") }
++        if (element.focused) append(" focused")
++        val x = (element.left + element.right) / 2 * GRID / screen.width.coerceAtLeast(1)
++        val y = (element.top + element.bottom) / 2 * GRID / screen.height.coerceAtLeast(1)
++        appendLine(" @($x,$y)")
++    }
++    if (screen.truncated) append("More elements were omitted; scroll or take a screenshot to see the rest.")
++}.trimEnd()
++
++// 模型有时把数字写成字符串，按内容解析
++private fun JsonObject.string(key: String) = (this[key] as? JsonPrimitive)?.contentOrNull
++
++private fun JsonObject.number(key: String) = string(key)?.toDoubleOrNull()
++
++private fun JsonObject.int(key: String) = number(key)?.toInt()
++
++private fun JsonObject.boolean(key: String) = string(key)?.toBooleanStrictOrNull()
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
+index ba9651428..151816938 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
+@@ -39,7 +39,7 @@ internal fun pruneOldCacheScreenshots(dir: File) {
+ 
+ fun takeScreenshotTool(context: Context): Tool = Tool(
+     name = "take_screenshot",
+-    description = "Capture the current display via AccessibilityService and return it as a vision attachment. PNG also saved to Pictures/RikkaHub Agents/Screenshots/ — gallery_path in the result is the on-device absolute path. Secure surfaces (banking, DRM, password fields) error gracefully. OS-rate-limited to ~1/sec.",
++    description = "Capture the current display via AccessibilityService and return it as a vision attachment. PNG also saved to Pictures/RikkaHub Agents/Screenshots/ — gallery_path in the result is the on-device absolute path. Secure surfaces (banking, DRM, password fields) error gracefully. OS-rate-limited to ~1/sec. Prefer phone_use for everyday phone operation.",
+     parameters = {
+         InputSchema.Obj(
+             properties = buildJsonObject {
+@@ -51,6 +51,7 @@ fun takeScreenshotTool(context: Context): Tool = Tool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         val displayId = input.jsonObject["display_id"]?.jsonPrimitive?.intOrNull ?: 0
+ 
+         val outcome = AccessibilityServiceHandle.withService { svc ->
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScrollTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScrollTool.kt
+index b50ca904b..62a7a7201 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScrollTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScrollTool.kt
+@@ -4,6 +4,7 @@ import android.accessibilityservice.GestureDescription
+ import android.graphics.Path
+ import android.graphics.Rect
+ import android.view.accessibility.AccessibilityNodeInfo
++import kotlinx.serialization.json.JsonObject
+ import kotlinx.serialization.json.add
+ import kotlinx.serialization.json.buildJsonArray
+ import kotlinx.serialization.json.buildJsonObject
+@@ -53,6 +54,79 @@ private fun findFirstScrollable(root: AccessibilityNodeInfo): AccessibilityNodeI
+     return null
+ }
+ 
++private suspend fun runScroll(
++    input: JsonObject,
++    invocationContext: ToolInvocationContext,
++    streamer: InteractiveToolStreamer,
++): List<UIMessagePart> {
++    AgentTurnTracker.recordAutomationAction()
++    me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
++    val direction = input.jsonObject["direction"]?.jsonPrimitive?.contentOrNull
++    if (direction == null || direction !in ALLOWED_DIRECTIONS) {
++        return listOf(
++            UIMessagePart.Text(
++                ToolErrors.envelopeFor(error = "invalid_argument", message = "direction must be one of [up, down, left, right]", hint = "Check the parameter values and retry with corrected arguments.").toString()
++            )
++        )
++    }
++    val anchorX = input.jsonObject["x"]?.jsonPrimitive?.doubleOrNull?.takeIf { it.isFinite() }
++    val anchorY = input.jsonObject["y"]?.jsonPrimitive?.doubleOrNull?.takeIf { it.isFinite() }
++
++    val payload = AccessibilityServiceHandle.withService { svc ->
++        val root = svc.rootInActiveWindow
++            ?: return@withService ToolErrors.envelopeFor(error = "no_active_window", message = "no_active_window")
++
++        val target = if (anchorX != null && anchorY != null) {
++            findScrollableAt(root, anchorX.toInt(), anchorY.toInt())
++        } else {
++            findFirstScrollable(root)
++        }
++
++        val ok = if (target != null) {
++            val action = when (direction) {
++                "down", "right" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
++                "up", "left" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
++                else -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
++            }
++            target.performAction(action)
++        } else {
++            // Fallback: dispatch a swipe gesture across the screen center
++            val rect = Rect()
++            root.getBoundsInScreen(rect)
++            val cx = (rect.left + rect.right) / 2f
++            val cy = (rect.top + rect.bottom) / 2f
++            val w = (rect.width() / 3f).coerceAtLeast(100f)
++            val h = (rect.height() / 3f).coerceAtLeast(100f)
++            val (sx, sy, ex, ey) = when (direction) {
++                "down" -> floatArrayOf(cx, cy + h, cx, cy - h)
++                "up" -> floatArrayOf(cx, cy - h, cx, cy + h)
++                "right" -> floatArrayOf(cx + w, cy, cx - w, cy)
++                else /* left */ -> floatArrayOf(cx - w, cy, cx + w, cy)
++            }.let { arr -> Quadruple(arr[0], arr[1], arr[2], arr[3]) }
++            val path = Path().apply { moveTo(sx, sy); lineTo(ex, ey) }
++            svc.dispatchGestureAsync(
++                GestureDescription.Builder()
++                    .addStroke(GestureDescription.StrokeDescription(path, 0L, SCROLL_GESTURE_MS))
++                    .build()
++            )
++        }
++        svc.appendLog(
++            ActionLogEntry(
++                type = "scroll",
++                paramsSummary = "$direction" + (if (target != null) " (node)" else " (fallback swipe)"),
++                success = ok,
++                timestampMs = System.currentTimeMillis(),
++            )
++        )
++        buildJsonObject {
++            put("success", ok)
++            if (!ok) put("reason", "no_scroll_action_accepted")
++        }
++    }
++    streamer.streamIfHeadless(invocationContext, "Scroll $direction")
++    return listOf(UIMessagePart.Text(payload.toString()))
++}
++
+ fun scrollTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
+@@ -80,72 +154,8 @@ fun scrollTool(
+         )
+     },
+     execute = { input ->
+-        AgentTurnTracker.recordAutomationAction()
+-        me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+-        val direction = input.jsonObject["direction"]?.jsonPrimitive?.contentOrNull
+-        if (direction == null || direction !in ALLOWED_DIRECTIONS) {
+-            return@Tool listOf(
+-                UIMessagePart.Text(
+-                    ToolErrors.envelopeFor(error = "invalid_argument", message = "direction must be one of [up, down, left, right]", hint = "Check the parameter values and retry with corrected arguments.").toString()
+-                )
+-            )
+-        }
+-        val anchorX = input.jsonObject["x"]?.jsonPrimitive?.doubleOrNull?.takeIf { it.isFinite() }
+-        val anchorY = input.jsonObject["y"]?.jsonPrimitive?.doubleOrNull?.takeIf { it.isFinite() }
+-
+-        val payload = AccessibilityServiceHandle.withService { svc ->
+-            val root = svc.rootInActiveWindow
+-                ?: return@withService ToolErrors.envelopeFor(error = "no_active_window", message = "no_active_window")
+-
+-            val target = if (anchorX != null && anchorY != null) {
+-                findScrollableAt(root, anchorX.toInt(), anchorY.toInt())
+-            } else {
+-                findFirstScrollable(root)
+-            }
+-
+-            val ok = if (target != null) {
+-                val action = when (direction) {
+-                    "down", "right" -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+-                    "up", "left" -> AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+-                    else -> AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+-                }
+-                target.performAction(action)
+-            } else {
+-                // Fallback: dispatch a swipe gesture across the screen center
+-                val rect = Rect()
+-                root.getBoundsInScreen(rect)
+-                val cx = (rect.left + rect.right) / 2f
+-                val cy = (rect.top + rect.bottom) / 2f
+-                val w = (rect.width() / 3f).coerceAtLeast(100f)
+-                val h = (rect.height() / 3f).coerceAtLeast(100f)
+-                val (sx, sy, ex, ey) = when (direction) {
+-                    "down" -> floatArrayOf(cx, cy + h, cx, cy - h)
+-                    "up" -> floatArrayOf(cx, cy - h, cx, cy + h)
+-                    "right" -> floatArrayOf(cx + w, cy, cx - w, cy)
+-                    else /* left */ -> floatArrayOf(cx - w, cy, cx + w, cy)
+-                }.let { arr -> Quadruple(arr[0], arr[1], arr[2], arr[3]) }
+-                val path = Path().apply { moveTo(sx, sy); lineTo(ex, ey) }
+-                svc.dispatchGestureAsync(
+-                    GestureDescription.Builder()
+-                        .addStroke(GestureDescription.StrokeDescription(path, 0L, SCROLL_GESTURE_MS))
+-                        .build()
+-                )
+-            }
+-            svc.appendLog(
+-                ActionLogEntry(
+-                    type = "scroll",
+-                    paramsSummary = "$direction" + (if (target != null) " (node)" else " (fallback swipe)"),
+-                    success = ok,
+-                    timestampMs = System.currentTimeMillis(),
+-                )
+-            )
+-            buildJsonObject {
+-                put("success", ok)
+-                if (!ok) put("reason", "no_scroll_action_accepted")
+-            }
+-        }
+-        streamer.streamIfHeadless(invocationContext, "Scroll $direction")
+-        listOf(UIMessagePart.Text(payload.toString()))
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
++        runScroll(input.jsonObject, invocationContext, streamer)
+     }
+ )
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
+index 6acfe7f77..bb8d2773a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
+@@ -46,6 +46,7 @@ fun swipeTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         AgentTurnTracker.recordAutomationAction()
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val sx = numOrNull(input, "start_x")
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt
+index 49da5624f..b2da37dfe 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt
+@@ -31,6 +31,7 @@ fun tapTool(
+         Tap at absolute screen coordinates (pixels). Requires the AccessibilityService to be enabled.
+         Returns {success: true} if the gesture completed, or {success: false, reason} if cancelled.
+         If the AccessibilityService is not active, returns {error, recovery} so you can ask the user to enable it.
++        Prefer phone_use for everyday phone operation; use this only when you need pixel-precise coordinates.
+     """.trimIndent().replace("\n", " "),
+     parameters = {
+         InputSchema.Obj(
+@@ -48,6 +49,7 @@ fun tapTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         AgentTurnTracker.recordAutomationAction()
+         // Wake screen so gestures land on a visible surface, not a dark screen.
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+@@ -113,6 +115,7 @@ fun longPressTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         AgentTurnTracker.recordAutomationAction()
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val x = coordOrError(input, "x")
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
+index bba6acac0..53313cb40 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
+@@ -80,6 +80,7 @@ fun readWindowTreeTool(
+         )
+     },
+     execute = { input ->
++        blockedForegroundEnvelope()?.let { return@Tool listOf(UIMessagePart.Text(it.toString())) }
+         me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val verbose = input.jsonObject["verbose"]?.jsonPrimitive?.booleanOrNull ?: false
+         val maxNodesRaw = input.jsonObject["max_nodes"]?.jsonPrimitive?.intOrNull ?: DEFAULT_MAX_NODES
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
+index ac9b14890..320d7d2e5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
+@@ -174,6 +174,7 @@ Entry("browser_back", "browser/BrowserToolDefaults.kt#ALL_TOOLS", "LocalToolOpti
+         Entry("open_wifi_settings", "local/SystemIntentTools.kt#openWifiSettingsTool", "LocalToolOption.SystemIntents", "DEVICE_CONTROL", "OpenWifiSettingsToolUI", InvocationKind.STANDARD),
+         Entry("pause_job", "local/CronJobTool.kt#pauseJobTool", "LocalToolOption.CronJobs", "AUTOMATION", null, InvocationKind.STANDARD),
+         Entry("pause_media", "local/MediaPlayerTool.kt#pauseMediaTool", "LocalToolOption.MediaPlayer", "MEDIA", null, InvocationKind.STANDARD),
++        Entry("phone_use", "local/PhoneUseTool.kt#buildPhoneUseTool", "LocalToolOption.PhoneUse", "DEVICE_CONTROL", null, InvocationKind.STANDARD),
+         Entry("play_media", "local/MediaPlayerTool.kt#playMediaTool", "LocalToolOption.MediaPlayer", "MEDIA", null, InvocationKind.STANDARD),
+         Entry("post_notification", "local/NotificationTool.kt#notificationTool", "LocalToolOption.Notification", "DEVICE_CONTROL", null, InvocationKind.STANDARD),
+         Entry("read_file", "local/FileManagerTool.kt#readFileTool", "LocalToolOption.Files", "FILES", "LocalReadFileToolUI", InvocationKind.STANDARD),
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt b/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt
+index 7aa73600f..c7f10672b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/files/FilesManager.kt
+@@ -261,14 +261,18 @@ class FilesManager(
+         return newUris
+     }
+ 
+-    fun createChatFilesByByteArrays(byteArrays: List<ByteArray>): List<Uri> {
++    fun createChatFilesByByteArrays(
++        byteArrays: List<ByteArray>,
++        displayName: String = "image.png",
++        mimeType: String = "image/png",
++    ): List<Uri> {
+         val newUris = mutableListOf<Uri>()
+         val dir = context.filesDir.resolve(FileFolders.UPLOAD)
+         if (!dir.exists()) {
+             dir.mkdirs()
+         }
+         byteArrays.forEach { byteArray ->
+-            val fileName = buildUuidFileName(displayName = "image.png", mimeType = "image/png")
++            val fileName = buildUuidFileName(displayName = displayName, mimeType = mimeType)
+             val file = dir.resolve(fileName)
+             if (!file.exists()) {
+                 file.createNewFile()
+@@ -280,8 +284,8 @@ class FilesManager(
+             trackManagedFile(
+                 folder = FileFolders.UPLOAD,
+                 file = file,
+-                displayName = "image.png",
+-                mimeType = "image/png"
++                displayName = displayName,
++                mimeType = mimeType
+             )
+             newUris.add(newUri)
+         }
+diff --git a/app/src/main/java/me/rerere/rikkahub/phoneuse/GestureIndicator.kt b/app/src/main/java/me/rerere/rikkahub/phoneuse/GestureIndicator.kt
+new file mode 100644
+index 000000000..3ef95ef0b
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/phoneuse/GestureIndicator.kt
+@@ -0,0 +1,187 @@
++package me.rerere.rikkahub.phoneuse
++
++import android.accessibilityservice.AccessibilityService
++import android.animation.Animator
++import android.animation.AnimatorListenerAdapter
++import android.animation.ValueAnimator
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Color
++import android.graphics.Paint
++import android.graphics.PixelFormat
++import android.os.Build
++import android.util.Log
++import android.view.View
++import android.view.WindowManager
++import android.view.animation.DecelerateInterpolator
++import kotlin.math.hypot
++
++private const val TAG = "GestureIndicator"
++
++// 手势做完后再留一会儿淡出，短促的点击也看得清落点
++private const val LINGER_MS = 350L
++private const val TAP_RADIUS_DP = 28f
++private const val DOT_RADIUS_DP = 9f
++private const val STROKE_DP = 3f
++
++// 起点和终点离得很近时按点击画
++private const val TAP_SLOP_DP = 8f
++
++/**
++ * 在屏幕上画出 AI 这次点在哪、往哪滑，让用户看得出它在操作。
++ * 用无障碍服务自己的覆盖层，不需要悬浮窗权限；窗口不接收触摸，只在动画期间存在。
++ * 所有方法都要在主线程调用。
++ */
++class GestureIndicator(private val service: AccessibilityService) {
++    private val windowManager = service.getSystemService(WindowManager::class.java)
++    private var view: IndicatorView? = null
++
++    /** 坐标是屏幕像素；[durationMs] 是手势本身的时长，滑动的轨迹跟着手势一起前进 */
++    fun show(fromX: Float, fromY: Float, toX: Float, toY: Float, durationMs: Long) {
++        dismiss()
++        val view = IndicatorView(service, GestureSpec(fromX, fromY, toX, toY, durationMs), onEnd = ::dismiss)
++        val params = WindowManager.LayoutParams(
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.MATCH_PARENT,
++            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
++            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
++                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
++                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
++                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
++            PixelFormat.TRANSLUCENT,
++        )
++        // 铺到刘海和系统栏下面，窗口原点才和屏幕原点一致
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            params.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
++        }
++        try {
++            windowManager.addView(view, params)
++            this.view = view
++        } catch (ignored: Exception) {
++            // 只是提示效果，加不上不影响手势本身
++            Log.w(TAG, "show: failed to add overlay", ignored)
++        }
++    }
++
++    fun dismiss() {
++        val view = view ?: return
++        this.view = null
++        view.cancel()
++        runCatching { windowManager.removeViewImmediate(view) }
++    }
++}
++
++/** 手势指示器的几何参数：起点、终点都是屏幕像素，[durationMs] 是手势本身的时长 */
++private data class GestureSpec(
++    val fromX: Float,
++    val fromY: Float,
++    val toX: Float,
++    val toY: Float,
++    val durationMs: Long,
++)
++
++private class IndicatorView(
++    context: Context,
++    spec: GestureSpec,
++    private val onEnd: () -> Unit,
++) : View(context) {
++    private val fromX = spec.fromX
++    private val fromY = spec.fromY
++    private val toX = spec.toX
++    private val toY = spec.toY
++    private val gestureMs = spec.durationMs
++    private val density = resources.displayMetrics.density
++    private val isTap = hypot(toX - fromX, toY - fromY) < TAP_SLOP_DP * density
++    private val total = gestureMs + LINGER_MS
++
++    // 手势进行到哪（0-1）和整体淡出（1-0）
++    private var progress = 0f
++    private var alphaScale = 1f
++    private val location = IntArray(2)
++
++    // 深色描边加浅色主体，亮暗背景上都看得见
++    private val accent = accentColor(context)
++    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
++    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        style = Paint.Style.STROKE
++        strokeCap = Paint.Cap.ROUND
++    }
++
++    private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
++        duration = total
++        interpolator = null
++        addUpdateListener {
++            val elapsed = it.animatedFraction * total
++            progress = (elapsed / gestureMs.coerceAtLeast(1)).coerceAtMost(1f)
++            alphaScale = (1f - (elapsed - gestureMs) / LINGER_MS).coerceIn(0f, 1f)
++            invalidate()
++        }
++        addListener(object : AnimatorListenerAdapter() {
++            // 取消时由 dismiss 自己移除窗口
++            private var cancelled = false
++
++            override fun onAnimationCancel(animation: Animator) {
++                cancelled = true
++            }
++
++            override fun onAnimationEnd(animation: Animator) {
++                if (!cancelled) onEnd()
++            }
++        })
++    }
++
++    private val ripple = DecelerateInterpolator()
++
++    override fun onAttachedToWindow() {
++        super.onAttachedToWindow()
++        animator.start()
++    }
++
++    fun cancel() = animator.cancel()
++
++    override fun onDraw(canvas: Canvas) {
++        // 个别系统上窗口仍会被系统栏挤开，按实际位置换算
++        getLocationOnScreen(location)
++        canvas.translate(-location[0].toFloat(), -location[1].toFloat())
++        if (isTap) drawTap(canvas) else drawSwipe(canvas)
++    }
++
++    // 点击：落点一个实心点，外面一圈向外扩散。长按时圆圈在按住期间一直留着
++    private fun drawTap(canvas: Canvas) {
++        val spread = ripple.getInterpolation(progress)
++        fill.color = withAlpha(accent, 0.25f * alphaScale)
++        canvas.drawCircle(fromX, fromY, TAP_RADIUS_DP * density * (0.4f + 0.6f * spread), fill)
++        drawDot(canvas, fromX, fromY)
++    }
++
++    // 滑动：从起点到当前位置的轨迹，头上一个点跟着手指走
++    private fun drawSwipe(canvas: Canvas) {
++        val x = fromX + (toX - fromX) * progress
++        val y = fromY + (toY - fromY) * progress
++        line.strokeWidth = (DOT_RADIUS_DP * 2 + STROKE_DP) * density
++        line.color = withAlpha(Color.BLACK, 0.2f * alphaScale)
++        canvas.drawLine(fromX, fromY, x, y, line)
++        line.strokeWidth = DOT_RADIUS_DP * 2 * density
++        line.color = withAlpha(accent, 0.35f * alphaScale)
++        canvas.drawLine(fromX, fromY, x, y, line)
++        drawDot(canvas, x, y)
++    }
++
++    private fun drawDot(canvas: Canvas, x: Float, y: Float) {
++        fill.color = withAlpha(Color.BLACK, 0.35f * alphaScale)
++        canvas.drawCircle(x, y, (DOT_RADIUS_DP + STROKE_DP / 2) * density, fill)
++        fill.color = withAlpha(accent, alphaScale)
++        canvas.drawCircle(x, y, DOT_RADIUS_DP * density, fill)
++    }
++
++    private fun withAlpha(color: Int, alpha: Float): Int =
++        Color.argb((alpha * 255).toInt().coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))
++}
++
++// 跟随系统的动态取色，Android 12 以下用固定的浅紫色
++private fun accentColor(context: Context): Int =
++    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++        context.getColor(android.R.color.system_accent1_200)
++    } else {
++        0xFFD0BCFF.toInt()
++    }
+diff --git a/app/src/main/java/me/rerere/rikkahub/phoneuse/PhoneController.kt b/app/src/main/java/me/rerere/rikkahub/phoneuse/PhoneController.kt
+new file mode 100644
+index 000000000..c58c86452
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/phoneuse/PhoneController.kt
+@@ -0,0 +1,121 @@
++package me.rerere.rikkahub.phoneuse
++
++import android.content.ComponentName
++import android.content.Context
++import android.os.Build
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import me.rerere.rikkahub.data.datastore.Settings
++
++/** 屏幕上一个可以操作或带文字的元素，[index] 在下一次 [PhoneController.captureScreen] 之前有效，坐标是屏幕像素 */
++data class PhoneElement(
++    val index: Int,
++    val className: String,
++    val label: String,
++    /** 布局里的资源 ID 名（如 btn_send），应用没有设置或被系统隐藏时为空 */
++    val resourceId: String?,
++    val left: Int,
++    val top: Int,
++    val right: Int,
++    val bottom: Int,
++    val clickable: Boolean,
++    val editable: Boolean,
++    val scrollable: Boolean,
++    val checked: Boolean?,
++    val focused: Boolean,
++)
++
++data class PhoneScreen(
++    val packageName: String?,
++    val appLabel: String?,
++    /** 这份元素来自哪些应用的窗口，[packageName] 只是最上层的那个 */
++    val packages: Set<String>,
++    val width: Int,
++    val height: Int,
++    val keyboardVisible: Boolean,
++    val elements: List<PhoneElement>,
++    /** 元素太多时只保留前面的一部分 */
++    val truncated: Boolean,
++)
++
++data class PhoneApp(val packageName: String, val label: String)
++
++enum class PhoneKey { BACK, HOME, RECENTS, NOTIFICATIONS, ENTER }
++
++/**
++ * 操作手机的底层能力，坐标都是屏幕像素。
++ * 实现是无障碍服务，用户在系统设置里开启后才存在。
++ */
++interface PhoneController {
++    /**
++     * 屏幕上所有可见窗口所属的应用，和 [captureScreen] 读取的窗口范围一致，不算本应用自己的悬浮窗。
++     * 分屏或下拉通知栏时不止一个；只用来判断屏幕上有谁，不影响元素编号
++     */
++    fun visiblePackages(): Set<String>
++
++    /** 读取当前屏幕上的元素，不包含本应用自己的悬浮窗 */
++    suspend fun captureScreen(): PhoneScreen
++
++    /** JPEG 截图，长边不超过 [maxSide] */
++    suspend fun screenshot(maxSide: Int): ByteArray
++
++    /** 起点和终点相同时是点击，[durationMs] 决定是轻点还是长按 */
++    suspend fun gesture(fromX: Float, fromY: Float, toX: Float, toY: Float, durationMs: Long): Boolean
++
++    /** 把文字填进 [elementIndex] 指向的输入框；为空时填进当前有输入焦点的输入框 */
++    suspend fun setText(elementIndex: Int?, text: String): Boolean
++
++    suspend fun pressKey(key: PhoneKey): Boolean
++
++    fun listApps(): List<PhoneApp>
++
++    fun openApp(packageName: String): Boolean
++}
++
++/**
++ * 后台悬浮窗是否真的能显示：开关打开并且有悬浮窗权限。
++ * Phone Use 要求它开着，用户才看得到 AI 在做什么、随时能停。
++ */
++fun isFloatingChatWindowOn(context: Context, settings: Settings): Boolean =
++    settings.displaySetting.enableFloatingChatWindow && android.provider.Settings.canDrawOverlays(context)
++
++/** Phone Use 服务是否在系统无障碍设置里处于开启状态（不代表服务进程已连接）。 */
++fun isPhoneUseServiceEnabledInSettings(context: Context): Boolean {
++    val expected = ComponentName(context, PhoneUseAccessibilityService::class.java).flattenToString()
++    val enabled = android.provider.Settings.Secure.getString(
++        context.contentResolver,
++        android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
++    ) ?: return false
++    return enabled.split(":").any { it.equals(expected, ignoreCase = true) }
++}
++
++/**
++ * 无障碍服务连接后把自己登记在这里，工具和设置页从这里拿。
++ * 进程级唯一的服务登记处，与无障碍服务本身同构，故用 object 而不是注入的单例。
++ */
++object PhoneUseManager {
++    /** 截图和回车键是 Android 11 才有的接口，更低的版本不提供 */
++    val isSupported: Boolean
++        get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
++
++    private val _controller = MutableStateFlow<PhoneController?>(null)
++    val controller: StateFlow<PhoneController?> = _controller.asStateFlow()
++
++    private val _acting = MutableStateFlow(false)
++
++    /** 正在截图或执行手势，这期间悬浮窗要让出屏幕：不能出现在截图里，也不能挡住点击 */
++    val acting: StateFlow<Boolean> = _acting.asStateFlow()
++
++    fun attach(controller: PhoneController) {
++        _controller.value = controller
++    }
++
++    fun detach(controller: PhoneController) {
++        _controller.compareAndSet(controller, null)
++    }
++
++    fun setActing(acting: Boolean) {
++        _acting.value = acting
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/phoneuse/PhoneUseAccessibilityService.kt b/app/src/main/java/me/rerere/rikkahub/phoneuse/PhoneUseAccessibilityService.kt
+new file mode 100644
+index 000000000..54761d594
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/phoneuse/PhoneUseAccessibilityService.kt
+@@ -0,0 +1,361 @@
++package me.rerere.rikkahub.phoneuse
++
++import android.accessibilityservice.AccessibilityService
++import android.accessibilityservice.GestureDescription
++import android.content.Intent
++import android.graphics.Bitmap
++import android.graphics.Path
++import android.graphics.Point
++import android.graphics.Rect
++import android.os.Build
++import android.os.Bundle
++import android.util.Log
++import android.view.Display
++import android.view.WindowManager
++import android.view.accessibility.AccessibilityEvent
++import android.view.accessibility.AccessibilityNodeInfo
++import android.view.accessibility.AccessibilityWindowInfo
++import androidx.annotation.RequiresApi
++import androidx.core.graphics.scale
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withContext
++import java.io.ByteArrayOutputStream
++import java.util.Locale
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++
++private const val TAG = "PhoneUseService"
++private const val MAX_ELEMENTS = 150
++private const val MAX_LABEL_CHARS = 80
++
++// 没有自己文字的可点击容器，用里面的前几段文字当名字
++private const val MAX_LABEL_PARTS = 3
++private const val SCREENSHOT_RETRY_DELAY_MS = 1000L
++private const val JPEG_QUALITY = 80
++
++/**
++ * Phone Use 的执行端：用户在系统无障碍设置里开启后，把自己登记到 [PhoneUseManager]。
++ * 不监听无障碍事件，只在工具调用时读取窗口、派发手势。
++ */
++class PhoneUseAccessibilityService : AccessibilityService(), PhoneController {
++    private val indicator by lazy { GestureIndicator(this) }
++
++    // 和最近一次 captureScreen 返回的元素一一对应，setText 靠它找到节点
++    @Volatile
++    private var nodes: List<AccessibilityNodeInfo> = emptyList()
++
++    override fun onServiceConnected() {
++        Log.i(TAG, "onServiceConnected")
++        PhoneUseManager.attach(this)
++    }
++
++    override fun onUnbind(intent: Intent?): Boolean {
++        PhoneUseManager.detach(this)
++        return super.onUnbind(intent)
++    }
++
++    override fun onDestroy() {
++        PhoneUseManager.detach(this)
++        indicator.dismiss()
++        super.onDestroy()
++    }
++
++    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
++        // Required override; no-op.
++    }
++
++    override fun onInterrupt() {
++        // Required override; no-op.
++    }
++
++    // ---- 读取屏幕 ----
++
++    override fun visiblePackages(): Set<String> = targetRoots().packages()
++
++    private fun List<AccessibilityNodeInfo>.packages(): Set<String> =
++        mapNotNullTo(mutableSetOf()) { it.packageName?.toString() }
++
++    override suspend fun captureScreen(): PhoneScreen = withContext(Dispatchers.Default) {
++        val size = screenSize()
++        val screenBounds = Rect(0, 0, size.x, size.y)
++        val roots = targetRoots()
++        val elements = mutableListOf<PhoneElement>()
++        val collected = mutableListOf<AccessibilityNodeInfo>()
++        var truncated = false
++
++        fun visit(node: AccessibilityNodeInfo, absorbed: Boolean) {
++            if (elements.size >= MAX_ELEMENTS) {
++                truncated = true
++                return
++            }
++            var childrenAbsorbed = absorbed
++            if (node.isVisibleToUser) {
++                val bounds = Rect().also(node::getBoundsInScreen)
++                val interactive = node.isClickable || node.isLongClickable || node.isEditable ||
++                    node.isScrollable || node.isCheckable
++                var label = node.ownLabel()
++                if (label.isEmpty() && node.isClickable) {
++                    label = node.descendantLabels().joinToString(" ")
++                    // 文字已经算进这个容器了，子节点里的纯文字不再单独列一遍
++                    childrenAbsorbed = label.isNotEmpty()
++                }
++                val listed = interactive || (label.isNotEmpty() && !absorbed)
++                if (listed && bounds.intersect(screenBounds)) {
++                    elements += nodeElement(node, bounds, elements.size, label)
++                    collected += node
++                }
++            }
++            for (i in 0 until node.childCount) {
++                node.getChild(i)?.let { visit(it, childrenAbsorbed) }
++            }
++        }
++        roots.forEach { visit(it, absorbed = false) }
++        nodes = collected
++
++        val topPackage = roots.firstOrNull()?.packageName?.toString()
++        PhoneScreen(
++            packageName = topPackage,
++            appLabel = topPackage?.let(::appLabel),
++            packages = roots.packages(),
++            width = size.x,
++            height = size.y,
++            keyboardVisible = windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD },
++            elements = elements,
++            truncated = truncated,
++        )
++    }
++
++    /** 单个可见节点转成元素；调用前已算好标签并确认要列出 */
++    private fun nodeElement(node: AccessibilityNodeInfo, bounds: Rect, index: Int, label: String): PhoneElement =
++        PhoneElement(
++            index = index,
++            className = node.className?.toString()?.substringAfterLast('.') ?: "View",
++            label = label.clean(),
++            // 形如 com.example:id/btn_send，只留名字
++            resourceId = node.viewIdResourceName?.substringAfterLast('/')?.takeIf { it.isNotBlank() },
++            left = bounds.left,
++            top = bounds.top,
++            right = bounds.right,
++            bottom = bounds.bottom,
++            clickable = node.isClickable,
++            editable = node.isEditable,
++            scrollable = node.isScrollable,
++            checked = if (node.isCheckable) node.isChecked else null,
++            focused = node.isEditable && node.isFocused,
++        )
++
++    /**
++     * 要读取的窗口根节点，最上层的在前。只看应用窗口和拿着焦点的系统窗口（比如下拉的通知栏），
++     * 状态栏、导航栏、输入法的按键不列出来；本应用自己的窗口（悬浮窗）也跳过。
++     */
++    private fun targetRoots(): List<AccessibilityNodeInfo> {
++        val roots = windows
++            .filter {
++                it.type == AccessibilityWindowInfo.TYPE_APPLICATION ||
++                    (it.type == AccessibilityWindowInfo.TYPE_SYSTEM && it.isFocused)
++            }
++            .mapNotNull { it.root }
++        // 个别系统拿不到窗口列表，退回当前活动窗口
++        return roots.ifEmpty { listOfNotNull(rootInActiveWindow) }.filter { it.packageName != packageName }
++    }
++
++    private fun AccessibilityNodeInfo.ownLabel(): String =
++        text?.toString()?.takeIf { it.isNotBlank() }
++            ?: contentDescription?.toString()?.takeIf { it.isNotBlank() }
++            ?: hintText?.toString()?.takeIf { it.isNotBlank() }
++            ?: ""
++
++    private fun AccessibilityNodeInfo.descendantLabels(): List<String> {
++        val labels = mutableListOf<String>()
++        fun collect(node: AccessibilityNodeInfo) {
++            for (i in 0 until node.childCount) {
++                if (labels.size >= MAX_LABEL_PARTS) return
++                val child = node.getChild(i) ?: continue
++                // 可点击的子节点自己会单独列出
++                if (child.isClickable) continue
++                child.ownLabel().takeIf { it.isNotEmpty() }?.let(labels::add)
++                collect(child)
++            }
++        }
++        collect(this)
++        return labels
++    }
++
++    private fun String.clean() = replace('\n', ' ').trim().let {
++        if (it.length > MAX_LABEL_CHARS) it.take(MAX_LABEL_CHARS) + "…" else it
++    }
++
++    private fun screenSize(): Point {
++        val windowManager = getSystemService(WindowManager::class.java)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            val bounds = windowManager.maximumWindowMetrics.bounds
++            return Point(bounds.width(), bounds.height())
++        }
++        // Android 11 以下没有 WindowMetrics，只能用已废弃的接口取真实尺寸；
++        // Phone Use 本身只在 Android 11+ 提供，这里只是防旧设备上服务被手动开启后崩溃。
++        return Point().also { windowManager.defaultDisplay.getRealSize(it) }
++    }
++
++    private fun appLabel(packageName: String): String? = runCatching {
++        packageManager.getApplicationLabel(packageManager.getApplicationInfo(packageName, 0)).toString()
++    }.getOrNull()
++
++    // ---- 截图 ----
++
++    override suspend fun screenshot(maxSide: Int): ByteArray {
++        check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) { "Screenshots need Android 11 or later." }
++        val bitmap = try {
++            takeScreenshot()
++        } catch (ignored: ScreenshotIntervalException) {
++            // 系统限制了两次截图的最小间隔
++            delay(SCREENSHOT_RETRY_DELAY_MS)
++            takeScreenshot()
++        }
++        // 一张全屏位图十几 MB，连续截图时等 GC 回收来不及，用完立刻释放
++        return try {
++            withContext(Dispatchers.Default) {
++                val ratio = maxSide.toFloat() / maxOf(bitmap.width, bitmap.height)
++                val scaled = if (ratio < 1f) {
++                    bitmap.scale((bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt())
++                } else {
++                    bitmap
++                }
++                try {
++                    ByteArrayOutputStream().also { scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, it) }
++                        .toByteArray()
++                } finally {
++                    if (scaled !== bitmap) scaled.recycle()
++                }
++            }
++        } finally {
++            bitmap.recycle()
++        }
++    }
++
++    private class ScreenshotIntervalException : IllegalStateException("Screenshot requested too frequently.")
++
++    @RequiresApi(Build.VERSION_CODES.R)
++    private suspend fun takeScreenshot(): Bitmap = suspendCancellableCoroutine { continuation ->
++        takeScreenshot(
++            Display.DEFAULT_DISPLAY,
++            mainExecutor,
++            object : TakeScreenshotCallback {
++                override fun onSuccess(screenshot: ScreenshotResult) {
++                    // 硬件位图不能缩放和压缩，转成普通位图；硬件位图自己还引用着屏幕缓冲区，拷完就释放
++                    val bitmap = screenshot.hardwareBuffer.use { buffer ->
++                        val hardware = Bitmap.wrapHardwareBuffer(buffer, screenshot.colorSpace)
++                        try {
++                            hardware?.copy(Bitmap.Config.ARGB_8888, false)
++                        } finally {
++                            hardware?.recycle()
++                        }
++                    }
++                    if (bitmap != null) {
++                        continuation.resume(bitmap)
++                    } else {
++                        continuation.resumeWithException(IllegalStateException("Screenshot failed."))
++                    }
++                }
++
++                override fun onFailure(errorCode: Int) {
++                    continuation.resumeWithException(
++                        if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
++                            ScreenshotIntervalException()
++                        } else {
++                            IllegalStateException("Screenshot failed (code $errorCode).")
++                        }
++                    )
++                }
++            },
++        )
++    }
++
++    // ---- 操作 ----
++
++    override suspend fun gesture(fromX: Float, fromY: Float, toX: Float, toY: Float, durationMs: Long): Boolean {
++        // 坐标不能为负；点击也补一段到原地的线，保证路径不为空
++        val path = Path().apply {
++            moveTo(fromX.coerceAtLeast(0f), fromY.coerceAtLeast(0f))
++            lineTo(toX.coerceAtLeast(0f), toY.coerceAtLeast(0f))
++        }
++        val gesture = GestureDescription.Builder()
++            .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
++            .build()
++        // 效果和手势同时开始；覆盖层不接收触摸，不会挡住手势
++        withContext(Dispatchers.Main) { indicator.show(fromX, fromY, toX, toY, durationMs) }
++        return suspendCancellableCoroutine { continuation ->
++            val dispatched = dispatchGesture(
++                gesture,
++                object : GestureResultCallback() {
++                    override fun onCompleted(gestureDescription: GestureDescription?) {
++                        if (continuation.isActive) continuation.resume(true)
++                    }
++
++                    override fun onCancelled(gestureDescription: GestureDescription?) {
++                        if (continuation.isActive) continuation.resume(false)
++                    }
++                },
++                null,
++            )
++            if (!dispatched && continuation.isActive) continuation.resume(false)
++        }
++    }
++
++    override suspend fun setText(elementIndex: Int?, text: String): Boolean = withContext(Dispatchers.Default) {
++        val target = if (elementIndex != null) nodes.getOrNull(elementIndex) else focusedInput()
++        // 模型可能选中了输入框外面的容器
++        val input = target?.let { if (it.isEditable) it else it.firstEditableDescendant() }
++            ?: return@withContext false
++        // 拿到输入焦点，之后按回车才会落在这个输入框上
++        input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
++        input.performAction(
++            AccessibilityNodeInfo.ACTION_SET_TEXT,
++            Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) },
++        )
++    }
++
++    private fun focusedInput(): AccessibilityNodeInfo? =
++        targetRoots().firstNotNullOfOrNull { it.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) }
++
++    private fun AccessibilityNodeInfo.firstEditableDescendant(): AccessibilityNodeInfo? {
++        for (i in 0 until childCount) {
++            val child = getChild(i) ?: continue
++            if (child.isEditable) return child
++            child.firstEditableDescendant()?.let { return it }
++        }
++        return null
++    }
++
++    override suspend fun pressKey(key: PhoneKey): Boolean = when (key) {
++        PhoneKey.BACK -> performGlobalAction(GLOBAL_ACTION_BACK)
++        PhoneKey.HOME -> performGlobalAction(GLOBAL_ACTION_HOME)
++        PhoneKey.RECENTS -> performGlobalAction(GLOBAL_ACTION_RECENTS)
++        PhoneKey.NOTIFICATIONS -> performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
++        PhoneKey.ENTER -> withContext(Dispatchers.Default) {
++            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++                "Enter needs Android 11 or later. Tap the search or send button on screen instead."
++            }
++            focusedInput()?.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id) == true
++        }
++    }
++
++    // ---- 应用 ----
++
++    override fun listApps(): List<PhoneApp> {
++        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
++        return packageManager.queryIntentActivities(launcher, 0)
++            .map { PhoneApp(it.activityInfo.packageName, it.loadLabel(packageManager).toString()) }
++            .filter { it.packageName != packageName }
++            .distinctBy { it.packageName }
++            .sortedBy { it.label.lowercase(Locale.ROOT) }
++    }
++
++    // 开启了无障碍服务的应用可以从后台启动 Activity
++    override fun openApp(packageName: String): Boolean {
++        val intent = packageManager.getLaunchIntentForPackage(packageName) ?: return false
++        startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++        return true
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatFloatingOverlayController.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatFloatingOverlayController.kt
+index 90cd0ed00..d1b32da70 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatFloatingOverlayController.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatFloatingOverlayController.kt
+@@ -77,6 +77,11 @@ internal class ChatFloatingOverlayController(
+             screenWidthPx = { overlayContext.resources.displayMetrics.widthPixels },
+         )
+     private var windowLifecycleOwner: FloatingWindowLifecycleOwner? = null
++    private val phoneUseGate = PhoneUseOverlayGate(
++        scope, chat,
++        collapsePanel = { policy = policy.collapse(); applyExpanded(false) },
++        windowState = { Triple(root, params, windowManager) },
++    )
+     private val replyDrafts = androidx.compose.runtime.mutableStateMapOf<String, String>()
+     private val uiState =
+         androidx.compose.runtime.mutableStateOf(
+@@ -153,6 +158,7 @@ internal class ChatFloatingOverlayController(
+                 ) { inputs, permission -> inputs to permission }
+                     .collect { (inputs, permission) -> refresh(inputs.first, inputs.second, inputs.third, permission) }
+             }
++        observerJobs += phoneUseGate.start()
+     }
+ 
+     fun close() {
+@@ -177,6 +183,8 @@ internal class ChatFloatingOverlayController(
+         if (enabled != priorEnabled) policy = policy.updateEnabled(enabled)
+         if (isForeground != priorForeground) policy = policy.updateForeground(isForeground)
+         policy = policy.updatePermission(permission).updateRunning(running)
++        // 目标会话这一轮刚结束（之前在跑，现在不在了），留待窗口确认显示后再看要不要展开。
++        val finishedTarget = targetId?.takeIf { it.toString() !in running && it.toString() in previousJobs }
+         priorEnabled = enabled
+         priorForeground = isForeground
+         previousJobs = running
+@@ -195,6 +203,12 @@ internal class ChatFloatingOverlayController(
+             releaseReference()
+             return
+         }
++        // 用了 Phone Use 的一轮结束时自动展开面板：用户正看着别的应用，结果直接展开给他看。
++        // 普通聊天不展开，切出去做别的事时不被打断。
++        if (finishedTarget != null && phoneUseGate.usedPhoneUse(finishedTarget)) {
++            policy = policy.expand()
++            applyExpanded(true)
++        }
+         targetId?.let(::trackTarget)
+         latestSnapshot?.let(::render)
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/PhoneUseOverlayGate.kt b/app/src/main/java/me/rerere/rikkahub/service/PhoneUseOverlayGate.kt
+new file mode 100644
+index 000000000..c6f344b9d
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/service/PhoneUseOverlayGate.kt
+@@ -0,0 +1,57 @@
++package me.rerere.rikkahub.service
++
++import android.view.WindowManager
++import android.widget.FrameLayout
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.launch
++import me.rerere.rikkahub.data.ai.tools.local.PHONE_USE_TOOL_NAME
++import me.rerere.rikkahub.phoneuse.PhoneUseManager
++import kotlin.uuid.Uuid
++
++/**
++ * Phone Use 期间的悬浮窗门控，从 [ChatFloatingOverlayController] 抽出来：
++ * 截图或执行手势时让出屏幕，回复用过 Phone Use 的一轮结束时展开面板。
++ * 窗口本身仍由控制器持有，这里只通过回调操作它。
++ */
++internal class PhoneUseOverlayGate(
++    private val scope: CoroutineScope,
++    private val chat: ChatService,
++    /** Phone Use 开始动作时收起面板 */
++    private val collapsePanel: () -> Unit,
++    /** 当前悬浮窗的根视图、窗口参数和窗口服务，没有窗口时根视图与参数为 null */
++    private val windowState: () -> Triple<FrameLayout?, WindowManager.LayoutParams?, WindowManager?>,
++) {
++    /** 开始监听 Phone Use 的 acting 状态；返回的 Job 由调用方在关闭时取消 */
++    fun start(): Job = scope.launch { PhoneUseManager.acting.collect(::yieldScreen) }
++
++    /** 目标会话一轮结束时，若回复用过 phone_use 则返回 true，调用方展开面板 */
++    fun usedPhoneUse(conversationId: Uuid): Boolean {
++        val replyId = chat.getFloatingReplyMessageIdFlow(conversationId).value ?: return false
++        return chat.getConversationFlow(conversationId).value.messageNodes.any { node ->
++            node.messages.any { message ->
++                message.id == replyId && message.getTools().any { it.toolName == PHONE_USE_TOOL_NAME }
++            }
++        }
++    }
++
++    /**
++     * Phone Use 截图或执行手势时让出屏幕：悬浮窗不能出现在截图里，也不能挡住落在它位置上的点击。
++     * 不用 detach（每次重建内容会一直闪），只让窗口透明并且不接收触摸；展开的面板先收起。
++     * 透明度要改窗口参数而不是 View：Android 12 起，触摸穿过不透明的悬浮窗落到别的应用上会被系统丢弃，
++     * 系统看的是窗口的透明度。
++     */
++    private fun yieldScreen(yielding: Boolean) {
++        if (yielding) collapsePanel()
++        val (frame, lp, windowManager) = windowState()
++        if (frame == null || lp == null) return
++        if (yielding) {
++            frame.alpha = 0f
++            lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
++        } else {
++            frame.alpha = 1f
++            lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
++        }
++        runCatching { windowManager?.updateViewLayout(frame, lp) }
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolPage.kt
+index 46611f9bd..dc494c11a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolPage.kt
+@@ -10,7 +10,9 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.LargeFlexibleTopAppBar
++import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Switch
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.material3.TopAppBarDefaults
+@@ -35,16 +37,22 @@ import me.rerere.hugeicons.stroke.Copy01
+ import me.rerere.hugeicons.stroke.FilterHorizontal
+ import me.rerere.hugeicons.stroke.Snow
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.data.ai.tools.LocalToolOption
+ import me.rerere.rikkahub.data.ai.tools.local.TermuxIntegration
++import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.model.Assistant
+ import me.rerere.rikkahub.data.telegram.TelegramBotPreferences
++import me.rerere.rikkahub.phoneuse.PhoneUseManager
++import me.rerere.rikkahub.phoneuse.isFloatingChatWindowOn
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
++import me.rerere.rikkahub.ui.context.LocalNavController
+ import me.rerere.rikkahub.ui.context.LocalToaster
+ import me.rerere.rikkahub.ui.theme.CustomColors
+ import me.rerere.rikkahub.utils.hasUsageStatsPermission
++import me.rerere.rikkahub.utils.openAccessibilitySettings
+ import me.rerere.rikkahub.utils.openUsageAccessSettings
+ import org.koin.androidx.compose.koinViewModel
+ import org.koin.compose.koinInject
+@@ -111,13 +119,32 @@ private fun AssistantLocalToolContent(
+ ) {
+     val ctx = LocalContext.current
+     val toaster = LocalToaster.current
++    val navController = LocalNavController.current
++    val settingsStore: SettingsStore = koinInject()
++    val phoneUseServiceOn = PhoneUseManager.controller.collectAsStateWithLifecycle().value != null
+     val screenTimePermissionRequiredText =
+         stringResource(R.string.assistant_page_local_tools_screen_time_permission_required)
++    val floatingWindowRequiredText =
++        stringResource(R.string.assistant_page_local_tools_phone_use_floating_window_required)
++    val enableServiceText = stringResource(R.string.assistant_page_local_tools_phone_use_enable_service)
+ 
+     fun toggleLocalTool(
+         option: LocalToolOption,
+         enabled: Boolean,
+     ) {
++        // 没有悬浮窗就看不到 AI 在做什么、也不方便随时停下，先去把它打开，这次不开启工具
++        if (enabled && option == LocalToolOption.PhoneUse &&
++            !isFloatingChatWindowOn(ctx, settingsStore.settingsFlow.value)
++        ) {
++            toaster.show(message = floatingWindowRequiredText, type = ToastType.Warning)
++            navController.navigate(Screen.SettingPreferencesNotification)
++            return
++        }
++        // 无障碍服务还没开时带用户去系统设置，开关照常打开，开完服务就能用
++        if (enabled && option == LocalToolOption.PhoneUse && !phoneUseServiceOn) {
++            toaster.show(message = enableServiceText, type = ToastType.Warning)
++            ctx.openAccessibilitySettings()
++        }
+         if (enabled && option == LocalToolOption.ScreenTime && !ctx.hasUsageStatsPermission()) {
+             toaster.show(message = screenTimePermissionRequiredText, type = ToastType.Warning)
+             ctx.openUsageAccessSettings()
+@@ -679,6 +706,33 @@ private fun AssistantLocalToolContent(
+                     )
+                 },
+             )
++            if (PhoneUseManager.isSupported) {
++                val phoneUseChecked = assistant.localTools.contains(LocalToolOption.PhoneUse)
++                item(
++                    leadingContent = { ToolOptionGroupIcon(LocalToolOption.PhoneUse, phoneUseChecked) },
++                    headlineContent = {
++                        Text(stringResource(R.string.assistant_page_local_tools_phone_use_title))
++                    },
++                    supportingContent = {
++                        Column {
++                            Text(stringResource(R.string.assistant_page_local_tools_phone_use_desc))
++                            // 开了工具但服务没开时模型调用会直接报错，在这里说明原因
++                            if (phoneUseChecked && !phoneUseServiceOn) {
++                                Text(
++                                    text = stringResource(R.string.assistant_page_local_tools_phone_use_service_off),
++                                    color = MaterialTheme.colorScheme.error,
++                                )
++                            }
++                        }
++                    },
++                    trailingContent = {
++                        Switch(
++                            checked = phoneUseChecked,
++                            onCheckedChange = { toggleLocalTool(LocalToolOption.PhoneUse, it) },
++                        )
++                    },
++                )
++            }
+             toolSwitchItem(R.string.assistant_page_local_tools_app_launcher_title, R.string.assistant_page_local_tools_app_launcher_desc, assistant.localTools.contains(LocalToolOption.AppLauncher), option = LocalToolOption.AppLauncher) { toggleLocalTool(LocalToolOption.AppLauncher, it) }
+             val termuxChecked = assistant.localTools.contains(LocalToolOption.Termux)
+             item(
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolWidgets.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolWidgets.kt
+index 7e3b2f6df..2f3354f7a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolWidgets.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/assistant/detail/AssistantLocalToolWidgets.kt
+@@ -581,6 +581,7 @@ internal fun iconForLocalToolOption(option: LocalToolOption): ImageVector =
+         LocalToolOption.Reliability -> HugeIcons.SecurityCheck
+         LocalToolOption.CostGuards -> HugeIcons.CoinsDollar
+         LocalToolOption.ScreenAutomation -> HugeIcons.CursorPointer01
++        LocalToolOption.PhoneUse -> HugeIcons.SmartPhone01
+         LocalToolOption.AppLauncher -> HugeIcons.Rocket01
+         LocalToolOption.Termux -> HugeIcons.ComputerTerminal01
+         LocalToolOption.KeyboardControl -> HugeIcons.Keyboard
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorChecks.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorChecks.kt
+index 5cbe19d22..829bb293d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorChecks.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorChecks.kt
+@@ -15,6 +15,8 @@ import me.rerere.rikkahub.data.ai.tools.LocalToolOption
+ import me.rerere.rikkahub.data.ai.tools.local.AccessibilityServiceHandle
+ import me.rerere.rikkahub.data.ai.tools.local.NotificationListenerHandle
+ import me.rerere.rikkahub.data.ai.tools.local.PermissionHelper
++import me.rerere.rikkahub.phoneuse.PhoneUseManager
++import me.rerere.rikkahub.phoneuse.isPhoneUseServiceEnabledInSettings
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+ import me.rerere.rikkahub.data.db.AppDatabase
+@@ -96,6 +98,7 @@ internal object Capability {
+     val Overlay: Set<LocalToolOption> =
+         setOf(
+             LocalToolOption.ScreenAutomation, // "agent is working" overlay during automation
++            LocalToolOption.PhoneUse, // background floating window must be on to watch / stop it
+         )
+     val WriteSettings: Set<LocalToolOption> =
+         setOf(
+@@ -121,6 +124,7 @@ private val DOCTOR_TOOL_STRING_RES =
+         LocalToolOption.DeviceInfo to R.string.doctor_tool_device_info,
+         LocalToolOption.NotificationListener to R.string.doctor_tool_nl,
+         LocalToolOption.ScreenAutomation to R.string.doctor_tool_screen,
++        LocalToolOption.PhoneUse to R.string.doctor_tool_phone_use,
+         LocalToolOption.SpeechToText to R.string.doctor_tool_stt,
+         LocalToolOption.TelegramBot to R.string.doctor_tool_telegram,
+         LocalToolOption.CronJobs to R.string.doctor_tool_cron,
+@@ -618,6 +622,7 @@ class DoctorChecks(
+                     ),
+                 )
+             }
++            phoneUseCheck(enabled)?.let { add(it) }
+             // NotificationListener binding — same logic.
+             val nlNeeders = requirersOf(Capability.NotificationListener, enabled)
+             if (nlNeeders.isNotEmpty()) {
+@@ -653,6 +658,43 @@ class DoctorChecks(
+             }
+         }
+ 
++    /**
++     * Phone Use service binding — only flagged if Phone Use is enabled on some assistant.
++     * Unlike the accessibility row above, this one tracks the Phone Use service itself,
++     * not the screen-automation service.
++     */
++    private fun phoneUseCheck(enabled: Set<LocalToolOption>): DoctorCheck? {
++        if (LocalToolOption.PhoneUse !in enabled) return null
++        val phoneUseName = LocalToolOption.PhoneUse.shortName(context)
++        val phoneUseBound = PhoneUseManager.controller.value != null
++        val phoneUseEnabled = isPhoneUseServiceEnabledInSettings(context)
++        return DoctorCheck(
++            id = "service.phone_use_bound",
++            category = DoctorCategory.Services,
++            labelRes = R.string.doctor_svc_phone_use,
++            detail =
++                when {
++                    phoneUseBound -> context.getString(R.string.doctor_msg_acc_live, phoneUseName)
++                    phoneUseEnabled -> context.getString(R.string.doctor_msg_acc_enabled_unbound)
++                    else -> context.getString(R.string.doctor_msg_acc_needed, phoneUseName)
++                },
++            severity =
++                when {
++                    phoneUseBound -> Severity.OK
++                    else -> Severity.WARN
++                },
++            fix =
++                if (!phoneUseBound) {
++                    FixAction.OpenIntent(
++                        labelRes = R.string.doctor_perm_14,
++                        intent = PermissionHelper.accessibilitySettingsIntent(),
++                    )
++                } else {
++                    null
++                },
++        )
++    }
++
+     // ----- Active assistant ------------------------------------------------------------
+ 
+     /**
+diff --git a/app/src/main/java/me/rerere/rikkahub/utils/ContextUtil.kt b/app/src/main/java/me/rerere/rikkahub/utils/ContextUtil.kt
+index c9923838a..bb2bcf24b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/utils/ContextUtil.kt
++++ b/app/src/main/java/me/rerere/rikkahub/utils/ContextUtil.kt
+@@ -124,6 +124,14 @@ fun Context.openUsageAccessSettings() {
+     }
+ }
+ 
++fun Context.openAccessibilitySettings() {
++    runCatching {
++        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
++    }.onFailure {
++        AppLog.e(TAG, "openAccessibilitySettings failed", it)
++    }
++}
++
+ /**
+  * Open a url
+  */
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index efdb78c7b..2e726b6ed 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -1346,6 +1346,12 @@
+   <string name="assistant_page_local_tools_section_screen_automation">الشاشة والطرفية</string>
+   <string name="assistant_page_local_tools_screen_automation_title">أتمتة الشاشة</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">السماح للنموذج اللغوي بالنقر والسحب والتمرير وقراءة المحتوى المعروض على الشاشة والتقاط لقطات شاشة عبر خدمة إمكانية الوصول في Android.</string>
++  <string name="assistant_page_local_tools_phone_use_title">استخدام الهاتف</string>
++  <string name="assistant_page_local_tools_phone_use_desc">اسمح للذكاء الاصطناعي بقراءة الشاشة والتحكم في التطبيقات الأخرى على هذا الهاتف</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">خدمة إمكانية الوصول متوقفة. أطفئ هذا المفتاح ثم أعد تشغيله لفتح الإعدادات. إذا جعل النظام هذا الخيار باهتًا، فاسمح بالإعدادات المقيّدة لهذا التطبيق من معلومات التطبيق أولًا.</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">فعّل \"RikkaHub Phone Use\" في إعدادات إمكانية الوصول</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">فعّل النافذة العائمة في الخلفية أولًا</string>
++  <string name="phone_use_accessibility_description">يتيح مساعد الذكاء الاصطناعي قراءة الشاشة وتنفيذ النقرات والسحب وإدخال النص نيابةً عنك عند تمكين أداة استخدام الهاتف. لن يُنفَّذ أي شيء ما لم يكن المساعد ينفّذ مهمة طلبتها.</string>
+   <string name="assistant_page_local_tools_app_launcher_title">مشغّل التطبيقات</string>
+   <string name="assistant_page_local_tools_app_launcher_desc">فتح التطبيقات المثبتة باسم الحزمة (مثل Termux، الإعدادات) وسرد التطبيقات المتاحة. يقترن بأتمتة الشاشة للتحكم الكامل في الواجهة.</string>
+   <string name="assistant_page_local_tools_notifications_title">إدراك الإشعارات</string>
+@@ -2070,6 +2076,7 @@
+   <string name="doctor_svc_04">فتح إعدادات Telegram</string>
+   <string name="doctor_svc_05">خدمة أمامية لروبوت Telegram</string>
+   <string name="doctor_svc_09">خدمة إمكانية الوصول مرتبطة</string>
++  <string name="doctor_svc_phone_use">خدمة استخدام الهاتف</string>
+   <string name="doctor_svc_13">مستمع الإشعارات مرتبط</string>
+   <string name="doctor_assistant_01">المساعد الافتراضي</string>
+   <string name="doctor_assistant_05">فتح المساعد</string>
+@@ -2313,6 +2320,7 @@
+   <string name="mcp_tool_shizuku">Shizuku</string>
+   <string name="mcp_tool_telegram_bot">بوت تلغرام</string>
+   <string name="mcp_tool_screen_automation">أتمتة الشاشة</string>
++  <string name="mcp_tool_phone_use">استخدام الهاتف</string>
+   <string name="mcp_tool_app_launcher">تشغيل التطبيقات</string>
+   <string name="mcp_tool_termux">أوامر Termux</string>
+   <string name="mcp_tool_notification_listener">مراقبة الإشعارات</string>
+@@ -3010,6 +3018,7 @@
+   <string name="doctor_tool_device_info">معلومات الجهاز</string>
+   <string name="doctor_tool_nl">مستمع الإشعارات</string>
+   <string name="doctor_tool_screen">أتمتة الشاشة</string>
++  <string name="doctor_tool_phone_use">استخدام الهاتف</string>
+   <string name="doctor_tool_stt">تحويل الكلام إلى نص</string>
+   <string name="doctor_tool_telegram">روبوت Telegram</string>
+   <string name="doctor_tool_cron">المهام المجدولة</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 4c3a9c351..fc8da5e94 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -1396,6 +1396,12 @@
+   <string name="assistant_page_local_tools_reliability_desc">讓助理檢查 GitHub 上的新版本，並按需產生已遮蔽的錯誤報告 ZIP。錯誤報告包含最近的數千行 logcat 記錄（敏感資訊已遮蔽）以及應用程式版本 + 裝置資訊 — 並明確排除你的對話、token 和已儲存的主機。</string>
+   <string name="assistant_page_local_tools_reliability_title">可靠性</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">讓大型語言模型透過 Android 無障礙服務點選、滑動、捲動、讀取螢幕內容和截圖。</string>
++  <string name="assistant_page_local_tools_phone_use_title">Phone Use</string>
++  <string name="assistant_page_local_tools_phone_use_desc">讓 AI 讀取螢幕並操作此手機上的其他應用程式</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">無障礙服務已關閉。將此開關關閉再開啟，即可開啟設定。若系統將該選項反灰，請先在「應用程式資訊」中允許此應用程式的受限設定。</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">在無障礙設定中開啟 \"RikkaHub Phone Use\"</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">請先開啟背景懸浮視窗</string>
++  <string name="phone_use_accessibility_description">啟用「Phone Use」工具後，AI 助理即可讀取螢幕內容，並代替你執行點按、滑動和文字輸入。除非助理正在執行你指派的任務，否則不會進行任何操作。</string>
+   <string name="assistant_page_local_tools_screen_automation_title">螢幕自動化</string>
+   <string name="assistant_page_local_tools_section_automation">自動化</string>
+   <string name="assistant_page_local_tools_section_existing">內建工具</string>
+@@ -2272,6 +2278,7 @@
+   <string name="doctor_svc_04">打开 Telegram 设置</string>
+   <string name="doctor_svc_05">Telegram 机器人前台服务</string>
+   <string name="doctor_svc_09">无障碍服务已绑定</string>
++  <string name="doctor_svc_phone_use">Phone Use 服務</string>
+   <string name="doctor_svc_13">通知监听器已绑定</string>
+   <string name="doctor_assistant_01">默认助手</string>
+   <string name="doctor_assistant_05">打开助手</string>
+@@ -3217,6 +3224,7 @@
+   <string name="doctor_tool_device_info">裝置資訊</string>
+   <string name="doctor_tool_nl">通知監聽</string>
+   <string name="doctor_tool_screen">屏幕自動化</string>
++  <string name="doctor_tool_phone_use">Phone Use</string>
+   <string name="doctor_tool_stt">語音轉文字</string>
+   <string name="doctor_tool_telegram">Telegram 機器人</string>
+   <string name="doctor_tool_cron">定時任務</string>
+@@ -3316,6 +3324,7 @@
+   <string name="mcp_tool_shizuku">Shizuku 提權</string>
+   <string name="mcp_tool_telegram_bot">Telegram 機器人</string>
+   <string name="mcp_tool_screen_automation">螢幕自動化</string>
++  <string name="mcp_tool_phone_use">Phone Use</string>
+   <string name="mcp_tool_app_launcher">啟動應用</string>
+   <string name="mcp_tool_termux">Termux 命令</string>
+   <string name="mcp_tool_notification_listener">通知監聽</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index e8842f8ac..be700bc15 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -1380,6 +1380,12 @@
+   <string name="assistant_page_local_tools_reliability_desc">アシスタントが GitHub で新しいリリースを確認し、機密情報を伏せたバグレポート ZIP をオンデマンドで作成できます。バグレポートには直近の数千行の logcat（機密情報は伏せ字）とアプリバージョン + デバイス情報が含まれ、会話、トークン、保存済みホストは明示的に除外されます。</string>
+   <string name="assistant_page_local_tools_reliability_title">信頼性</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">LLM が Android のユーザー補助サービスを介してタップ、スワイプ、スクロール、画面内容の読み取り、スクリーンショットの撮影を行えるようにします。</string>
++  <string name="assistant_page_local_tools_phone_use_title">スマホ操作</string>
++  <string name="assistant_page_local_tools_phone_use_desc">AI が画面を読み取り、この端末上の他のアプリを操作できるようにします</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">ユーザー補助サービスがオフです。このスイッチをオフにしてから再度オンにすると設定が開きます。システムでこのオプションがグレー表示される場合は、先にアプリ情報でこのアプリの制限付き設定を許可してください。</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">ユーザー補助設定で\"RikkaHub Phone Use\"をオンにしてください</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">先にバックグラウンドのフローティングウィンドウを有効にしてください</string>
++  <string name="phone_use_accessibility_description">Phone Useツールを有効にすると、AIアシスタントが画面を読み取り、タップ、スワイプ、テキスト入力を代行できるようになります。アシスタントがあなたの依頼したタスクを実行している場合にのみ動作し、それ以外は何も行われません。</string>
+   <string name="assistant_page_local_tools_screen_automation_title">画面自動化</string>
+   <string name="assistant_page_local_tools_section_automation">自動化</string>
+   <string name="assistant_page_local_tools_section_existing">組み込みツール</string>
+@@ -2521,6 +2527,7 @@
+   <string name="doctor_svc_04">Telegram 設定を開く</string>
+   <string name="doctor_svc_05">Telegram ボットのフォアグラウンドサービス</string>
+   <string name="doctor_svc_09">アクセシビリティサービスは接続済み</string>
++  <string name="doctor_svc_phone_use">Phone Use サービス</string>
+   <string name="doctor_svc_13">通知リスナーは接続済み</string>
+   <string name="doctor_assistant_01">既定のアシスタント</string>
+   <string name="doctor_assistant_05">アシスタントを開く</string>
+@@ -2764,6 +2771,7 @@
+   <string name="mcp_tool_shizuku">Shizuku</string>
+   <string name="mcp_tool_telegram_bot">Telegram ボット</string>
+   <string name="mcp_tool_screen_automation">画面自動化</string>
++  <string name="mcp_tool_phone_use">スマホ操作</string>
+   <string name="mcp_tool_app_launcher">アプリ起動</string>
+   <string name="mcp_tool_termux">Termux</string>
+   <string name="mcp_tool_notification_listener">通知リスナー</string>
+@@ -3457,6 +3465,7 @@
+   <string name="doctor_tool_device_info">デバイス情報</string>
+   <string name="doctor_tool_nl">通知リスナー</string>
+   <string name="doctor_tool_screen">画面自動化</string>
++  <string name="doctor_tool_phone_use">スマホ操作</string>
+   <string name="doctor_tool_stt">音声認識</string>
+   <string name="doctor_tool_telegram">Telegram ボット</string>
+   <string name="doctor_tool_cron">スケジュールタスク</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 9c6b64b97..931697ebd 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -1377,6 +1377,12 @@
+   <string name="assistant_page_local_tools_reliability_desc">어시스턴트가 GitHub에서 새 릴리스를 확인하고 민감 정보를 가린 버그 보고서 ZIP을 필요 시 생성할 수 있습니다. 버그 보고서에는 최근 수천 줄의 logcat(비밀은 가려짐)과 앱 버전 + 기기 정보가 포함되며, 대화, 토큰, 저장된 호스트는 명시적으로 제외됩니다.</string>
+   <string name="assistant_page_local_tools_reliability_title">신뢰성</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">LLM이 Android 접근성 서비스를 통해 탭, 스와이프, 스크롤, 화면 내용 읽기, 스크린샷 촬영을 할 수 있도록 합니다.</string>
++  <string name="assistant_page_local_tools_phone_use_title">휴대폰 사용</string>
++  <string name="assistant_page_local_tools_phone_use_desc">AI가 화면을 읽고 이 휴대전화의 다른 앱을 조작하도록 허용</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">접근성 서비스가 꺼져 있습니다. 설정을 열려면 이 스위치를 껐다가 다시 켜세요. 시스템에서 해당 옵션이 회색으로 비활성화되어 있으면 먼저 앱 정보에서 이 앱의 제한된 설정을 허용하세요.</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">접근성 설정에서 \"RikkaHub Phone Use\"를 켜세요</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">먼저 백그라운드 플로팅 창을 켜세요</string>
++  <string name="phone_use_accessibility_description">Phone Use 도구를 활성화하면 AI 어시스턴트가 화면을 읽고 사용자를 대신해 탭, 스와이프, 텍스트 입력을 수행할 수 있습니다. 어시스턴트가 요청한 작업을 실행 중인 경우가 아니면 아무 작업도 수행되지 않습니다.</string>
+   <string name="assistant_page_local_tools_screen_automation_title">화면 자동화</string>
+   <string name="assistant_page_local_tools_section_automation">자동화</string>
+   <string name="assistant_page_local_tools_section_existing">기본 제공 도구</string>
+@@ -2521,6 +2527,7 @@
+   <string name="doctor_svc_04">Telegram 설정 열기</string>
+   <string name="doctor_svc_05">Telegram 봇 포그라운드 서비스</string>
+   <string name="doctor_svc_09">접근성 서비스 연결됨</string>
++  <string name="doctor_svc_phone_use">Phone Use 서비스</string>
+   <string name="doctor_svc_13">알림 리스너 연결됨</string>
+   <string name="doctor_assistant_01">기본 어시스턴트</string>
+   <string name="doctor_assistant_05">어시스턴트 열기</string>
+@@ -2764,6 +2771,7 @@
+   <string name="mcp_tool_shizuku">Shizuku</string>
+   <string name="mcp_tool_telegram_bot">Telegram 봇</string>
+   <string name="mcp_tool_screen_automation">화면 자동화</string>
++  <string name="mcp_tool_phone_use">휴대폰 사용</string>
+   <string name="mcp_tool_app_launcher">앱 실행</string>
+   <string name="mcp_tool_termux">Termux</string>
+   <string name="mcp_tool_notification_listener">알림 리스너</string>
+@@ -3457,6 +3465,7 @@
+   <string name="doctor_tool_device_info">기기 정보</string>
+   <string name="doctor_tool_nl">알림 리스너</string>
+   <string name="doctor_tool_screen">화면 자동화</string>
++  <string name="doctor_tool_phone_use">휴대폰 사용</string>
+   <string name="doctor_tool_stt">음성 텍스트 변환</string>
+   <string name="doctor_tool_telegram">Telegram 봇</string>
+   <string name="doctor_tool_cron">예약 작업</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 2a4f1a901..5cf5b1add 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -1375,6 +1375,12 @@
+   <string name="assistant_page_local_tools_reliability_desc">Позволяет ассистенту проверять GitHub на наличие новых выпусков и по запросу создавать ZIP-отчёт об ошибках с удалёнными конфиденциальными данными. Отчёт об ошибках включает последние несколько тысяч строк logcat (с удалёнными секретами) и версию приложения + сведения об устройстве — и явно исключает ваши разговоры, токены и сохранённые хосты.</string>
+   <string name="assistant_page_local_tools_reliability_title">Надёжность</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">Позволяет LLM нажимать, проводить, прокручивать, читать содержимое экрана и делать снимки экрана через службу специальных возможностей Android.</string>
++  <string name="assistant_page_local_tools_phone_use_title">Использование телефона</string>
++  <string name="assistant_page_local_tools_phone_use_desc">Разрешить ИИ читать экран и управлять другими приложениями на этом телефоне</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">Служба доступности выключена. Выключите и снова включите этот переключатель, чтобы открыть настройки. Если система сделает этот пункт серым, сначала разрешите ограниченные настройки для этого приложения в разделе «Информация о приложении».</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">Включите \"RikkaHub Phone Use\" в настройках специальных возможностей</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">Сначала включите фоновое плавающее окно</string>
++  <string name="phone_use_accessibility_description">Позволяет ИИ-ассистенту читать экран и выполнять за вас нажатия, свайпы и ввод текста, когда вы включаете инструмент Phone Use. Ничего не выполняется, если ассистент не выполняет задачу, которую вы запросили.</string>
+   <string name="assistant_page_local_tools_screen_automation_title">Автоматизация экрана</string>
+   <string name="assistant_page_local_tools_section_automation">Автоматизация</string>
+   <string name="assistant_page_local_tools_section_existing">Встроенные инструменты</string>
+@@ -2516,6 +2522,7 @@
+   <string name="doctor_svc_04">Открыть настройки Telegram</string>
+   <string name="doctor_svc_05">Foreground-служба бота Telegram</string>
+   <string name="doctor_svc_09">Служба спец. возможностей подключена</string>
++  <string name="doctor_svc_phone_use">Служба Phone Use</string>
+   <string name="doctor_svc_13">Прослушиватель уведомлений подключён</string>
+   <string name="doctor_assistant_01">Ассистент по умолчанию</string>
+   <string name="doctor_assistant_05">Открыть ассистента</string>
+@@ -2759,6 +2766,7 @@
+   <string name="mcp_tool_shizuku">Shizuku</string>
+   <string name="mcp_tool_telegram_bot">Telegram-бот</string>
+   <string name="mcp_tool_screen_automation">Автоматизация экрана</string>
++  <string name="mcp_tool_phone_use">Использование телефона</string>
+   <string name="mcp_tool_app_launcher">Запуск приложений</string>
+   <string name="mcp_tool_termux">Termux</string>
+   <string name="mcp_tool_notification_listener">Прослушивание уведомлений</string>
+@@ -3454,6 +3462,7 @@
+   <string name="doctor_tool_device_info">Сведения об устройстве</string>
+   <string name="doctor_tool_nl">Прослушиватель уведомлений</string>
+   <string name="doctor_tool_screen">Автоматизация экрана</string>
++  <string name="doctor_tool_phone_use">Использование телефона</string>
+   <string name="doctor_tool_stt">Распознавание речи</string>
+   <string name="doctor_tool_telegram">Бот Telegram</string>
+   <string name="doctor_tool_cron">Задачи по расписанию</string>
+diff --git a/app/src/main/res/values-v30/bools.xml b/app/src/main/res/values-v30/bools.xml
+new file mode 100644
+index 000000000..d381ceb4e
+--- /dev/null
++++ b/app/src/main/res/values-v30/bools.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++  <bool name="phone_use_supported">true</bool>
++</resources>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 7edd45e0c..23ff1c1d6 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1618,6 +1618,12 @@
+   <string name="assistant_page_local_tools_reliability_desc">让助手检查 GitHub 上的新版本，并按需生成已脱敏的错误报告 ZIP。错误报告包含最近的数千行 logcat 日志（敏感信息已脱敏）以及应用版本 + 设备信息 — 并明确排除你的对话、token 和已保存的主机。</string>
+   <string name="assistant_page_local_tools_reliability_title">可靠性</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">让大模型通过 Android 无障碍服务点击、滑动、滚动、读取屏幕内容和截图。</string>
++  <string name="assistant_page_local_tools_phone_use_title">Phone Use</string>
++  <string name="assistant_page_local_tools_phone_use_desc">允许 AI 读取屏幕并操作此手机上的其他应用</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">无障碍服务已关闭。请将此开关关闭再打开，以进入设置。若该选项在系统中呈灰色不可用，请先在\"应用信息\"中为此应用允许受限设置。</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">在无障碍设置中开启 \"RikkaHub Phone Use\"</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">请先开启后台悬浮窗</string>
++  <string name="phone_use_accessibility_description">启用 Phone Use 工具后，允许 AI 助手读取屏幕并为您执行点按、滑动和文本输入。除非助手正在运行您请求的任务，否则不会执行任何操作。</string>
+   <string name="assistant_page_local_tools_screen_automation_title">屏幕自动化</string>
+   <string name="assistant_page_local_tools_section_automation">自动化</string>
+   <string name="assistant_page_extra_cold_section">工具详略（高级）</string>
+@@ -2853,6 +2859,7 @@
+   <string name="doctor_svc_04">打开 Telegram 设置</string>
+   <string name="doctor_svc_05">Telegram 机器人前台服务</string>
+   <string name="doctor_svc_09">无障碍服务已绑定</string>
++  <string name="doctor_svc_phone_use">Phone Use 服务</string>
+   <string name="doctor_svc_13">通知监听器已绑定</string>
+   <string name="doctor_assistant_01">默认助手</string>
+   <string name="doctor_assistant_05">打开助手</string>
+@@ -3330,6 +3337,7 @@
+   <string name="doctor_tool_device_info">设备信息</string>
+   <string name="doctor_tool_nl">通知监听</string>
+   <string name="doctor_tool_screen">屏幕自动化</string>
++  <string name="doctor_tool_phone_use">Phone Use</string>
+   <string name="doctor_tool_stt">语音转文字</string>
+   <string name="doctor_tool_telegram">Telegram 机器人</string>
+   <string name="doctor_tool_cron">定时任务</string>
+@@ -3433,6 +3441,7 @@
+   <string name="mcp_tool_shizuku">Shizuku 提权</string>
+   <string name="mcp_tool_telegram_bot">Telegram 机器人</string>
+   <string name="mcp_tool_screen_automation">屏幕自动化</string>
++  <string name="mcp_tool_phone_use">Phone Use</string>
+   <string name="mcp_tool_app_launcher">启动应用</string>
+   <string name="mcp_tool_termux">Termux 命令</string>
+   <string name="mcp_tool_notification_listener">通知监听</string>
+diff --git a/app/src/main/res/values/bools.xml b/app/src/main/res/values/bools.xml
+new file mode 100644
+index 000000000..7a65d1522
+--- /dev/null
++++ b/app/src/main/res/values/bools.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++  <!-- Phone Use 只支持 Android 11 及以上，values-v30 里是 true；和 PhoneUseManager.isSupported 保持一致 -->
++  <bool name="phone_use_supported">false</bool>
++</resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 03d54e04f..1055f8507 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1790,6 +1790,13 @@
+   <string name="assistant_page_local_tools_section_screen_automation">Screen &amp; terminal</string>
+   <string name="assistant_page_local_tools_screen_automation_title">Screen automation</string>
+   <string name="assistant_page_local_tools_screen_automation_desc">Let the LLM tap, swipe, scroll, read on-screen content, and take screenshots via Android\'s accessibility service.</string>
++  <string name="assistant_page_local_tools_phone_use_title">Phone Use</string>
++  <string name="assistant_page_local_tools_phone_use_desc">Let the AI read the screen and operate other apps on this phone</string>
++  <string name="assistant_page_local_tools_phone_use_service_off">The accessibility service is off. Turn this switch off and on again to open the settings. If the system greys the option out, allow restricted settings for this app in App info first.</string>
++  <string name="assistant_page_local_tools_phone_use_enable_service">Turn on \"RikkaHub Phone Use\" in the accessibility settings</string>
++  <string name="assistant_page_local_tools_phone_use_floating_window_required">Turn on the background floating window first</string>
++  <string name="phone_use_accessibility_description">Lets the AI assistant read the screen and perform taps, swipes and text input for you when you enable the Phone Use tool. Nothing is done unless the assistant is running a task you asked for.</string>
++  <string name="phone_use_accessibility_label" translatable="false">RikkaHub Phone Use</string>
+   <string name="assistant_page_local_tools_app_launcher_title">App launcher</string>
+   <string name="assistant_page_local_tools_app_launcher_desc">Open installed apps by package name (e.g. Termux, Settings) and list available apps. Pairs with screen automation for full UI control.</string>
+   <string name="assistant_page_local_tools_notifications_title">Notification awareness</string>
+@@ -2846,6 +2853,7 @@
+   <string name="doctor_svc_04">Open Telegram settings</string>
+   <string name="doctor_svc_05">Telegram bot foreground service</string>
+   <string name="doctor_svc_09">Accessibility service bound</string>
++  <string name="doctor_svc_phone_use">Phone Use service</string>
+   <string name="doctor_svc_13">Notification listener bound</string>
+   <string name="doctor_assistant_01">Default assistant</string>
+   <string name="doctor_assistant_05">Open assistants</string>
+@@ -3297,6 +3305,7 @@
+   <string name="doctor_tool_device_info">Device info</string>
+   <string name="doctor_tool_nl">Notification listener</string>
+   <string name="doctor_tool_screen">Screen automation</string>
++  <string name="doctor_tool_phone_use">Phone Use</string>
+   <string name="doctor_tool_stt">Speech to text</string>
+   <string name="doctor_tool_telegram">Telegram bot</string>
+   <string name="doctor_tool_cron">Scheduled jobs</string>
+@@ -3400,6 +3409,7 @@
+   <string name="mcp_tool_shizuku">Shizuku</string>
+   <string name="mcp_tool_telegram_bot">Telegram bot</string>
+   <string name="mcp_tool_screen_automation">Screen automation</string>
++  <string name="mcp_tool_phone_use">Phone Use</string>
+   <string name="mcp_tool_app_launcher">App launcher</string>
+   <string name="mcp_tool_termux">Termux</string>
+   <string name="mcp_tool_notification_listener">Notification listener</string>
+diff --git a/app/src/main/res/xml/phone_use_accessibility.xml b/app/src/main/res/xml/phone_use_accessibility.xml
+new file mode 100644
+index 000000000..6b2bfbfbc
+--- /dev/null
++++ b/app/src/main/res/xml/phone_use_accessibility.xml
+@@ -0,0 +1,10 @@
++<?xml version="1.0" encoding="utf-8"?>
++<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
++    android:accessibilityEventTypes="typeWindowStateChanged"
++    android:accessibilityFeedbackType="feedbackGeneric"
++    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
++    android:canPerformGestures="true"
++    android:canRetrieveWindowContent="true"
++    android:canTakeScreenshot="true"
++    android:description="@string/phone_use_accessibility_description"
++    android:notificationTimeout="500" />
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/PhoneUseToolTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/PhoneUseToolTest.kt
+new file mode 100644
+index 000000000..73d4b673e
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/PhoneUseToolTest.kt
+@@ -0,0 +1,333 @@
++package me.rerere.rikkahub.data.ai.tools
++
++import kotlinx.coroutines.test.runTest
++import kotlinx.serialization.json.JsonObjectBuilder
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import me.rerere.ai.core.Tool
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.data.ai.tools.local.buildPhoneUseTool
++import me.rerere.rikkahub.data.ai.tools.local.phoneUseActionOf
++import me.rerere.rikkahub.phoneuse.PhoneApp
++import me.rerere.rikkahub.phoneuse.PhoneController
++import me.rerere.rikkahub.phoneuse.PhoneElement
++import me.rerere.rikkahub.phoneuse.PhoneKey
++import me.rerere.rikkahub.phoneuse.PhoneScreen
++import me.rerere.rikkahub.phoneuse.PhoneUseManager
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class PhoneUseToolTest {
++    // PhoneUseManager 是进程级单例：每个用例结束时把本用例的控制器拆掉，下一个用例从未绑定开始。
++    private val manager = PhoneUseManager
++    private val controller = FakeController(manager)
++    private var selfInForeground = false
++    private var floatingWindowOn = true
++    private val tool: Tool = buildPhoneUseTool(
++        ownPackageName = "me.rerere.rikkahub",
++        manager = manager,
++        saveScreenshot = { "file:///screenshot.jpg" },
++        isFloatingWindowOn = { floatingWindowOn },
++        isSelfInForeground = { selfInForeground },
++    )
++
++    @After
++    fun tearDown() {
++        PhoneUseManager.detach(controller)
++    }
++
++    private suspend fun call(build: JsonObjectBuilder.() -> Unit): String =
++        tool.execute(buildJsonObject(build)).filterIsInstance<UIMessagePart.Text>().joinToString("\n") { it.text }
++
++    @Test
++    fun `fails with guidance when the accessibility service is off`() = runTest {
++        val error = runCatching { call { put("action", "observe") } }.exceptionOrNull()
++        assertTrue(error!!.message!!.contains("not enabled"))
++    }
++
++    @Test
++    fun `refuses to run while the floating window is off`() = runTest {
++        manager.attach(controller)
++        floatingWindowOn = false
++        val error = runCatching {
++            call {
++                put("action", "press")
++                put("key", "home")
++            }
++        }.exceptionOrNull()
++        assertTrue(error!!.message!!.contains("floating window"))
++        assertTrue(controller.keys.isEmpty())
++    }
++
++    @Test
++    fun `observe lists elements on the grid`() = runTest {
++        manager.attach(controller)
++        val output = call { put("action", "observe") }
++        assertTrue(output.contains("App: Demo (com.demo)"))
++        // 中心 (540,1200) 在 1080x2400 的屏幕上是网格的 (500,500)
++        assertTrue(output.contains("[0] Button \"Send\" clickable @(500,500)"))
++        assertTrue(output.contains("[1] EditText \"Message\" editable focused @(250,900)"))
++        // 没有文字的元素用资源 ID 说明用途，有文字的不带
++        assertTrue(output.contains("[2] ImageView #btn_more clickable @(879,62)"))
++        assertFalse(output.contains("ignored_when_labeled"))
++    }
++
++    @Test
++    fun `tap on element hits its center in pixels while overlays yield`() = runTest {
++        manager.attach(controller)
++        call { put("action", "observe") }
++        val output = call {
++            put("action", "tap")
++            put("element", 0)
++        }
++        assertEquals(listOf(540f, 1200f, 540f, 1200f), controller.gestures.single())
++        assertEquals(listOf(true), controller.actingDuringGesture)
++        assertFalse(manager.acting.value)
++        // 结果直接带回操作后的界面
++        assertTrue(output.startsWith("tap done."))
++        assertTrue(output.contains("Elements"))
++    }
++
++    @Test
++    fun `tap by grid coordinates converts to pixels`() = runTest {
++        manager.attach(controller)
++        // 模型有时把数字写成字符串
++        call {
++            put("action", "tap")
++            put("x", "250")
++            put("y", 750)
++        }
++        assertEquals(listOf(270f, 1800f, 270f, 1800f), controller.gestures.single())
++    }
++
++    @Test
++    fun `scroll down moves the finger up`() = runTest {
++        manager.attach(controller)
++        call {
++            put("action", "scroll")
++            put("direction", "down")
++        }
++        val (fromX, fromY, toX, toY) = controller.gestures.single()
++        assertEquals(fromX, toX)
++        assertTrue(fromY > toY)
++    }
++
++    @Test
++    fun `stale element index is rejected`() = runTest {
++        manager.attach(controller)
++        call { put("action", "observe") }
++        val error = runCatching {
++            call {
++                put("action", "tap")
++                put("element", 9)
++            }
++        }.exceptionOrNull()
++        assertTrue(error!!.message!!.contains("Observe the screen again"))
++        assertTrue(controller.gestures.isEmpty())
++    }
++
++    @Test
++    fun `refuses to operate while this app is in the foreground except leaving it`() = runTest {
++        manager.attach(controller)
++        selfInForeground = true
++        val error = runCatching {
++            call {
++                put("action", "tap")
++                put("x", 1)
++                put("y", 1)
++            }
++        }.exceptionOrNull()
++        assertTrue(error!!.message!!.contains("foreground"))
++        assertTrue(controller.gestures.isEmpty())
++
++        call {
++            put("action", "press")
++            put("key", "home")
++        }
++        assertEquals(listOf(PhoneKey.HOME), controller.keys)
++        call {
++            put("action", "open_app")
++            put("app", "demo")
++        }
++        assertEquals(listOf("com.demo"), controller.opened)
++    }
++
++    @Test
++    fun `blocked apps cannot be listed or opened`() = runTest {
++        manager.attach(controller)
++        assertFalse(call { put("action", "list_apps") }.contains("Alipay"))
++        val error = runCatching {
++            call {
++                put("action", "open_app")
++                put("app", "Alipay")
++            }
++        }.exceptionOrNull()
++        assertTrue(error!!.message!!.contains("blocked"))
++        assertTrue(controller.opened.isEmpty())
++    }
++
++    @Test
++    fun `inside a blocked app nothing is read or operated but leaving works`() = runTest {
++        manager.attach(controller)
++        call { put("action", "observe") }
++        // 从别的应用跳转进了支付宝
++        controller.visible = listOf("com.eg.android.AlipayGphone")
++        listOf("observe", "screenshot", "tap").forEach { action ->
++            val error = runCatching {
++                call {
++                    put("action", action)
++                    put("element", 0)
++                }
++            }.exceptionOrNull()
++            assertTrue(action, error!!.message!!.contains("blocked"))
++        }
++        assertTrue(controller.gestures.isEmpty())
++
++        // 返回可以用，但结果里不带支付宝界面的内容
++        val output = call {
++            put("action", "press")
++            put("key", "back")
++        }
++        assertEquals(listOf(PhoneKey.BACK), controller.keys)
++        assertTrue(output.contains("blocked"))
++        assertFalse(output.contains("Send"))
++    }
++
++    @Test
++    fun `a blocked app that is visible but not on top still blocks everything`() = runTest {
++        manager.attach(controller)
++        // 分屏或下拉通知栏：最上层是别的应用，支付宝的界面还在屏幕上
++        controller.visible = listOf("com.android.systemui", "com.eg.android.AlipayGphone")
++        listOf("observe", "screenshot", "tap").forEach { action ->
++            val error = runCatching {
++                call {
++                    put("action", action)
++                    put("x", 500)
++                    put("y", 500)
++                }
++            }.exceptionOrNull()
++            assertTrue(action, error!!.message!!.contains("blocked"))
++        }
++        assertTrue(controller.gestures.isEmpty())
++
++        // 操作之后才出现的也不把界面交给模型
++        controller.visible = listOf("com.demo")
++        controller.afterGesture = { controller.visible = listOf("com.demo", "com.eg.android.AlipayGphone") }
++        val output = call {
++            put("action", "tap")
++            put("x", 500)
++            put("y", 500)
++        }
++        assertTrue(output.contains("blocked"))
++        assertFalse(output.contains("Send"))
++    }
++
++    @Test
++    fun `type with submit sets text then presses enter`() = runTest {
++        manager.attach(controller)
++        call { put("action", "observe") }
++        call {
++            put("action", "type")
++            put("element", 1)
++            put("text", "hi")
++            put("submit", true)
++        }
++        assertEquals(listOf(1 to "hi"), controller.texts)
++        assertEquals(listOf(PhoneKey.ENTER), controller.keys)
++    }
++
++    @Test
++    fun `action name is read from complete input only`() {
++        assertEquals("tap", phoneUseActionOf("""{"action":"tap","element":3}"""))
++        assertNull(phoneUseActionOf("""{"action":"ta"""))
++        assertNull(phoneUseActionOf(""))
++    }
++
++    @Test
++    fun `wechat is blocked like the other payment apps`() = runTest {
++        manager.attach(controller)
++        assertFalse(call { put("action", "list_apps") }.contains("WeChat"))
++        controller.visible = listOf("com.tencent.mm")
++        val error = runCatching { call { put("action", "observe") } }.exceptionOrNull()
++        assertTrue(error!!.message!!.contains("blocked"))
++    }
++
++    private class FakeController(private val manager: PhoneUseManager) : PhoneController {
++        val gestures = mutableListOf<List<Float>>()
++        val actingDuringGesture = mutableListOf<Boolean>()
++        val keys = mutableListOf<PhoneKey>()
++        val texts = mutableListOf<Pair<Int?, String>>()
++        val opened = mutableListOf<String>()
++        var afterGesture: () -> Unit = {}
++
++        // 最上层的在前
++        var visible = listOf("com.demo")
++
++        override fun visiblePackages() = visible.toSet()
++
++        override suspend fun captureScreen() = PhoneScreen(
++            packageName = visible.first(),
++            packages = visible.toSet(),
++            appLabel = "Demo",
++            width = 1080,
++            height = 2400,
++            keyboardVisible = false,
++            elements = listOf(
++                element(0, "Button", "Send", 440, 1100, 640, 1300, clickable = true),
++                element(1, "EditText", "Message", 0, 2100, 540, 2220, editable = true, focused = true),
++                element(2, "ImageView", "", 900, 100, 1000, 200, clickable = true, resourceId = "btn_more"),
++            ),
++            truncated = false,
++        )
++
++        override suspend fun screenshot(maxSide: Int) = ByteArray(0)
++
++        override suspend fun gesture(fromX: Float, fromY: Float, toX: Float, toY: Float, durationMs: Long): Boolean {
++            gestures += listOf(fromX, fromY, toX, toY)
++            afterGesture()
++            actingDuringGesture += manager.acting.value
++            return true
++        }
++
++        override suspend fun setText(elementIndex: Int?, text: String): Boolean {
++            texts += elementIndex to text
++            return true
++        }
++
++        override suspend fun pressKey(key: PhoneKey): Boolean {
++            keys += key
++            return true
++        }
++
++        override fun listApps() = listOf(
++            PhoneApp("com.demo", "Demo App"),
++            PhoneApp("com.eg.android.AlipayGphone", "Alipay"),
++            PhoneApp("com.tencent.mm", "WeChat"),
++        )
++
++        override fun openApp(packageName: String): Boolean {
++            opened += packageName
++            return true
++        }
++
++        private fun element(
++            index: Int,
++            className: String,
++            label: String,
++            left: Int,
++            top: Int,
++            right: Int,
++            bottom: Int,
++            clickable: Boolean = false,
++            editable: Boolean = false,
++            focused: Boolean = false,
++            resourceId: String? = "ignored_when_labeled",
++        ) = PhoneElement(
++            index, className, label, resourceId, left, top, right, bottom, clickable, editable, false, null, focused,
++        )
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/BlockedAppsTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/BlockedAppsTest.kt
+new file mode 100644
+index 000000000..7467245cc
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/BlockedAppsTest.kt
+@@ -0,0 +1,52 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class BlockedAppsTest {
++    @Test
++    fun `all payment and banking apps are blocked`() {
++        listOf(
++            "com.eg.android.AlipayGphone", // 支付宝
++            "com.unionpay", // 云闪付
++            "com.tencent.mm", // 微信
++            "com.paypal.android.p2pmobile", // PayPal
++            "com.google.android.apps.walletnfcrel", // Google Wallet
++            "com.google.android.apps.nbu.paisa.user", // Google Pay
++            "com.icbc", // 工商银行
++            "com.chinamworld.main", // 建设银行
++            "com.android.bankabc", // 农业银行
++            "com.chinamworld.bocmbci", // 中国银行
++            "com.bankcomm.Bankcomm", // 交通银行
++            "cmb.pb", // 招商银行
++            "com.yitong.mbank.psbc", // 邮储银行
++        ).forEach { packageName ->
++            assertTrue(packageName, isBlockedAutomationApp(packageName))
++            assertTrue(packageName, packageName in PHONE_USE_BLOCKED_APPS)
++        }
++        assertEquals(13, PHONE_USE_BLOCKED_APPS.size)
++    }
++
++    @Test
++    fun `ordinary apps are not blocked`() {
++        listOf(
++            "com.demo",
++            "com.tencent.mobileqq",
++            "com.android.chrome",
++            "me.rerere.rikkahub",
++        ).forEach { packageName ->
++            assertFalse(packageName, isBlockedAutomationApp(packageName))
++        }
++        assertFalse(isBlockedAutomationApp(null))
++    }
++
++    @Test
++    fun `no foreground envelope when the accessibility service is not connected`() {
++        // RikkaAccessibilityService.instance is null on the JVM; the check must not
++        // intercept anything and must not touch Android framework code.
++        assertNull(blockedForegroundEnvelope())
++    }
++}
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index c54abd53c..e0f75062c 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+@@ -159,6 +159,7 @@ koin-compose = { group = "io.insert-koin", name = "koin-androidx-compose" }
+ koin-androidx-workmanager = { group = "io.insert-koin", name = "koin-androidx-workmanager" }
+ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "serialization-json" }
+ kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "kotlin-coroutines-core" }
++kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "kotlin-coroutines-core" }
+ kotlinx-datetime = { module = "org.jetbrains.kotlinx:kotlinx-datetime", version.ref = "kotlinx-datetime" }
+ lucide-icons = { group = "com.composables", name = "icons-lucide", version.ref = "lucide-icons" }
+ huge-icons = { group = "com.github.rikkahub", name = "hugeicons-compose", version.ref = "huge-icons" }
