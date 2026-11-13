@@ -1,0 +1,187 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshNetworkSession.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshNetworkSession.kt
+index 87f592010..92fb1a2d3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshNetworkSession.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshNetworkSession.kt
+@@ -341,10 +341,24 @@ internal class JumpTunnelProxy(
+         val ch = jumpSession.openChannel("direct-tcpip") as ChannelDirectTCPIP
+         ch.setHost(targetHost)
+         ch.setPort(targetPort)
+-        ch.connect(connectTimeout.coerceAtLeast(10_000))
+-        channel = ch
++        // 流必须在 connect 之前取：JSch 的约定是 getInputStream()/getOutputStream()
++        // 在 connect() 之前调用（晚了库内会记 "should be called before connect()"，
++        // 开头的握手字节也可能丢）；同仓 SshConnection.openShell 与 JumpHostProxy
++        // 都是先取流再 connect。
+         input = ch.inputStream
+         jumpOutStream = ch.outputStream
++        try {
++            ch.connect(connectTimeout.coerceAtLeast(10_000))
++        } catch (e: com.jcraft.jsch.JSchException) {
++            // 建连失败：断开已打开的通道再上抛，否则半开通道留在跳板会话上
++            // （channel 尚未赋值，close() 收不到它）；流引用一并清掉，失败后
++            // 的代理仍报告"未连接"。
++            runCatching { ch.disconnect() }
++            input = null
++            jumpOutStream = null
++            throw e
++        }
++        channel = ch
+     }
+ 
+     override fun getInputStream(): java.io.InputStream = input ?: error("jump proxy not connected")
+diff --git a/app/src/test/java/com/jcraft/jsch/JumpTunnelProxyTest.kt b/app/src/test/java/com/jcraft/jsch/JumpTunnelProxyTest.kt
+new file mode 100644
+index 000000000..d5af838e6
+--- /dev/null
++++ b/app/src/test/java/com/jcraft/jsch/JumpTunnelProxyTest.kt
+@@ -0,0 +1,125 @@
++package com.jcraft.jsch
++
++import me.rerere.rikkahub.data.ai.tools.local.JumpTunnelProxy
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.ByteArrayInputStream
++import java.io.ByteArrayOutputStream
++import java.io.InputStream
++import java.io.OutputStream
++
++/**
++ * [JumpTunnelProxy] 的建连顺序与失败清理。
++ *
++ * 放在 com.jcraft.jsch 包里：JSch 的 Session 与 ChannelDirectTCPIP 构造器是
++ * 包内可见，测试要造一个可控的假跳板会话与假通道只能待在这个包。测试不走
++ * 网络：假会话的 openChannel 直接返回假通道，假通道的 connect 按需成功或
++ * 抛 [JSchException]。
++ */
++class JumpTunnelProxyTest {
++
++    /** 记录调用顺序与断开的假 direct-tcpip 通道。 */
++    private class FakeChannel(
++        private val connectFailure: JSchException? = null,
++    ) : ChannelDirectTCPIP() {
++        val calls = mutableListOf<String>()
++        var disconnected = false
++        val fakeInput: InputStream = ByteArrayInputStream(ByteArray(0))
++        val fakeOutput: OutputStream = ByteArrayOutputStream()
++
++        override fun getInputStream(): InputStream {
++            calls += "getInputStream"
++            return fakeInput
++        }
++
++        override fun getOutputStream(): OutputStream {
++            calls += "getOutputStream"
++            return fakeOutput
++        }
++
++        override fun connect(timeout: Int) {
++            calls += "connect"
++            connectFailure?.let { throw it }
++        }
++
++        override fun disconnect() {
++            calls += "disconnect"
++            disconnected = true
++        }
++    }
++
++    /** openChannel 永远返回假通道的假跳板会话。 */
++    private class FakeSession(
++        private val channel: ChannelDirectTCPIP,
++    ) : Session(JSch(), "jump", "jump.example", 22) {
++        var disconnected = false
++
++        override fun openChannel(type: String): Channel = channel
++
++        override fun disconnect() {
++            disconnected = true
++        }
++    }
++
++    @Test
++    fun `streams are taken before connect`() {
++        val channel = FakeChannel()
++        val session = FakeSession(channel)
++        val proxy = JumpTunnelProxy(session, "target.example", 22)
++
++        proxy.connect(null, "target.example", 22, 10_000)
++
++        assertTrue(
++            "input stream must be taken before connect, was: ${channel.calls}",
++            channel.calls.indexOf("getInputStream") < channel.calls.indexOf("connect"),
++        )
++        assertTrue(
++            "output stream must be taken before connect, was: ${channel.calls}",
++            channel.calls.indexOf("getOutputStream") < channel.calls.indexOf("connect"),
++        )
++        assertSame(channel.fakeInput, proxy.inputStream)
++        assertSame(channel.fakeOutput, proxy.outputStream)
++        assertEquals(listOf("getInputStream", "getOutputStream", "connect"), channel.calls)
++
++        proxy.close()
++        assertTrue(channel.disconnected)
++        assertTrue(session.disconnected)
++    }
++
++    @Test
++    fun `connect failure disconnects channel and rethrows`() {
++        val channel = FakeChannel(JSchException("simulated open failure"))
++        val session = FakeSession(channel)
++        val proxy = JumpTunnelProxy(session, "target.example", 22)
++
++        assertThrows(JSchException::class.java) {
++            proxy.connect(null, "target.example", 22, 10_000)
++        }
++
++        assertTrue("failed channel must be disconnected, was: ${channel.calls}", channel.disconnected)
++        assertEquals(
++            listOf("getInputStream", "getOutputStream", "connect", "disconnect"),
++            channel.calls,
++        )
++        // 失败后代理仍报告"未连接"，不留半开通道的流引用。
++        assertThrows(IllegalStateException::class.java) { proxy.inputStream }
++        assertThrows(IllegalStateException::class.java) { proxy.outputStream }
++    }
++
++    @Test
++    fun `close after failed connect is safe`() {
++        val channel = FakeChannel(JSchException("simulated open failure"))
++        val session = FakeSession(channel)
++        val proxy = JumpTunnelProxy(session, "target.example", 22)
++
++        assertThrows(JSchException::class.java) {
++            proxy.connect(null, "target.example", 22, 10_000)
++        }
++        proxy.close()
++
++        assertTrue(session.disconnected)
++    }
++}
+diff --git a/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt b/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt
+index 15fc37a01..eac103220 100644
+--- a/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt
++++ b/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt
+@@ -122,8 +122,10 @@ class SshConnectionPool(
+         open: (SshConnection, onClose: () -> Unit) -> SshShell,
+     ): SshShell {
+         val pooled = acquire(id, config)
++        // onClose 走池级 release(pooled)：退役中的连接在最后一次使用结束时立即关闭；
++        // 直接传 pooled::release 只减引用计数，退役连接要等 sweeper 巡检才关。
+         return try {
+-            open(pooled.connection, pooled::release)
++            open(pooled.connection) { release(pooled) }
+         } catch (e: Exception) {
+             pooled.release()
+             if (e.isInterruption()) throw e
+@@ -136,7 +138,7 @@ class SshConnectionPool(
+             AppLogger.w(TAG, "openShell: retrying after channel failure (id=$id)", e)
+             val retried = acquire(id, config)
+             try {
+-                open(retried.connection, retried::release)
++                open(retried.connection) { release(retried) }
+             } catch (retryError: Exception) {
+                 retried.release()
+                 throw retryError
