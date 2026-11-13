@@ -1,0 +1,113 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/browser/BrowserToolDefaults.kt b/app/src/main/java/me/rerere/rikkahub/browser/BrowserToolDefaults.kt
+index 3e1d07e0a..753077935 100644
+--- a/app/src/main/java/me/rerere/rikkahub/browser/BrowserToolDefaults.kt
++++ b/app/src/main/java/me/rerere/rikkahub/browser/BrowserToolDefaults.kt
+@@ -1,10 +1,11 @@
+ package me.rerere.rikkahub.browser
+ 
+ /**
+- * Authoritative list of the 17 browser tools the LLM can drive, plus their default
+- * enabled/disabled state. Read tools (cheap, don't touch the page) default ON;
+- * write tools (mutate state, can be misused) default OFF; the loop-control tool
+- * defaults ON because the AI can't escape the browser loop without it.
++ * Authoritative list of the 18 browser tools the LLM can drive, plus their default
++ * enabled/disabled state. Read tools (cheap, don't touch the page) default ON, except
++ * [SCREENSHOT] which defaults OFF because image payloads are token-heavy; write tools
++ * (mutate state, can be misused) default OFF; the loop-control tool defaults ON
++ * because the AI can't escape the browser loop without it.
+  *
+  * Pass 1 lays the catalogue. Pass 2's [me.rerere.rikkahub.data.ai.tools.LocalTools]
+  * registration block will gate per-tool registration on these defaults via
+@@ -12,7 +13,7 @@ package me.rerere.rikkahub.browser
+  */
+ object BrowserToolDefaults {
+ 
+-    // --- Read tools (default ON) --------------------------------------------------------------
++    // --- Read tools (default ON, except SCREENSHOT which defaults OFF) -----------------------
+     const val OPEN = "browser_open"
+     const val CURRENT_URL = "browser_current_url"
+     const val SCREENSHOT = "browser_screenshot"
+@@ -59,9 +60,9 @@ object BrowserToolDefaults {
+     )
+ 
+     /**
+-     * Defaults baked in. Read tools + the loop-control tool default ON; write tools
+-     * default OFF — matches the spec's "highest-trust surface — user must explicitly
+-     * grant write access" rule.
++     * Defaults baked in. Read tools (except [SCREENSHOT], which is opt-in due to image
++     * token cost) + the loop-control tool default ON; write tools default OFF — matches
++     * the spec's "highest-trust surface — user must explicitly grant write access" rule.
+      */
+     val DEFAULT_ENABLED: Map<String, Boolean> = buildMap {
+         READ_TOOLS.forEach { put(it, it != SCREENSHOT) }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt
+index ccf6f9d7e..25c524527 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt
+@@ -100,10 +100,6 @@ private const val LOOP_GUARD_REPEAT_THRESHOLD = 3
+  */
+ internal const val MAX_LOOP_GUARD_TRIPS_PER_TURN = 6
+ 
+-// 轮预算将尽时提前注入收尾指令的宽限窗口：让模型总结收场，而不是被硬掐在半句话上。
+-// 长会话单步 prefill 可达数十秒，120s 跨不过一步 → 300s。
+-internal const val WRAP_UP_GRACE_MS = 300_000L
+-
+ // 流式期间「输出变换 + 界面投递」的合并窗口由当前渲染档位给出（见 data/perf/RenderProfile.kt）：
+ // 每个 token 都做一次全量变换，在长会话下开销随消息数增长。同一窗口内只保留最新快照，
+ // 并在 step 边界与生成结束时强制补齐，最终结果与逐次变换一致（窗口为 0 即恢复逐次处理）。
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+index 221a55a0c..fa4ea34c9 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+@@ -329,7 +329,6 @@ data class NetworkSetting(
+     val proxyPassword: String = "",
+     val hostAddressOverrides: List<HostAddressOverride> = emptyList(),
+     // ── 内嵌隧道（per-app，不接管系统 VPN / DNS）──────────────────────────
+-    // 连接开关只存在于运行期（见 `TunnelState`）：重开 App 不自动连，所以这里不落盘 enabled。
+     /** 隧道总开关（用户手动控制）。落盘后用于下次启动时自动接回；不改进程保活。 */
+     val tailscaleEnabled: Boolean = false,
+     /** 控制面 URL（自填，不写死；如自建 Headscale 或默认 Tailscale）。 */
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt
+index f3e3a11cc..d126d4c19 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt
+@@ -23,10 +23,14 @@ import me.rerere.rikkahub.data.ai.tools.local.withUtf8ConsoleEncoding
+ import me.rerere.rikkahub.data.datastore.SshPlatform
+ 
+ /**
+- * Vault 凭证工具（App 内 AI 凭证中枢）。
++ * Vault 凭证执行与环境导出工具（`vault_export_env` / `vault_ssh_exec`）。
+  *
+- * 安全模型：凭证值只在 App 进程内存使用（JSch 字节加载 / 密码对象），
+- * 工具返回值不含明文——只返回变量名、公钥、命令输出。
++ * 安全模型：
++ * - `vault_export_env`：需有效 Vault 授权与调用审批，将解密后的凭证明文写入工作区环境文件
++ *   （`/workspace/tmp/vault-env.sh`）供沙箱脚本 `source`；工具向 AI 返回的内容不含明文，
++ *   仅含已导出变量名列表、文件路径与用完立即删除提醒。
++ * - `vault_ssh_exec`：SSH 私钥或密码只在 App 进程内存中通过 JSch 加载使用，不落盘，
++ *   工具返回值仅含命令执行输出。
+  */
+ 
+ /** vault_export_env — 工具桥：把密钥库凭证解密值导出为沙箱环境变量文件（AI 不见明文）。 */
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultSyncTools.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultSyncTools.kt
+index 56c97a76b..99de8072e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultSyncTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultSyncTools.kt
+@@ -12,10 +12,14 @@ import me.rerere.ai.core.Tool
+ import me.rerere.ai.ui.UIMessagePart
+ 
+ /**
+- * Vault 凭证工具（App 内 AI 凭证中枢）。
++ * Vault 凭证导入导出与整理工具（`vault_export_loadcreds` / `vault_import_loadcreds` /
++ * `vault_compare_loadcreds` / `vault_credential_merge` / `vault_credential_normalize_names`）。
+  *
+- * 安全模型：凭证值只在 App 进程内存使用（JSch 字节加载 / 密码对象），
+- * 工具返回值不含明文——只返回变量名、公钥、命令输出。
++ * 安全模型：
++ * - `vault_export_loadcreds`：需有效 Vault 授权与调用审批，将解密后的凭证明文导出写入工作区脚本
++ *   （`/workspace/tmp/load-creds-export.sh`）；明文仅存在于该工作区文件内，工具向 AI 返回的内容
++ *   不含明文，仅含导出条数、文件路径与用完删除提醒。
++ * - 其余导入、比对、合并与名称规范化工具仅在 App 进程内读写凭证库，工具返回值只含变量名与变更摘要。
+  */
+ 
+ /** 将凭证库导出为 load-creds.sh 风格脚本（含分组/描述/公钥注释，与导入格式对称）。 */
