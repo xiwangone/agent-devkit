@@ -1,0 +1,936 @@
+diff --git a/ai/src/main/java/me/rerere/ai/provider/Model.kt b/ai/src/main/java/me/rerere/ai/provider/Model.kt
+index 24031e27f..6839eba3a 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/Model.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/Model.kt
+@@ -24,6 +24,21 @@ data class Model(
+     val priceCompletionPerToken: Double? = null,
+ )
+ 
++/**
++ * 按空格分隔的关键词筛选模型：忽略大小写，每个关键词都要命中模型 ID 或显示名称的一部分，
++ * 关键词之间不要求顺序。没有关键词时返回原列表。
++ */
++fun List<Model>.filterByKeywords(query: String): List<Model> {
++    val keywords = query.split(" ").filter { it.isNotBlank() }
++    if (keywords.isEmpty()) return this
++    return filter { model ->
++        keywords.all { keyword ->
++            model.modelId.contains(keyword, ignoreCase = true) ||
++                model.displayName.contains(keyword, ignoreCase = true)
++        }
++    }
++}
++
+ @Serializable
+ enum class ModelType {
+     CHAT,
+diff --git a/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt b/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt
+index b23df0a45..52468ffab 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/ProviderSetting.kt
+@@ -37,6 +37,27 @@ enum class ClaudePromptCacheTtl(val apiValue: String?) {
+     ONE_HOUR("1h")
+ }
+ 
++/**
++ * 是否支持模型内置联网搜索（[BuiltInTools.Search]）。
++ *
++ * OpenAI 兼容提供商只有 Responses API 有 `web_search` 工具，Chat Completions 没有。
++ * GeminiOAuth 走 Google 的请求实现，同样支持；Codex/Grok 在本仓未实现内置搜索，
++ * AICore 与本地模型是端侧模型、Backend 是自定义后端，均不支持。
++ */
++val ProviderSetting.supportsBuiltInSearch: Boolean
++    get() = when (this) {
++        is ProviderSetting.OpenAI -> useResponseApi
++        is ProviderSetting.Google -> true
++        is ProviderSetting.Claude -> true
++        is ProviderSetting.GeminiOAuth -> true
++        is ProviderSetting.AICore -> false
++        is ProviderSetting.LiteRtLocal -> false
++        is ProviderSetting.LlamaCppLocal -> false
++        is ProviderSetting.Codex -> false
++        is ProviderSetting.Grok -> false
++        is ProviderSetting.Backend -> false
++    }
++
+ @Serializable
+ sealed class ProviderSetting {
+     abstract val id: Uuid
+diff --git a/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt b/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
+index d2953e86a..dbc73f50f 100644
+--- a/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
++++ b/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
+@@ -255,6 +255,22 @@ object ModelRegistry {
+         contextLength(1.m)
+     }
+ 
++    private val CLAUDE_SONNET_5_5 = defineModel {
++        tokens("claude", "sonnet", "5", "5")
++        notTokens("claude", "sonnet", "4")
++        visionInput()
++        toolReasoningAbility()
++        contextLength(1.m)
++    }
++
++    private val CLAUDE_OPUS_5_5 = defineModel {
++        tokens("claude", "opus", "5", "5")
++        notTokens("claude", "opus", "4")
++        visionInput()
++        toolReasoningAbility()
++        contextLength(1.m)
++    }
++
+     val CLAUDE_SERIES = defineGroup {
+         add(
+             CLAUDE_SONNET_3_5,
+@@ -266,7 +282,9 @@ object ModelRegistry {
+             CLAUDE_OPUS_4_7,
+             CLAUDE_OPUS_4_8,
+             CLAUDE_SONNET_5,
+-            CLAUDE_OPUS_5
++            CLAUDE_OPUS_5,
++            CLAUDE_SONNET_5_5,
++            CLAUDE_OPUS_5_5
+         )
+     }
+ 
+@@ -534,6 +552,16 @@ object ModelRegistry {
+         toolReasoningAbility()
+     }
+ 
++    private val XIAOMI_MIMO_V2 = defineModel {
++        tokens("mimo", "v", "2")
++        toolReasoningAbility()
++    }
++
++    private val XIAOMI_MIMO_V2_PRO = defineModel {
++        tokens("mimo", "v", "2", "pro")
++        toolReasoningAbility()
++    }
++
+     private val XIAOMI_MIMO_V2_5 = defineModel {
+         tokens("mimo", "v", "2", "5")
+         notTokens("mimo", "v", "2", "5", "pro")
+@@ -736,6 +764,8 @@ object ModelRegistry {
+         CLAUDE_OPUS_4_8,
+         CLAUDE_SONNET_5,
+         CLAUDE_OPUS_5,
++        CLAUDE_SONNET_5_5,
++        CLAUDE_OPUS_5_5,
+         DEEPSEEK_V3_MODEL,
+         DEEPSEEK_CHAT,
+         DEEPSEEK_R1_MODEL,
+@@ -783,6 +813,8 @@ object ModelRegistry {
+         MINIMAX_M2_5,
+         MINIMAX_M2_7,
+         MINIMAX_M3,
++        XIAOMI_MIMO_V2,
++        XIAOMI_MIMO_V2_PRO,
+         XIAOMI_MIMO_V2_5,
+         XIAOMI_MIMO_V2_5_PRO,
+         XIAOMI_MIMO_V2_6,
+diff --git a/ai/src/test/java/me/rerere/ai/provider/ModelFilterTest.kt b/ai/src/test/java/me/rerere/ai/provider/ModelFilterTest.kt
+new file mode 100644
+index 000000000..75ad1a11f
+--- /dev/null
++++ b/ai/src/test/java/me/rerere/ai/provider/ModelFilterTest.kt
+@@ -0,0 +1,43 @@
++package me.rerere.ai.provider
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class ModelFilterTest {
++    private val models = listOf(
++        Model(modelId = "gpt-5-mini", displayName = "GPT-5 Mini"),
++        Model(modelId = "gpt-5-chat", displayName = "GPT-5 Chat"),
++        Model(modelId = "claude-sonnet-4-5", displayName = "Claude Sonnet 4.5"),
++        Model(modelId = "deepseek-v3", displayName = "DeepSeek V3"),
++    )
++
++    @Test
++    fun `empty query returns original list`() {
++        assertEquals(models, models.filterByKeywords(""))
++        assertEquals(models, models.filterByKeywords("   "))
++    }
++
++    @Test
++    fun `single keyword matches modelId or displayName`() {
++        assertEquals(listOf(models[0], models[1]), models.filterByKeywords("gpt"))
++        assertEquals(listOf(models[2]), models.filterByKeywords("Claude"))
++    }
++
++    @Test
++    fun `multiple keywords all must match`() {
++        assertEquals(listOf(models[0]), models.filterByKeywords("gpt 5 mini"))
++        assertEquals(emptyList<Model>(), models.filterByKeywords("gpt claude"))
++    }
++
++    @Test
++    fun `keywords may match across modelId and displayName`() {
++        // "Mini" 只在 displayName 里，"gpt" 只在 modelId 里
++        assertEquals(listOf(models[0]), models.filterByKeywords("gpt Mini"))
++    }
++
++    @Test
++    fun `displayName-only keyword does not match modelId`() {
++        // "Chat" 只在 displayName 里：gpt-5-mini 不应命中
++        assertEquals(listOf(models[1]), models.filterByKeywords("Chat"))
++    }
++}
+diff --git a/ai/src/test/java/me/rerere/ai/provider/ProviderSettingTest.kt b/ai/src/test/java/me/rerere/ai/provider/ProviderSettingTest.kt
+new file mode 100644
+index 000000000..84d3f5cf3
+--- /dev/null
++++ b/ai/src/test/java/me/rerere/ai/provider/ProviderSettingTest.kt
+@@ -0,0 +1,25 @@
++package me.rerere.ai.provider
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ProviderSettingTest {
++    @Test
++    fun `supportsBuiltInSearch follows provider capability`() {
++        // OpenAI：只有 Responses API 有 web_search 工具
++        assertFalse(ProviderSetting.OpenAI().supportsBuiltInSearch)
++        assertTrue(ProviderSetting.OpenAI().copy(useResponseApi = true).supportsBuiltInSearch)
++        assertTrue(ProviderSetting.Google().supportsBuiltInSearch)
++        assertTrue(ProviderSetting.Claude().supportsBuiltInSearch)
++        // GeminiOAuth 走 Google 的请求实现，同样支持
++        assertTrue(ProviderSetting.GeminiOAuth().supportsBuiltInSearch)
++        // 端侧模型与未实现内置搜索的提供商不支持
++        assertFalse(ProviderSetting.AICore().supportsBuiltInSearch)
++        assertFalse(ProviderSetting.LiteRtLocal().supportsBuiltInSearch)
++        assertFalse(ProviderSetting.LlamaCppLocal().supportsBuiltInSearch)
++        assertFalse(ProviderSetting.Codex().supportsBuiltInSearch)
++        assertFalse(ProviderSetting.Grok().supportsBuiltInSearch)
++        assertFalse(ProviderSetting.Backend().supportsBuiltInSearch)
++    }
++}
+diff --git a/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt b/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
+index 8e3e353ec..eccf7f02a 100644
+--- a/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
++++ b/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
+@@ -85,14 +85,28 @@ class ModelRegistryTest {
+         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-3.5-sonnet"))
+         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-sonnet-5"))
+         assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-opus-5"))
++        assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-sonnet-5-5"))
++        assertTrue(ModelRegistry.CLAUDE_SERIES.match("claude-opus-5-5"))
+         assertEquals(
+             listOf(Modality.TEXT, Modality.IMAGE),
+             ModelRegistry.MODEL_INPUT_MODALITIES.getData("claude-sonnet-5")
+         )
++        assertEquals(
++            listOf(Modality.TEXT, Modality.IMAGE),
++            ModelRegistry.MODEL_INPUT_MODALITIES.getData("claude-sonnet-5-5")
++        )
+         assertEquals(
+             listOf(ModelAbility.TOOL, ModelAbility.REASONING),
+             ModelRegistry.MODEL_ABILITIES.getData("claude-opus-5")
+         )
++        assertEquals(
++            listOf(ModelAbility.TOOL, ModelAbility.REASONING),
++            ModelRegistry.MODEL_ABILITIES.getData("claude-opus-5-5")
++        )
++        assertEquals(
++            1_000_000,
++            ModelRegistry.MODEL_CONTEXT_LENGTH.getData("claude-sonnet-5-5")
++        )
+     }
+ 
+     @Test
+@@ -163,6 +177,11 @@ class ModelRegistryTest {
+         assertEquals(textOnly, ModelRegistry.MODEL_INPUT_MODALITIES.getData("mimo-v2.5-pro"))
+         assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("mimo-v2.6-flash"))
+         assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("mimo-v2.5"))
++        // 裸 v2 / v2-pro：只命中基础版（纯文本 + 工具 + 推理），不得吃掉 v2.5/v2.6 的视觉
++        assertEquals(textOnly, ModelRegistry.MODEL_INPUT_MODALITIES.getData("mimo-v2"))
++        assertEquals(textOnly, ModelRegistry.MODEL_INPUT_MODALITIES.getData("mimo-v2-pro"))
++        assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("mimo-v2"))
++        assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("mimo-v2-pro"))
+     }
+ 
+     /** 把外部目录的来源换成空实现，供用例在 finally 里还原全局单例。 */
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt
+index 31dcf81f9..1ac6d843c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt
+@@ -12,6 +12,7 @@ import me.rerere.ai.core.InputSchema
+ import me.rerere.ai.core.Tool
+ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.common.android.SafeRequestLoggingInterceptor
++import me.rerere.rikkahub.utils.KnownSecretPrefixes
+ import okhttp3.MediaType.Companion.toMediaType
+ import okhttp3.OkHttpClient
+ import okhttp3.Request
+@@ -60,15 +61,9 @@ object SecretMasker {
+         setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE),
+     )
+ 
+-    // 通用密钥形态：不依赖凭证表即可命中（未登记凭证 / 临时 token 的兜底）
+-    private val GENERIC_SECRET_PATTERNS = listOf(
+-        Regex("gh[pousr]_[A-Za-z0-9]{20,}"),
+-        Regex("sk-[A-Za-z0-9_-]{20,}"),
+-        Regex("xox[baprs]-[A-Za-z0-9-]{10,}"),
+-        Regex("AKIA[0-9A-Z]{16}"),
+-        Regex("eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"),
+-        Regex("AIza[0-9A-Za-z_-]{30,}"),
+-    )
++    // 通用密钥形态：不依赖凭证表即可命中（未登记凭证 / 临时 token 的兜底）。
++    // 口径见 KnownSecretPrefixes：与日志脱敏共用同一张前缀表，阈值取更敏感的一档。
++    private val GENERIC_SECRET_PATTERNS = KnownSecretPrefixes.patternRegexes()
+ 
+     // 公钥值形态：以这些开头的是公钥（可公开，不掩——authorized_keys 本就公开贴）
+     private val PUBLIC_KEY_PREFIX = listOf(
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt
+index 92f36032e..619c7cb9b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt
+@@ -70,6 +70,7 @@ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.ModelType
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.filterByKeywords
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.ArrowDown01
+ import me.rerere.hugeicons.stroke.ArrowRight01
+@@ -460,9 +461,8 @@ private fun ColumnScope.ModelList(
+         remember(providers, modelType, searchKeywords) {
+             providers.associate { provider ->
+                 provider.id to
+-                    provider.models.fastFilter {
+-                        it.matchesPickerType(modelType) && it.displayName.contains(searchKeywords, true)
+-                    }
++                    provider.models.fastFilter { it.matchesPickerType(modelType) }
++                        .filterByKeywords(searchKeywords)
+             }
+         }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/SearchPicker.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/SearchPicker.kt
+index 975c73557..362a6cdc3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/SearchPicker.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/SearchPicker.kt
+@@ -68,7 +68,7 @@ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.launch
+ import me.rerere.ai.provider.BuiltInTools
+ import me.rerere.ai.provider.Model
+-import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.supportsBuiltInSearch
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.AiSearch02
+ import me.rerere.hugeicons.stroke.ArrowLeft01
+@@ -375,9 +375,7 @@ private fun SearchPicker(
+ ) {
+     val navBackStack = LocalNavController.current
+     val provider = model?.findProvider(settings.providers)
+-    val supportsBuiltInSearch =
+-        provider is ProviderSetting.Google ||
+-            (provider is ProviderSetting.OpenAI && provider.useResponseApi)
++    val supportsBuiltInSearch = provider?.supportsBuiltInSearch == true
+     val currentMode = searchModeOf(enableSearch, model)
+     val showModelSearch = model != null && (supportsBuiltInSearch || currentMode == SearchMode.BUILT_IN)
+     val modes =
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
+index 5a6e5330f..0c222ec7c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
+@@ -49,13 +49,13 @@ import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+-import androidx.compose.ui.util.fastFilter
+ import kotlinx.coroutines.launch
+ import me.rerere.ai.provider.Modality
+ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.ModelType
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.filterByKeywords
+ import me.rerere.ai.registry.ModelRegistry
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.Add01
+@@ -460,18 +460,7 @@ internal fun ModelPicker(
+                 ),
+         ) {
+             var filterText by remember { mutableStateOf("") }
+-            val filterKeywords = filterText.split(" ").filter { it.isNotBlank() }
+-            val filteredModels =
+-                models.fastFilter {
+-                    if (filterKeywords.isEmpty()) {
+-                        true
+-                    } else {
+-                        filterKeywords.all { keyword ->
+-                            it.modelId.contains(keyword, ignoreCase = true) ||
+-                                it.displayName.contains(keyword, ignoreCase = true)
+-                        }
+-                    }
+-                }
++            val filteredModels = models.filterByKeywords(filterText)
+             Column(
+                 modifier =
+                     Modifier
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderPage.kt
+index e5fc1a033..707d9f5f5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderPage.kt
+@@ -61,6 +61,7 @@ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.dokar.sonner.ToastType
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.filterByKeywords
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.Add01
+ import me.rerere.hugeicons.stroke.Camera01
+@@ -112,9 +113,7 @@ internal fun ProviderSetting.matchesProviderQuery(
+     if (name.contains(q, ignoreCase = true)) return true
+     if (providerKey.contains(q, ignoreCase = true)) return true
+     if (typeName.contains(q, ignoreCase = true)) return true
+-    return models.any {
+-        it.modelId.contains(q, ignoreCase = true) || it.displayName.contains(q, ignoreCase = true)
+-    }
++    return models.filterByKeywords(q).isNotEmpty()
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/me/rerere/rikkahub/utils/KnownSecretPrefixes.kt b/app/src/main/java/me/rerere/rikkahub/utils/KnownSecretPrefixes.kt
+new file mode 100644
+index 000000000..167de6b7e
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/utils/KnownSecretPrefixes.kt
+@@ -0,0 +1,41 @@
++package me.rerere.rikkahub.utils
++
++/**
++ * 已知凭证前缀正则表：日志脱敏（LogRedactor）与工具输出掩码（SecretMasker）共用的唯一口径。
++ *
++ * 两处消费方掩法不同——日志留前 3 后 3 便于排查，工具输出全掩防进模型上下文——
++ * 但“什么算凭证”的判定必须一致。此前两边阈值不同（日志 sk- {6,}、工具输出 sk- {20,}），
++ * 一段 10 字符的 sk- token 在日志里被掩、在工具输出里原样进了模型上下文。
++ * 新增厂商前缀只改这里；阈值一律取两边旧口径中更敏感（更小）的一档。
++ */
++object KnownSecretPrefixes {
++    /** 各条目的原始正则片段（不含 `(?i)` 与前置边界，由消费方按需组合）。 */
++    val patterns: List<String> = listOf(
++        """sk-[A-Za-z0-9_-]{6,}""",
++        """sk-ant-[A-Za-z0-9_-]{6,}""",
++        """xai-[A-Za-z0-9_-]{6,}""",
++        """gsk_[A-Za-z0-9]{6,}""",
++        """AIza[A-Za-z0-9_-]{10,}""",
++        """(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}""",
++        """github_pat_[A-Za-z0-9_]{10,}""",
++        """(?:AKIA|ASIA)[A-Z0-9]{12,}""",
++        """hf_[A-Za-z0-9]{10,}""",
++        """r8_[A-Za-z0-9]{10,}""",
++        """tvly-[A-Za-z0-9_-]{6,}""",
++        """ya29\.[A-Za-z0-9._-]{10,}""",
++        """xox[baprs]-[A-Za-z0-9-]{10,}""",
++        """Bearer\s+[A-Za-z0-9._~+/=-]{8,}""",
++        // JWT：三段 base64url，整体足够长才判定（避免误掩普通文本）
++        """eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}""",
++    )
++
++    /** 消费方共用的组合形态：大小写不敏感，且要求前缀前一位不是词字符（避免把长词里的片段当凭证）。 */
++    fun combinedRegex(): Regex =
++        Regex(
++            """(?i)(?<![A-Za-z0-9_-])(?:${patterns.joinToString("|")})""",
++        )
++
++    /** 逐条形态：供按条替换的消费方使用，与 [combinedRegex] 同一匹配口径。 */
++    fun patternRegexes(): List<Regex> =
++        patterns.map { Regex("""(?i)(?<![A-Za-z0-9_-])$it""") }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/utils/LogRedactor.kt b/app/src/main/java/me/rerere/rikkahub/utils/LogRedactor.kt
+index 4d00b565f..4b7768209 100644
+--- a/app/src/main/java/me/rerere/rikkahub/utils/LogRedactor.kt
++++ b/app/src/main/java/me/rerere/rikkahub/utils/LogRedactor.kt
+@@ -56,32 +56,10 @@ object LogRedactor {
+         "key|token|secret|password|passwd|pwd|auth|authorization|signature|sign|sig|credential"
+ 
+     /**
+-     * 已知凭证前缀的 token（覆盖常见厂商）。分组顺序无关，正则本身按前缀区分。
++     * 已知凭证前缀的 token（覆盖常见厂商），见 [KnownSecretPrefixes]。
+      * 注意：**没有固定前缀**的 key（如自建/国内厂商）不在此列，由 [KEYED_SECRET_REGEX] 兜底。
+      */
+-    private val SECRET_PREFIX_REGEX =
+-        Regex(
+-            """(?i)(?<![A-Za-z0-9_-])(?:""" +
+-                """sk-[A-Za-z0-9_-]{6,}""" +
+-                """|sk-ant-[A-Za-z0-9_-]{6,}""" +
+-                """|xai-[A-Za-z0-9_-]{6,}""" +
+-                """|gsk_[A-Za-z0-9]{6,}""" +
+-                """|AIza[A-Za-z0-9_-]{10,}""" +
+-                """|(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}""" +
+-                """|github_pat_[A-Za-z0-9_]{10,}""" +
+-                """|(?:AKIA|ASIA)[A-Z0-9]{12,}""" +
+-                """|hf_[A-Za-z0-9]{10,}""" +
+-                """|r8_[A-Za-z0-9]{10,}""" +
+-                """|tvly-[A-Za-z0-9_-]{6,}""" +
+-                """|ya29\.[A-Za-z0-9._-]{10,}""" +
+-                """|xox[baprs]-[A-Za-z0-9-]{10,}""" +
+-                """|Bearer\s+[A-Za-z0-9._~+/=-]{8,}""" +
+-                """)""",
+-        )
+-
+-    /** JWT：三段 base64url，整体足够长才判定（避免误掩普通文本） */
+-    private val JWT_REGEX =
+-        Regex("""eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}""")
++    private val SECRET_PREFIX_REGEX = KnownSecretPrefixes.combinedRegex()
+ 
+     /**
+      * 自由文本中「敏感键名 + 分隔符 + 值」形态：`api_key=xxx`、`"token": "xxx"`、`password: xxx`。
+@@ -166,9 +144,8 @@ object LogRedactor {
+ 
+     /**
+      * 对自由文本脱敏：依次替换
+-     *  1. 已知前缀 token（`sk-…` / `AIza…` / `Bearer …` 等）
+-     *  2. JWT
+-     *  3. 「敏感键名 = 值」形态的值（覆盖**无固定前缀**的 key）
++     *  1. 已知前缀 token（`sk-…` / `AIza…` / `Bearer …` / JWT 等，见 [KnownSecretPrefixes]）
++     *  2. 「敏感键名 = 值」形态的值（覆盖**无固定前缀**的 key）
+      * 不改变文本结构，可安全用于 JSON body / 崩溃堆栈 / 日志导出。
+      */
+     /** 超过该长度不做正则脱敏：多次 replace 会在堆上产生多份等大字符串。 */
+@@ -189,7 +166,6 @@ object LogRedactor {
+                 maskSecret(raw)
+             }
+         }
+-        out = JWT_REGEX.replace(out) { match -> maskSecret(match.value) }
+         out =
+             QUERY_SECRET_REGEX.replace(out) { match ->
+                 // group(1) = `?key=`（保留），group(2) = 值
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/SecretMaskerTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/SecretMaskerTest.kt
+index c10872f09..70dd7139b 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/vault/SecretMaskerTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/SecretMaskerTest.kt
+@@ -1,5 +1,6 @@
+ package me.rerere.rikkahub.data.vault
+ 
++import me.rerere.rikkahub.utils.LogRedactor
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+@@ -32,6 +33,40 @@ class SecretMaskerTest {
+         assertEquals("*** x", SecretMasker.mask("$jwt x", emptyList()))
+     }
+ 
++    @Test
++    fun `短 sk token 也被掩`() {
++        // 旧口径 {20,} 会漏掉 10 字符左右的短 token；与日志脱敏共用前缀表后应掩
++        assertEquals("*** x", SecretMasker.mask("sk-abcdef123456 x", emptyList()))
++    }
++
++    @Test
++    fun `短 GitHub token 也被掩`() {
++        assertEquals("*** x", SecretMasker.mask("ghp_abcdef1234 x", emptyList()))
++    }
++
++    @Test
++    fun `与日志脱敏的掩码口径一致`() {
++        // 同一段凭证在日志与工具输出里都必须被掩（此前两边阈值不同，短 token 只在日志里被掩）
++        val secrets = listOf(
++            "sk-abcdef123456",
++            "sk-ant-abcdef123456",
++            "xai-abcdef123456",
++            "gsk_abcdef1234567890",
++            "ghp_abcdef1234",
++            "AKIAIOSFODNN7EXAMPLE", // ALLOW-FAKE-SECRET: 假样本，不是真凭据
++        )
++        for (secret in secrets) {
++            assertFalse(
++                "SecretMasker should mask $secret",
++                SecretMasker.mask("v=$secret", emptyList()).contains(secret),
++            )
++            assertFalse(
++                "LogRedactor should mask $secret",
++                LogRedactor.maskText("v=$secret").contains(secret),
++            )
++        }
++    }
++
+     // ---- PEM 私钥结构 ----
+ 
+     @Test
+diff --git a/workspace/src/main/java/me/rerere/workspace/ProotShellRunner.kt b/workspace/src/main/java/me/rerere/workspace/ProotShellRunner.kt
+index 39950e096..b1b70b62f 100644
+--- a/workspace/src/main/java/me/rerere/workspace/ProotShellRunner.kt
++++ b/workspace/src/main/java/me/rerere/workspace/ProotShellRunner.kt
+@@ -1,6 +1,8 @@
+ package me.rerere.workspace
+ 
+ import java.io.File
++import java.util.UUID
++import java.util.concurrent.ConcurrentHashMap
+ 
+ data class WorkspaceBindMount(
+     val source: File,
+@@ -17,6 +19,9 @@ class ProotShellRunner(
+     private val nativeLibraryDir: File,
+     private val patcher: RootfsPatcher = RootfsPatcher(),
+ ) : WorkspaceShellRunner {
++    /** 后台任务 token → pidFile（start() 时登记，cancel() 时消费并删除）。 */
++    private val backgroundPidFiles = ConcurrentHashMap<String, File>()
++
+     override fun execute(context: WorkspaceShellContext): WorkspaceCommandResult {
+         if (!context.linuxDir.hasUsableRootfs()) {
+             return WorkspaceCommandResult(
+@@ -45,8 +50,9 @@ class ProotShellRunner(
+ 
+         context.tempDir.mkdirs()
+         patcher.patch(context.linuxDir, RootfsPatchOptions(nameservers = context.dnsServers))
++        val pidFile = newPidFile(context, UUID.randomUUID().toString())
+         val process =
+-            ProcessBuilder(buildCommand(context, proot))
++            ProcessBuilder(buildCommand(context, proot, pidFileGuestPath(pidFile)))
+                 .directory(context.filesDir)
+                 .redirectErrorStream(false)
+                 .apply {
+@@ -63,7 +69,12 @@ class ProotShellRunner(
+                     }
+                 }.start()
+ 
+-        return process.readResult(context.timeoutMillis, context.stdin)
++        return try {
++            // 超时或取消时直接结束, 不留宽限期: 调用方已经不再等这条命令
++            process.readResult(context.timeoutMillis, context.stdin) { terminateProot(this, pidFile) }
++        } finally {
++            pidFile.delete()
++        }
+     }
+ 
+     override fun start(context: WorkspaceShellContext): Process {
+@@ -82,7 +93,14 @@ class ProotShellRunner(
+ 
+         context.tempDir.mkdirs()
+         patcher.patch(context.linuxDir, RootfsPatchOptions(nameservers = context.dnsServers))
+-        return ProcessBuilder(buildCommand(context, proot))
++        // 后台任务的 pidFile 以 taskToken 命名, cancel(token) 时据此终止整组进程;
++        // taskToken 为空时不登记, 取消退回调用方的本地 destroyForcibly。
++        val pidFile = newPidFile(context, context.taskToken.ifBlank { UUID.randomUUID().toString() })
++        if (context.taskToken.isNotBlank()) {
++            backgroundPidFiles[context.taskToken] = pidFile
++            pruneBackgroundPidFiles(context.taskToken)
++        }
++        return ProcessBuilder(buildCommand(context, proot, pidFileGuestPath(pidFile)))
+             .directory(context.filesDir)
+             .redirectErrorStream(false)
+             .apply {
+@@ -100,9 +118,39 @@ class ProotShellRunner(
+             }.start()
+     }
+ 
++    /**
++     * 后台取消：按 pidFile 终止整组 proot 进程。返回 false 表示本后端没登记该 token，
++     * 调用方仍会本地 destroyForcibly 兜底。
++     */
++    override fun cancel(token: String): Boolean {
++        if (token.isBlank()) return false
++        val pidFile = backgroundPidFiles.remove(token) ?: return false
++        val terminated = terminateProotByPidFile(pidFile)
++        pidFile.delete()
++        return terminated
++    }
++
++    /** pidFile 登记表上限：只清“pidFile 可读且 PRoot 已退出”的旧条目，缺文件的一律保留（可能刚启动还没写入）。 */
++    private fun pruneBackgroundPidFiles(exceptToken: String) {
++        if (backgroundPidFiles.size <= MAX_TRACKED_PID_FILES) return
++        backgroundPidFiles.entries.removeIf { (token, pidFile) ->
++            token != exceptToken &&
++                readPidFile(pidFile)?.second?.let { !isPidAlive(it) } == true
++        }
++    }
++
++    private fun newPidFile(context: WorkspaceShellContext, name: String): File {
++        val dir = File(context.linuxDir, EXEC_DIR.trimStart('/'))
++        dir.mkdirs()
++        return File(dir, "$name.pid")
++    }
++
++    private fun pidFileGuestPath(pidFile: File): String = "$EXEC_DIR/${pidFile.name}"
++
+     private fun buildCommand(
+         context: WorkspaceShellContext,
+         proot: File,
++        pidFileGuestPath: String,
+     ): List<String> {
+         val command =
+             mutableListOf(
+@@ -173,10 +221,11 @@ class ProotShellRunner(
+                 "-l",
+                 "-c",
+                 // 命令通过位置参数传入, 避免任何转义; eval "$2" 对命令文本只求值一次, 等价于 bash -c "$cmd"
+-                "cd -- \"\$1\" && eval \"\$2\"",
++                TRACKED_SCRIPT,
+                 "rikkahub",
+                 context.prootCwd(),
+                 context.command,
++                pidFileGuestPath,
+             )
+         return command
+     }
+@@ -211,6 +260,15 @@ class ProotShellRunner(
+         private const val PROOT_EXEC = "libproot_exec.so"
+         private const val PROOT_LOADER = "libproot_loader.so"
+         private val WORKSPACE_DIR = WorkspaceManager.ROOTFS_WORKSPACE_DIR
++
++        // 先把 shell 与 PRoot 的进程号写入 $3, 终止时据此给整组进程发信号, 见 terminateProot
++        private const val TRACKED_SCRIPT = "echo \"\$\$ \$PPID\" > \"\$3\"; cd -- \"\$1\" && eval \"\$2\""
++
++        /** Rootfs 内存放前台/后台命令进程号文件的目录 */
++        private const val EXEC_DIR = "/tmp/rikkahub/exec"
++
++        /** 后台 pidFile 登记表上限（自然退出且未取消的任务会留一条记录，超限时清掉已退出的）。 */
++        private const val MAX_TRACKED_PID_FILES = 64
+     }
+ }
+ 
+diff --git a/workspace/src/main/java/me/rerere/workspace/ProotTermination.kt b/workspace/src/main/java/me/rerere/workspace/ProotTermination.kt
+new file mode 100644
+index 000000000..24a4c5515
+--- /dev/null
++++ b/workspace/src/main/java/me/rerere/workspace/ProotTermination.kt
+@@ -0,0 +1,135 @@
++package me.rerere.workspace
++
++import android.system.ErrnoException
++import android.system.Os
++import android.system.OsConstants
++import java.io.File
++import java.util.concurrent.TimeUnit
++
++private const val KILL_WAIT_MS = 2_000L
++private const val KILL_ROUNDS = 10
++private const val KILL_ROUND_WAIT_MS = 200L
++private const val PID_WAIT_MS = 1_000L
++
++/**
++ * 终止 PRoot 及其中运行的所有进程, 阻塞到 PRoot 退出。
++ *
++ * PRoot 被 SIGKILL 后它跟踪的进程会脱离跟踪继续运行, 所以不能直接 [Process.destroyForcibly];
++ * 也不能靠 PRoot 收到 SIGQUIT 后清理: 它从应用进程继承了屏蔽 SIGQUIT 的信号掩码, 信号一直挂起。
++ * 做法是在 PRoot 还活着时 SIGKILL 它跟踪的所有进程, 最后一个退出后 PRoot 自己退出;
++ * 命令可能正在派生新进程, 所以多扫几轮。
++ * [graceMillis] 大于 0 时先给命令派生的进程发 SIGTERM, 留出这段时间让它们正常退出。
++ *
++ * 进程号由 shell 启动时写入 [pidFile] (`$$ $PPID`), 即 shell 自身与 PRoot 的进程号。
++ */
++internal fun terminateProot(process: Process, pidFile: File, graceMillis: Long = 0) {
++    val pids = readPids(pidFile) { process.isAlive }
++    if (pids == null) {
++        process.destroyForcibly()
++        process.waitFor(KILL_WAIT_MS, TimeUnit.MILLISECONDS)
++        return
++    }
++    val (shellPid, prootPid) = pids
++    killTraced(prootPid, shellPid, graceMillis) { timeoutMs ->
++        process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
++    }
++    if (process.isAlive) {
++        process.destroyForcibly()
++        process.waitFor(KILL_WAIT_MS, TimeUnit.MILLISECONDS)
++    }
++}
++
++/**
++ * 后台取消路径：只有 [pidFile]、没有 Process 句柄时按 pidFile 终止整组进程。
++ *
++ * 返回 true 表示 pidFile 可读且已尝试终止；false 表示无事可做（文件不存在/内容非法/
++ * PRoot 已退出）。直接杀 PRoot 前先核对 `/proc/<pid>/cmdline` 含 proot，避免 pid
++ * 复用后误杀无关进程。
++ */
++internal fun terminateProotByPidFile(pidFile: File, graceMillis: Long = 0): Boolean {
++    val pids = readPidFile(pidFile) ?: return false
++    val (shellPid, prootPid) = pids
++    if (!isProotProcess(prootPid)) return false
++    killTraced(prootPid, shellPid, graceMillis) { timeoutMs -> waitForPidExit(prootPid, timeoutMs) }
++    if (isPidAlive(prootPid)) {
++        signal(prootPid, OsConstants.SIGKILL)
++    }
++    return true
++}
++
++/** 先给被跟踪进程发 SIGTERM（有宽限期时），再多轮 SIGKILL，直到 [waitForExit] 报告退出。 */
++private fun killTraced(
++    prootPid: Int,
++    shellPid: Int,
++    graceMillis: Long,
++    waitForExit: (Long) -> Boolean,
++) {
++    if (graceMillis > 0) {
++        // 命令本身先收到 SIGTERM; 直接结束 shell 会让 --kill-on-exit 立刻 SIGKILL 其余进程
++        (traceesOf(prootPid) - shellPid).ifEmpty { listOf(shellPid) }.forEach { signal(it, OsConstants.SIGTERM) }
++        if (waitForExit(graceMillis)) return
++    }
++    repeat(KILL_ROUNDS) {
++        traceesOf(prootPid).forEach { signal(it, OsConstants.SIGKILL) }
++        if (waitForExit(KILL_ROUND_WAIT_MS)) return
++    }
++}
++
++// 刚启动时 shell 可能还没写入进程号, 稍等片刻
++private fun readPids(pidFile: File, isAlive: () -> Boolean): Pair<Int, Int>? {
++    val deadline = System.currentTimeMillis() + PID_WAIT_MS
++    while (true) {
++        val pids = readPidFile(pidFile)
++        if (pids != null) return pids
++        if (!isAlive() || System.currentTimeMillis() > deadline) return null
++        Thread.sleep(50)
++    }
++}
++
++/** 不等待：只解析一次 pidFile 内容，读不到或格式不对返回 null。 */
++internal fun readPidFile(pidFile: File): Pair<Int, Int>? {
++    val pids = runCatching { pidFile.readText() }.getOrNull()
++        ?.trim()
++        ?.split(' ')
++        ?.mapNotNull { it.toIntOrNull() }
++    if (pids != null && pids.size == 2) return pids[0] to pids[1]
++    return null
++}
++
++internal fun isPidAlive(pid: Int): Boolean = File("/proc/$pid").exists()
++
++private fun waitForPidExit(pid: Int, timeoutMs: Long): Boolean {
++    val deadline = System.currentTimeMillis() + timeoutMs
++    while (System.currentTimeMillis() < deadline) {
++        if (!isPidAlive(pid)) return true
++        Thread.sleep(20)
++    }
++    return !isPidAlive(pid)
++}
++
++/** `/proc/<pid>/cmdline` 首个参数含 proot 才认，避免 pid 复用后误杀无关进程。 */
++private fun isProotProcess(pid: Int): Boolean {
++    val cmdline = runCatching { File("/proc/$pid/cmdline").readBytes() }.getOrNull() ?: return false
++    val argv0 = cmdline.decodeToString().substringBefore('\u0000')
++    return "proot" in argv0
++}
++
++/** 被 [tracerPid] 跟踪的进程, 即 PRoot 内运行的所有进程 (包括脱离了进程树的守护进程) */
++private fun traceesOf(tracerPid: Int): List<Int> =
++    File("/proc").listFiles().orEmpty().mapNotNull { dir ->
++        val pid = dir.name.toIntOrNull() ?: return@mapNotNull null
++        val tracer = runCatching {
++            File(dir, "status").useLines { lines ->
++                lines.firstOrNull { it.startsWith("TracerPid:") }?.substringAfter(':')?.trim()?.toIntOrNull()
++            }
++        }.getOrNull()
++        pid.takeIf { tracer == tracerPid }
++    }
++
++private fun signal(pid: Int, signal: Int) {
++    try {
++        Os.kill(pid, signal)
++    } catch (_: ErrnoException) {
++        // 进程已经退出
++    }
++}
+diff --git a/workspace/src/main/java/me/rerere/workspace/WorkspaceShellRunner.kt b/workspace/src/main/java/me/rerere/workspace/WorkspaceShellRunner.kt
+index 8550bbdfc..cbff20a33 100644
+--- a/workspace/src/main/java/me/rerere/workspace/WorkspaceShellRunner.kt
++++ b/workspace/src/main/java/me/rerere/workspace/WorkspaceShellRunner.kt
+@@ -94,9 +94,11 @@ class HostShellRunner : WorkspaceShellRunner {
+ // 单个流保留的最大字符数, 防止命令疯狂输出导致 OOM 或撑爆 LLM 上下文
+ const val MAX_OUTPUT_CHARS = 128 * 1024
+ 
++/** 等待命令结束并收集输出; 超时或线程被中断时用 [terminate] 结束进程 */
+ fun Process.readResult(
+     timeoutMillis: Long,
+     stdin: ByteArray? = null,
++    terminate: Process.() -> Unit = { destroyForcibly() },
+ ): WorkspaceCommandResult {
+     val stdout = StreamCollector(inputStream)
+     val stderr = StreamCollector(errorStream)
+@@ -113,7 +115,7 @@ fun Process.readResult(
+     try {
+         val finished = waitFor(timeoutMillis, TimeUnit.MILLISECONDS)
+         if (!finished) {
+-            destroyForcibly()
++            terminate()
+         }
+         stdinWriter?.join(1_000)
+         stdout.join(1_000)
+@@ -127,7 +129,7 @@ fun Process.readResult(
+         )
+     } catch (e: InterruptedException) {
+         // 调用方线程被中断（如协程取消时的 runInterruptible），杀掉进程避免命令继续执行
+-        destroyForcibly()
++        terminate()
+         // 进程被杀后 stdout/stderr 会关闭, 这里 join 回收两个采集线程, 避免每次取消泄漏一对线程
+         stdinWriter?.join(1_000)
+         stdout.join(1_000)
+diff --git a/workspace/src/test/java/me/rerere/workspace/ProotTerminationTest.kt b/workspace/src/test/java/me/rerere/workspace/ProotTerminationTest.kt
+new file mode 100644
+index 000000000..c46129b63
+--- /dev/null
++++ b/workspace/src/test/java/me/rerere/workspace/ProotTerminationTest.kt
+@@ -0,0 +1,67 @@
++package me.rerere.workspace
++
++import org.junit.Assert.assertFalse
++import org.junit.Test
++import java.io.File
++
++/**
++ * 覆盖 [terminateProot] / [terminateProotByPidFile] 的兜底路径。
++ *
++ * 真实的孤儿进程清理（向被跟踪进程发信号）需要 Android + proot 环境，JVM 单测
++ * 覆盖不到；这里只钉住不依赖信号发送的分支：pidFile 缺失/非法/
++ * 进程已退出时不得抛异常、不得误杀。
++ */
++class ProotTerminationTest {
++
++    @Test
++    fun `missing pidFile falls back to destroyForcibly`() {
++        val process = ProcessBuilder("sh", "-c", "sleep 30").start()
++        try {
++            terminateProot(process, File("/tmp/does-not-exist-rikkahub-test.pid"))
++            assertFalse(process.isAlive)
++        } finally {
++            if (process.isAlive) process.destroyForcibly()
++        }
++    }
++
++    @Test
++    fun `terminateProot with exited process and stale pidFile does not throw`() {
++        val process = ProcessBuilder("sh", "-c", "true").start()
++        process.waitFor()
++        val pidFile = File.createTempFile("rikkahub-proot-test", ".pid")
++        try {
++            pidFile.writeText("1999999999 1999999998")
++            terminateProot(process, pidFile)
++            assertFalse(process.isAlive)
++        } finally {
++            pidFile.delete()
++        }
++    }
++
++    @Test
++    fun `byPidFile returns false when pidFile is missing`() {
++        assertFalse(terminateProotByPidFile(File("/tmp/does-not-exist-rikkahub-test.pid")))
++    }
++
++    @Test
++    fun `byPidFile returns false when proot pid is gone`() {
++        val pidFile = File.createTempFile("rikkahub-proot-test", ".pid")
++        try {
++            pidFile.writeText("1999999999 1999999998")
++            assertFalse(terminateProotByPidFile(pidFile))
++        } finally {
++            pidFile.delete()
++        }
++    }
++
++    @Test
++    fun `byPidFile returns false for malformed pidFile`() {
++        val pidFile = File.createTempFile("rikkahub-proot-test", ".pid")
++        try {
++            pidFile.writeText("not-a-pid")
++            assertFalse(terminateProotByPidFile(pidFile))
++        } finally {
++            pidFile.delete()
++        }
++    }
++}
