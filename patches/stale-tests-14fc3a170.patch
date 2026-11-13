@@ -1,0 +1,3579 @@
+diff --git a/app/src/androidTest/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt b/app/src/androidTest/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt
+index 9c5455e22..0fb739af6 100644
+--- a/app/src/androidTest/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt
++++ b/app/src/androidTest/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt
+@@ -3,13 +3,17 @@ package me.rerere.rikkahub.data.db
+ import android.content.Context
+ import android.database.sqlite.SQLiteDatabase
+ import androidx.room.Room
++import androidx.room.testing.MigrationTestHelper
++import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+ import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.platform.app.InstrumentationRegistry
++import me.rerere.rikkahub.data.db.migrations.APP_DATABASE_MIGRATIONS
+ import org.junit.After
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertTrue
+ import org.junit.Assert.fail
+ import org.junit.Before
++import org.junit.Rule
+ import org.junit.Test
+ import org.junit.runner.RunWith
+ 
+@@ -23,13 +27,15 @@ import org.junit.runner.RunWith
+  * earlier versions). This app's schema-equivalent version is 27, so an un-reconciled restore
+  * makes Room replay this app's 24 -> 25 auto-migration, which re-ADDs custom_system_prompt and
+  * crashes. This app's shared tables at v27 are byte-for-byte identical to the earlier build's at v24, so
+- * [ImportedDatabaseReconciler] stamps such a file straight to v27 and skips the replay.
++ * [ImportedDatabaseReconciler] re-stamps such a file as a genuine v27 file and lets Room run the
++ * ordinary 27 -> current migrations (the JVM twin of this test is
++ * app/src/test/.../data/db/ImportedDatabaseReconcilerTest.kt).
+  *
+- * The test builds a faithful 2.4.1 file (this app's v27 shared schema, the earlier version +
+- * identity, app-specific tables removed) and asserts:
++ * The test builds a faithful 2.4.1 file (this app's v27 shared schema from 27.json via
++ * [MigrationTestHelper], the earlier version + identity, app-specific tables removed) and asserts:
+  *  - without reconcile, opening it through Room reproduces the reported duplicate-column crash;
+- *  - after reconcile, Room opens it cleanly, the seeded conversation survives, and every
+- *    app-specific table exists and starts empty.
++ *  - after reconcile, Room migrates it to the current schema, the seeded conversation survives,
++ *    and every app-specific table exists and starts empty.
+  */
+ @RunWith(AndroidJUnit4::class)
+ class ImportedDatabaseReconcilerTest {
+@@ -47,6 +53,14 @@ class ImportedDatabaseReconcilerTest {
+ 
+     private val context: Context = InstrumentationRegistry.getInstrumentation().targetContext
+ 
++    @get:Rule
++    val helper: MigrationTestHelper = MigrationTestHelper(
++        InstrumentationRegistry.getInstrumentation(),
++        AppDatabase::class.java,
++        emptyList(),
++        FrameworkSQLiteOpenHelperFactory(),
++    )
++
+     @Before
+     fun setUp() {
+         context.deleteDatabase(TEST_DB)
+@@ -62,6 +76,7 @@ class ImportedDatabaseReconcilerTest {
+         createLegacy241Backup(conversationId = "c1")
+ 
+         val room = Room.databaseBuilder(context, AppDatabase::class.java, TEST_DB)
++            .addMigrations(*APP_DATABASE_MIGRATIONS)
+             .allowMainThreadQueries()
+             .build()
+         try {
+@@ -90,10 +105,12 @@ class ImportedDatabaseReconcilerTest {
+         ImportedDatabaseReconciler.reconcileDatabaseFile(context.getDatabasePath(TEST_DB))
+ 
+         val room = Room.databaseBuilder(context, AppDatabase::class.java, TEST_DB)
++            .addMigrations(*APP_DATABASE_MIGRATIONS)
+             .allowMainThreadQueries()
+             .build()
+         try {
+-            val db = room.openHelper.writableDatabase // opens + validates now; no migration runs
++            val db = room.openHelper.writableDatabase // runs 27 -> current and validates now
++            assertEquals(AppDatabase.VERSION, db.version)
+ 
+             db.query("SELECT title FROM ConversationEntity WHERE id = 'c1'").use { c ->
+                 assertTrue("seeded conversation row should survive the restore", c.moveToFirst())
+@@ -112,23 +129,19 @@ class ImportedDatabaseReconcilerTest {
+     }
+ 
+     /**
+-     * Writes a file that looks exactly like a 2.4.1 backup: start from a
+-     * genuine v27 database (Room creates every table and stamps the v27 identity), seed a
+-     * conversation, then downgrade the file on disk by dropping the app-specific tables and
+-     * stamping the earlier user_version + identity.
++     * Writes a file that looks exactly like a 2.4.1 backup: start from a genuine v27 database
++     * built from app/schemas/.../27.json (the shape a 2.4.1 file shares), seed a conversation,
++     * then downgrade the file on disk by dropping the app-specific tables and stamping the
++     * earlier user_version + identity.
+      */
+     private fun createLegacy241Backup(conversationId: String) {
+-        val room = Room.databaseBuilder(context, AppDatabase::class.java, TEST_DB)
+-            .allowMainThreadQueries()
+-            .build()
+-        try {
+-            room.openHelper.writableDatabase.execSQL(
++        helper.createDatabase(TEST_DB, ImportedDatabaseReconciler.LEGACY_BASELINE_VERSION).apply {
++            execSQL(
+                 "INSERT INTO ConversationEntity (id, title, nodes, create_at, update_at) " +
+                     "VALUES (?, ?, ?, ?, ?)",
+                 arrayOf<Any?>(conversationId, "hello", "[]", 1_000L, 1_000L),
+             )
+-        } finally {
+-            room.close() // checkpoints WAL so the raw handle below sees a settled file
++            close()
+         }
+ 
+         val dbFile = context.getDatabasePath(TEST_DB)
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/27.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/27.json
+new file mode 100644
+index 000000000..f048bcee8
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/27.json
+@@ -0,0 +1,1107 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 27,
++    "identityHash": "47dc97ce825856b039f96c2769103dd1",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, `custom_system_prompt` TEXT NOT NULL DEFAULT '', `mode_injection_ids` TEXT NOT NULL DEFAULT '[]', `lorebook_ids` TEXT NOT NULL DEFAULT '[]', `workspace_cwd` TEXT NOT NULL DEFAULT '', `folder_id` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "customSystemPrompt",
++            "columnName": "custom_system_prompt",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "''"
++          },
++          {
++            "fieldPath": "modeInjectionIds",
++            "columnName": "mode_injection_ids",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "lorebookIds",
++            "columnName": "lorebook_ids",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "workspaceCwd",
++            "columnName": "workspace_cwd",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "''"
++          },
++          {
++            "fieldPath": "folderId",
++            "columnName": "folder_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "''"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `type` TEXT NOT NULL DEFAULT 'image_generation', `source_paths` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'image_generation'"
++          },
++          {
++            "fieldPath": "sourcePaths",
++            "columnName": "source_paths",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "message_node",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `conversation_id` TEXT NOT NULL, `node_index` INTEGER NOT NULL, `messages` TEXT NOT NULL, `select_index` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversation_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodeIndex",
++            "columnName": "node_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "messages",
++            "columnName": "messages",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "selectIndex",
++            "columnName": "select_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_message_node_conversation_id",
++            "unique": false,
++            "columnNames": [
++              "conversation_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_node_conversation_id` ON `${TABLE_NAME}` (`conversation_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "ConversationEntity",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "conversation_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "managed_files",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder` TEXT NOT NULL, `relative_path` TEXT NOT NULL, `display_name` TEXT NOT NULL, `mime_type` TEXT NOT NULL, `size_bytes` INTEGER NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "folder",
++            "columnName": "folder",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "relativePath",
++            "columnName": "relative_path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "displayName",
++            "columnName": "display_name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mimeType",
++            "columnName": "mime_type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sizeBytes",
++            "columnName": "size_bytes",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_managed_files_relative_path",
++            "unique": true,
++            "columnNames": [
++              "relative_path"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_managed_files_relative_path` ON `${TABLE_NAME}` (`relative_path`)"
++          },
++          {
++            "name": "index_managed_files_folder",
++            "unique": false,
++            "columnNames": [
++              "folder"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_managed_files_folder` ON `${TABLE_NAME}` (`folder`)"
++          }
++        ]
++      },
++      {
++        "tableName": "favorites",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `type` TEXT NOT NULL, `ref_key` TEXT NOT NULL, `ref_json` TEXT NOT NULL, `snapshot_json` TEXT NOT NULL, `meta_json` TEXT, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refKey",
++            "columnName": "ref_key",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refJson",
++            "columnName": "ref_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "snapshotJson",
++            "columnName": "snapshot_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "metaJson",
++            "columnName": "meta_json",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_favorites_ref_key",
++            "unique": true,
++            "columnNames": [
++              "ref_key"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_favorites_ref_key` ON `${TABLE_NAME}` (`ref_key`)"
++          },
++          {
++            "name": "index_favorites_type",
++            "unique": false,
++            "columnNames": [
++              "type"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_type` ON `${TABLE_NAME}` (`type`)"
++          },
++          {
++            "name": "index_favorites_created_at",
++            "unique": false,
++            "columnNames": [
++              "created_at"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_created_at` ON `${TABLE_NAME}` (`created_at`)"
++          }
++        ]
++      },
++      {
++        "tableName": "scheduled_jobs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `prompt` TEXT, `assistantId` TEXT NOT NULL, `scheduleType` TEXT NOT NULL, `atUnixMs` INTEGER, `intervalSeconds` INTEGER, `enabled` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `nextRunAtMs` INTEGER, `mode` TEXT NOT NULL DEFAULT 'llm', `actionsJson` TEXT, `cronExpression` TEXT, `timezone` TEXT, `startAtUnixMs` INTEGER, `endAtUnixMs` INTEGER, `maxRuns` INTEGER, `runsSoFar` INTEGER NOT NULL DEFAULT 0, `catchup` TEXT NOT NULL DEFAULT 'fire_once', `description` TEXT, `tags` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistantId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduleType",
++            "columnName": "scheduleType",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "atUnixMs",
++            "columnName": "atUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "intervalSeconds",
++            "columnName": "intervalSeconds",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "nextRunAtMs",
++            "columnName": "nextRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'llm'"
++          },
++          {
++            "fieldPath": "actionsJson",
++            "columnName": "actionsJson",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "cronExpression",
++            "columnName": "cronExpression",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "timezone",
++            "columnName": "timezone",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "startAtUnixMs",
++            "columnName": "startAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "endAtUnixMs",
++            "columnName": "endAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "maxRuns",
++            "columnName": "maxRuns",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "runsSoFar",
++            "columnName": "runsSoFar",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "catchup",
++            "columnName": "catchup",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'fire_once'"
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "tags",
++            "columnName": "tags",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "scheduled_job_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `jobId` TEXT NOT NULL, `mode` TEXT NOT NULL, `scheduledAtMs` INTEGER NOT NULL, `startedAtMs` INTEGER NOT NULL, `finishedAtMs` INTEGER, `outcome` TEXT NOT NULL, `conversationId` TEXT, `errorMessage` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "jobId",
++            "columnName": "jobId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduledAtMs",
++            "columnName": "scheduledAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startedAtMs",
++            "columnName": "startedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "finishedAtMs",
++            "columnName": "finishedAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "outcome",
++            "columnName": "outcome",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "ssh_hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`name` TEXT NOT NULL, `host` TEXT NOT NULL, `port` INTEGER NOT NULL, `user` TEXT NOT NULL, `password` TEXT, `privateKey` TEXT, `passphrase` TEXT, `createdAtMs` INTEGER NOT NULL, PRIMARY KEY(`name`))",
++        "fields": [
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "host",
++            "columnName": "host",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "user",
++            "columnName": "user",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "password",
++            "columnName": "password",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "privateKey",
++            "columnName": "privateKey",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "passphrase",
++            "columnName": "passphrase",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "name"
++          ]
++        }
++      },
++      {
++        "tableName": "telegram_chats",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chatId` INTEGER NOT NULL, `conversationId` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastMessageAtMs` INTEGER NOT NULL, PRIMARY KEY(`chatId`))",
++        "fields": [
++          {
++            "fieldPath": "chatId",
++            "columnName": "chatId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastMessageAtMs",
++            "columnName": "lastMessageAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "chatId"
++          ]
++        }
++      },
++      {
++        "tableName": "workflows",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `description` TEXT, `enabled` INTEGER NOT NULL DEFAULT 1, `definitionJson` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `updatedAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `lastRunStatus` TEXT, `lastRunError` TEXT, `runsTodayCount` INTEGER NOT NULL DEFAULT 0, `runsTodayDate` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "1"
++          },
++          {
++            "fieldPath": "definitionJson",
++            "columnName": "definitionJson",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAtMs",
++            "columnName": "updatedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "lastRunStatus",
++            "columnName": "lastRunStatus",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "lastRunError",
++            "columnName": "lastRunError",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "runsTodayCount",
++            "columnName": "runsTodayCount",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "runsTodayDate",
++            "columnName": "runsTodayDate",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "''"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "workflow_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`rowId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `workflowId` TEXT NOT NULL, `firedAtMs` INTEGER NOT NULL, `status` TEXT NOT NULL, `durationMs` INTEGER NOT NULL, `errorMessage` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "rowId",
++            "columnName": "rowId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "workflowId",
++            "columnName": "workflowId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "firedAtMs",
++            "columnName": "firedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "status",
++            "columnName": "status",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "durationMs",
++            "columnName": "durationMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "rowId"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_workflow_runs_workflowId_firedAtMs",
++            "unique": false,
++            "columnNames": [
++              "workflowId",
++              "firedAtMs"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_workflow_runs_workflowId_firedAtMs` ON `${TABLE_NAME}` (`workflowId`, `firedAtMs`)"
++          }
++        ]
++      },
++      {
++        "tableName": "agent_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `kind` TEXT NOT NULL, `domain_id` TEXT NOT NULL, `parent_run_id` TEXT, `status` TEXT NOT NULL, `created_at_ms` INTEGER NOT NULL, `updated_at_ms` INTEGER NOT NULL, `started_at_ms` INTEGER, `finished_at_ms` INTEGER, `last_error` TEXT, `metadata_json` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "kind",
++            "columnName": "kind",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "domainId",
++            "columnName": "domain_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "parentRunId",
++            "columnName": "parent_run_id",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "status",
++            "columnName": "status",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "created_at_ms",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAtMs",
++            "columnName": "updated_at_ms",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startedAtMs",
++            "columnName": "started_at_ms",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "finishedAtMs",
++            "columnName": "finished_at_ms",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "lastError",
++            "columnName": "last_error",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "metadataJson",
++            "columnName": "metadata_json",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "idx_runs_status",
++            "unique": false,
++            "columnNames": [
++              "status"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_status` ON `${TABLE_NAME}` (`status`)"
++          },
++          {
++            "name": "idx_runs_kind_dom",
++            "unique": false,
++            "columnNames": [
++              "kind",
++              "domain_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_kind_dom` ON `${TABLE_NAME}` (`kind`, `domain_id`)"
++          },
++          {
++            "name": "idx_runs_parent",
++            "unique": false,
++            "columnNames": [
++              "parent_run_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_parent` ON `${TABLE_NAME}` (`parent_run_id`)"
++          },
++          {
++            "name": "idx_runs_updated_at",
++            "unique": false,
++            "columnNames": [
++              "updated_at_ms"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_updated_at` ON `${TABLE_NAME}` (`updated_at_ms`)"
++          }
++        ]
++      },
++      {
++        "tableName": "workspaces",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `root` TEXT NOT NULL, `shell_status` TEXT NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, `last_access_at` INTEGER, `tool_approvals` TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "root",
++            "columnName": "root",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "shellStatus",
++            "columnName": "shell_status",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastAccessAt",
++            "columnName": "last_access_at",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "toolApprovals",
++            "columnName": "tool_approvals",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'{}'"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_workspaces_root",
++            "unique": true,
++            "columnNames": [
++              "root"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_workspaces_root` ON `${TABLE_NAME}` (`root`)"
++          },
++          {
++            "name": "index_workspaces_updated_at",
++            "unique": false,
++            "columnNames": [
++              "updated_at"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_workspaces_updated_at` ON `${TABLE_NAME}` (`updated_at`)"
++          }
++        ]
++      },
++      {
++        "tableName": "conversation_folder",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL, `name` TEXT NOT NULL, `sort_index` INTEGER NOT NULL DEFAULT 0, `create_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sortIndex",
++            "columnName": "sort_index",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_conversation_folder_assistant_id",
++            "unique": false,
++            "columnNames": [
++              "assistant_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_conversation_folder_assistant_id` ON `${TABLE_NAME}` (`assistant_id`)"
++          }
++        ]
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '47dc97ce825856b039f96c2769103dd1')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/limits/ToolRuntimeLimits.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/limits/ToolRuntimeLimits.kt
+index 092b5f1fa..360a36e4b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/limits/ToolRuntimeLimits.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/limits/ToolRuntimeLimits.kt
+@@ -17,7 +17,12 @@ object ToolRuntimeLimits {
+ 
+     /**
+      * Tool-call iterations a single turn may run before it is force-ended. Was hardcoded at 32,
+-     * which truncated long Termux chains mid-task (issue #22).
++     * which truncated long Termux chains mid-task (issue #22). Writes are clamped into
++     * [TermuxDefaults.MIN_MAX_TOOL_STEPS]..[TermuxDefaults.MAX_MAX_TOOL_STEPS]: the agent loop
++     * rejects a non-positive step count, so a stray 0 must never reach it.
+      */
+     @Volatile var maxToolSteps: Int = TermuxDefaults.DEFAULT_MAX_TOOL_STEPS
++        set(value) {
++            field = TermuxDefaults.clampMaxToolSteps(value)
++        }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserTools.kt
+index b38fedfec..ca4379720 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserTools.kt
+@@ -400,14 +400,59 @@ internal fun clipText(text: String, maxChars: Int): Pair<String, Boolean> =
+     if (text.length <= maxChars) text to false
+     else text.substring(0, maxChars) to true
+ 
++/**
++ * How [runHistoryNav] should carry out a back/forward request, decided from state read off
++ * the live WebView. Extracted as a pure function so the decision (issue #59: Chromium's
++ * history-manipulation intervention marks gesture-less navigations skippable, making
++ * `canGoBack()`/`canGoForward()` false even though a real entry exists) unit-tests without
++ * Robolectric.
++ */
++internal enum class HistoryNavMethod { NATIVE, OFFSET, NONE }
++
++/**
++ * NATIVE when the native canGoBack()/canGoForward() check already agrees. Otherwise OFFSET
++ * when `copyBackForwardList()`'s index proves a real entry exists in that direction (back:
++ * not already at the oldest entry; forward: not already at the newest). NONE when there's
++ * genuinely nowhere to go.
++ */
++internal fun resolveHistoryNav(
++    forward: Boolean,
++    canNative: Boolean,
++    currentIndex: Int,
++    size: Int,
++): HistoryNavMethod = when {
++    canNative -> HistoryNavMethod.NATIVE
++    forward && currentIndex < size - 1 -> HistoryNavMethod.OFFSET
++    !forward && currentIndex > 0 -> HistoryNavMethod.OFFSET
++    else -> HistoryNavMethod.NONE
++}
++
+ internal suspend fun runHistoryNav(toolName: String, forward: Boolean): JsonObject {
+     val out = withTimeoutOrNull(toolTimeoutMs) {
+         BrowserControllerHandle.withController {
+-            val ok = withContext(Dispatchers.Main) {
+-                if (forward) {
+-                    if (webView.canGoForward()) { webView.goForward(); true } else false
+-                } else {
+-                    if (webView.canGoBack()) { webView.goBack(); true } else false
++            // Returns (navigated, usedHistoryLoadFallback).
++            val (ok, usedFallback) = withContext(Dispatchers.Main) {
++                val list = webView.copyBackForwardList()
++                val canNative = if (forward) webView.canGoForward() else webView.canGoBack()
++                when (resolveHistoryNav(forward, canNative, list.currentIndex, list.size)) {
++                    HistoryNavMethod.NATIVE -> {
++                        if (forward) webView.goForward() else webView.goBack()
++                        true to false
++                    }
++                    HistoryNavMethod.OFFSET -> {
++                        // goBackOrForward(offset) honors the skippable flag on some WebView
++                        // builds too and silently no-ops, so load the target history item's
++                        // URL directly — a fresh load can't be suppressed, at the cost of
++                        // appending a new entry rather than moving the index.
++                        val target = list.getItemAtIndex(list.currentIndex + (if (forward) 1 else -1))
++                        me.rerere.rikkahub.data.log.AppLog.i(
++                            "BrowserNav",
++                            "runHistoryNav: native nav refused, loading history item directly: ${target.url.take(120)}",
++                        )
++                        webView.loadUrl(target.url)
++                        true to true
++                    }
++                    HistoryNavMethod.NONE -> false to false
+                 }
+             }
+             if (ok) webView.awaitReadyState(8_000L)
+@@ -415,6 +460,7 @@ internal suspend fun runHistoryNav(toolName: String, forward: Boolean): JsonObje
+             buildJsonObject {
+                 put("success", ok)
+                 put("current_url", webView.url.orEmpty())
++                if (ok && usedFallback) put("method", "history_load_fallback")
+             }
+         }
+     } ?: timeoutEnvelope(toolName)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserWriteTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserWriteTools.kt
+index 8f89475ff..b522d6f92 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserWriteTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/BrowserWriteTools.kt
+@@ -85,6 +85,51 @@ fun browserClickTool(): Tool = Tool(
+     },
+ )
+ 
++/**
++ * JS payload for browser_type. React (and similar frameworks) install their own `value`
++ * setter on the DOM node instance to track the "last known value", so a plain
++ * `el.value = ...` write is invisible to them: the framework's state never updates and the
++ * rendered input silently keeps its old value even though this tool reports success.
++ *
++ * Fix: fetch the *native* value setter off the element's prototype
++ * (`HTMLInputElement.prototype` / `HTMLTextAreaElement.prototype` — whichever
++ * `Object.getPrototypeOf(el)` resolves to) and invoke it directly, bypassing the
++ * instance-level override, then dispatch real `input`/`change` events. Falls back to plain
++ * `el.value = ...` when the prototype has no setter (custom elements, exotic hosts) — the
++ * previous behavior for those cases. Pure string builder so it stays unit-testable.
++ */
++internal fun buildTypeScript(selector: String, text: String, clear: Boolean): String {
++    val sel = jsString(selector)
++    val txt = jsString(text)
++    val clearFlag = if (clear) "true" else "false"
++    return """(function(){
++        try {
++            var el = document.querySelector($sel);
++            if (!el) return JSON.stringify({error:'selector_not_found', selector:$sel});
++            el.focus();
++            function setNativeValue(node, value) {
++                var proto = Object.getPrototypeOf(node);
++                var desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
++                if (desc && typeof desc.set === 'function') {
++                    desc.set.call(node, value);
++                    return true;
++                }
++                return false;
++            }
++            if ('value' in el) {
++                var next = ($clearFlag ? '' : (el.value || '')) + $txt;
++                if (!setNativeValue(el, next)) { el.value = next; }
++            } else if (el.isContentEditable) {
++                if ($clearFlag) el.textContent = '';
++                el.textContent = (el.textContent || '') + $txt;
++            }
++            el.dispatchEvent(new Event('input', {bubbles:true}));
++            el.dispatchEvent(new Event('change', {bubbles:true}));
++            return JSON.stringify({typed:true});
++        } catch(e) { return JSON.stringify({error:'js_failed', detail:String(e)}); }
++    })()"""
++}
++
+ fun browserTypeTool(): Tool = Tool(
+     name = BrowserToolDefaults.TYPE,
+     description = "Type text into an input/textarea/contenteditable matching a CSS selector. Focuses, optionally clears, sets the value + dispatches an 'input' event so SPA frameworks observe the change. Returns the diff between the page before and after by default; pass full:true to skip the diff. {success, [diff]}.$TELEGRAM_HEADLESS_CUE",
+@@ -107,25 +152,10 @@ fun browserTypeTool(): Tool = Tool(
+             else -> withTimeoutOrNull(toolTimeoutMs) {
+                 BrowserControllerHandle.withController {
+                     withDiff(full) {
+-                        // Use both 'input' and 'change' events to satisfy frameworks that listen
+-                        // to either; React's synthetic event layer needs the native value setter
+-                        // path which we don't replicate here — covers ~90% of real inputs.
+-                        val js = """(function(){
+-                            try {
+-                                var el = document.querySelector(${jsString(selector)});
+-                                if (!el) return JSON.stringify({error:'selector_not_found', selector:${jsString(selector)}});
+-                                el.focus();
+-                                if (${if (clear) "true" else "false"}) {
+-                                    if ('value' in el) el.value = '';
+-                                    else if (el.isContentEditable) el.textContent = '';
+-                                }
+-                                if ('value' in el) el.value = (el.value || '') + ${jsString(text)};
+-                                else if (el.isContentEditable) el.textContent = (el.textContent || '') + ${jsString(text)};
+-                                el.dispatchEvent(new Event('input', {bubbles:true}));
+-                                el.dispatchEvent(new Event('change', {bubbles:true}));
+-                                return JSON.stringify({typed:true});
+-                            } catch(e) { return JSON.stringify({error:'js_failed', detail:String(e)}); }
+-                        })()"""
++                        // Routes the write through the element prototype's native value
++                        // setter so React-style instance trackers observe it (see
++                        // buildTypeScript), then fires both 'input' and 'change'.
++                        val js = buildTypeScript(selector, text, clear)
+                         val res = parseJsResult(webView.evaluateJavascriptAsync(js))
+                         if (res.containsKey("error")) return@withDiff res
+                         BrowserController.appendAction("Typed into $selector")
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CronJobTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CronJobTool.kt
+index 92405dc3b..3f3c0685f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CronJobTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/CronJobTool.kt
+@@ -18,6 +18,7 @@ import me.rerere.ai.core.InputSchema
+ import me.rerere.ai.core.Tool
+ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.rikkahub.data.ai.tools.HardlineCommandGuard
++import me.rerere.rikkahub.service.MAX_HISTORY_RETENTION
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+ import me.rerere.rikkahub.data.db.entity.ScheduledJobEntity
+@@ -136,10 +137,14 @@ object ScheduleJobValidator {
+         if (!tz.isNullOrBlank() && runCatching { ZoneId.of(tz) }.isFailure)
+             return ValidationError("bad_timezone", "unknown IANA zone: '$tz'")
+ 
+-        // max_runs
++        // max_runs — capped at MAX_HISTORY_RETENTION so a job's target is always within
++        // the run history trim() retains; above it countSuccessful() would stay below
++        // max_runs and the job would fire forever instead of stopping.
+         val maxRuns = (input["max_runs"] as? JsonPrimitive)?.intOrNull
+         if (maxRuns != null && maxRuns < 1)
+             return ValidationError("max_runs_invalid", "max_runs must be >= 1")
++        if (maxRuns != null && maxRuns > MAX_HISTORY_RETENTION)
++            return ValidationError("max_runs_invalid", "max_runs must be <= $MAX_HISTORY_RETENTION")
+ 
+         // catchup
+         val catchup = (input["catchup"] as? JsonPrimitive)?.contentOrNull
+@@ -230,7 +235,7 @@ private fun scheduleTimingProperties(): JsonObject = buildJsonObject {
+     put("timezone", buildJsonObject { put("type","string") })
+     put("start_at_unix_ms", buildJsonObject { put("type","integer") })
+     put("end_at_unix_ms", buildJsonObject { put("type","integer") })
+-    put("max_runs", buildJsonObject { put("type","integer"); put("minimum", 1) })
++    put("max_runs", buildJsonObject { put("type","integer"); put("minimum", 1); put("maximum", MAX_HISTORY_RETENTION) })
+     put("catchup", buildJsonObject { put("type","string"); put("enum", buildJsonArray { add("skip"); add("fire_once"); add("fire_all") }) })
+ }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TermuxTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TermuxTool.kt
+index 65c9ab4aa..302220d3e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TermuxTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TermuxTool.kt
+@@ -53,22 +53,41 @@ internal object TermuxIntegration {
+     enum class State { NOT_INSTALLED, NO_PERMISSION, READY }
+ 
+     /**
+-     * Process-scoped timestamp of the last successful end-to-end smoke test. The toggle row
+-     * in the assistant Local-tools page reads this so the green indicator persists across
+-     * navigations within the session — without it the dot would reset to orange every time
+-     * the user left and re-entered the page. Resets on app restart, which is acceptable
+-     * since re-verifying is one tap.
++     * Timestamp of the last successful end-to-end smoke test. The toggle row in the assistant
++     * Local-tools page reads this so the green indicator persists across navigations — without
++     * it the dot would reset to orange every time the user left and re-entered the page. It
++     * also survives app restarts: [me.rerere.rikkahub.data.preferences.TermuxPreferences]
++     * restores it from DataStore via [restoreVerifiedAt] and re-persists every change through
++     * [persister] (issue #14 — users had to re-verify on every launch).
+      */
+     @Volatile
+     var lastVerifiedOkAtMs: Long = 0L
+         private set
+ 
++    /**
++     * Write-path for [lastVerifiedOkAtMs], set by [me.rerere.rikkahub.data.preferences.TermuxPreferences]
++     * so every [markVerifiedOk] / [clearVerified] persists without this object needing a
++     * [Context] of its own. Null until the preferences singleton is constructed.
++     */
++    @Volatile
++    var persister: ((Long) -> Unit)? = null
++
+     fun markVerifiedOk() {
+         lastVerifiedOkAtMs = System.currentTimeMillis()
++        persister?.invoke(lastVerifiedOkAtMs)
+     }
+ 
+     fun clearVerified() {
+         lastVerifiedOkAtMs = 0L
++        persister?.invoke(lastVerifiedOkAtMs)
++    }
++
++    /**
++     * Restore a timestamp persisted in a previous process. Does not invoke [persister] — the
++     * value already came from disk, so there is nothing new to write back.
++     */
++    fun restoreVerifiedAt(ms: Long) {
++        lastVerifiedOkAtMs = ms
+     }
+ 
+     fun state(ctx: Context): State {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconciler.kt b/app/src/main/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconciler.kt
+index 8e47c6d59..c4b552b13 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconciler.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconciler.kt
+@@ -11,31 +11,34 @@ import me.rerere.rikkahub.data.log.AppLog
+  * This app added several tables (scheduled jobs, workflows, ssh hosts, telegram chats,
+  * the agent-run ledger) on top of an earlier build, and renumbered its Room schema so
+  * the same version number no longer means the same thing in the two apps. A backup exported
+- * from an earlier build therefore breaks a fresh restore in two ways:
++ * from an earlier build (2.4.x) therefore breaks a fresh restore in two ways:
+  *  - it is missing the app-specific tables, so Room fails its integrity check or hits "no such
+  *    table: scheduled_jobs" at first query (issue #8); and
+- *  - it is stamped with an older user_version (24 for 2.4.x), which is LOWER than the
+- *    this app's schema-equivalent version (27), so Room replays this app's 24->25 / 25->26 /
+- *    26->27 auto-migrations and re-ADDs columns the file already carries, crashing with
+- *    "duplicate column name: custom_system_prompt" (issues #10, #11).
++ *  - it is stamped with an older user_version (24 for 2.4.x), which is LOWER than this app's
++ *    schema-equivalent version ([LEGACY_BASELINE_VERSION] = 27), so Room replays this app's
++ *    24->25 / 25->26 / 26->27 auto-migrations and re-ADDs columns the file already carries,
++ *    crashing with "duplicate column name: custom_system_prompt" (issues #10, #11).
+  * Either way the app crashes on the very first launch after the import.
+  *
+  * This step runs once, right after the restore writes `rikka_hub.db`, on the raw file before
+  * Room touches it:
+- *  - It creates any of the app-specific tables that are missing, empty, with the exact schema
+- *    Room expects (copied verbatim from app/schemas/.../27.json), so the file looks like a
+- *    clean agent install for those tables.
+- *  - If the file is already at this app's current schema (stamped at the matching version, or
+- *    an older file whose shared tables already carry every modern column), it stamps Room's
+- *    user_version and identity row to this app's current values so Room opens the file with no
+- *    migration. Without this Room either replays colliding migrations or rejects the foreign
+- *    hash, even though every table is now present. The shared tables match column-for-column
+- *    because this app tracks the same shared schema, so trusting the hash is sound.
++ *  - It creates any of the app-specific tables that are missing, empty, with the exact v27
++ *    schema (copied verbatim from app/schemas/.../27.json). Every statement is IF NOT EXISTS,
++ *    so on a genuine backup of this app (where the tables already exist) it is a no-op.
++ *  - A 2.4.x file (stamped below v27, carrying every [LEGACY_BASELINE_SENTINELS] column and
++ *    none of the [POST_BASELINE_SENTINELS] columns) has shared tables byte-for-byte equal to
++ *    this app's v27. It is re-stamped as a genuine v27 file ([LEGACY_BASELINE_VERSION] +
++ *    [LEGACY_BASELINE_IDENTITY_HASH]); Room then runs this app's ordinary 27 -> current
++ *    migrations, which add every later column, table and index exactly as on a real upgrade.
++ *    It is deliberately NOT stamped straight to the current version: the current schema has
++ *    many columns/tables a 2.4.x file lacks, and stamping past the migrations that add them
++ *    would fail Room's validation (that shortcut only worked while 27 was the current version).
++ *  - A file already stamped at [EXPECTED_VERSION] gets its identity row pointed at this
++ *    app's current hash (harmless if it already is).
+  *
+- * If the backup is at an older version that is not yet schema-complete, Room runs its normal
+- * migrations up to current and sets the identity itself; pre-creating the tables just lets
+- * those migrations find them. Backups newer than the app are left untouched (Room reports the
+- * downgrade).
++ * Any other file (a genuine older backup of this app, or a pre-2.4 file without the baseline
++ * columns) is left to Room's normal migrations. Backups newer than the app are left untouched
++ * (Room reports the downgrade).
+  *
+  * Best-effort: any failure here is logged and returned as a failed [Result] instead of
+  * thrown, so a restore never half-breaks — but the caller must treat a failed result as
+@@ -51,53 +54,74 @@ object ImportedDatabaseReconciler {
+     private const val DB_NAME = "rikka_hub"
+ 
+     /**
+-     * Room's schema version and identity hash for [AppDatabase]. Both are copied verbatim
+-     * from app/schemas/me.rerere.rikkahub.data.db.AppDatabase/27.json (the identity hash also
+-     * appears in the generated AppDatabase_Impl RoomOpenDelegate). When the schema version is
+-     * bumped, update BOTH constants (and the table DDL below if the app-specific tables changed,
+-     * and MODERN_COLUMN_SENTINELS_BY_TABLE if newer shared columns were added) or this
+-     * reconciliation will silently stop matching.
++     * Room's current schema version and identity hash for [AppDatabase]. The version follows
++     * [AppDatabase.VERSION] directly; the hash is copied verbatim from
++     * app/schemas/me.rerere.rikkahub.data.db.AppDatabase/<VERSION>.json (it also appears in the
++     * generated AppDatabase_Impl RoomOpenDelegate). When the schema version is bumped, update the
++     * hash — ImportedDatabaseReconcilerConstantsTest fails until it matches the exported schema.
+      */
+-    internal const val EXPECTED_VERSION = 27
+-    internal const val EXPECTED_IDENTITY_HASH = "47dc97ce825856b039f96c2769103dd1"
++    internal const val EXPECTED_VERSION = AppDatabase.VERSION
++    internal const val EXPECTED_IDENTITY_HASH = "c2222aef4fc160047a5db0cb2f35ac0e"
+ 
+     /**
+-     * Columns that a restored file must already have for its shared schema to be considered
+-     * byte-for-byte equal to this app's current schema. They are exactly the columns the
+-     * this app's 24->25 / 25->26 / 26->27 auto-migrations add (custom_system_prompt at 25,
+-     * workspace_cwd at 26, folder_id at 27), so a file carrying all three would collide on
+-     * every one of those replays. 2.4.x builds carry all three; a genuine file from this app below
+-     * v27 carries only a prefix, so it still migrates normally.
++     * This app's version whose shared tables equal a 2.4.x file's, with its identity hash
++     * (verbatim from app/schemas/.../27.json). Fixed history: never bump these with the schema.
+      */
+-    private val MODERN_COLUMN_SENTINELS_BY_TABLE: List<Pair<String, String>> =
++    internal const val LEGACY_BASELINE_VERSION = 27
++    internal const val LEGACY_BASELINE_IDENTITY_HASH = "47dc97ce825856b039f96c2769103dd1"
++
++    /**
++     * Columns a file stamped below [LEGACY_BASELINE_VERSION] must carry to be treated as a
++     * 2.4.x file. They are exactly the columns this app's 24->25 / 25->26 / 26->27
++     * auto-migrations add (custom_system_prompt at 25, workspace_cwd at 26, folder_id at 27),
++     * so a file carrying all three would collide on every one of those replays. A genuine file
++     * of this app below v27 carries only a prefix, so it still migrates normally.
++     */
++    internal val LEGACY_BASELINE_SENTINELS: List<Pair<String, String>> =
+         listOf(
+-            // 24→25 / 25→26 / 26→27（历史基线列）
+             "ConversationEntity" to "custom_system_prompt",
+             "ConversationEntity" to "workspace_cwd",
+             "ConversationEntity" to "folder_id",
+-            // 32→33
++        )
++
++    /**
++     * Columns this app's migrations add AFTER v27 to tables that already exist at v27 (diff of
++     * 27.json vs 48.json; ssh_hosts included because it is created here in its v27 shape).
++     * A file that already carries any of them is not a plain 2.4.x file: re-stamping it to v27
++     * would make Room's 27 -> current migrations re-ADD that column and crash the same way, so
++     * such a file is left alone (Room then reports the mismatch and the startup probe can roll
++     * back to the pre-restore copy). Add to this list when a later version adds a column to a
++     * table that exists at v27.
++     */
++    internal val POST_BASELINE_SENTINELS: List<Pair<String, String>> =
++        listOf(
+             "ConversationEntity" to "chat_model_id",
+-            // 31→32
+-            "memoryentity" to "tier",
+-            // 33→34
+-            "vault_credentials" to "publicKey",
+-            // 30→31 / 34→35 / 35→36
++            "ConversationEntity" to "is_sub_agent_run",
++            "ConversationEntity" to "max_tool_steps_override",
++            "ConversationEntity" to "tool_scope_override",
++            "ConversationEntity" to "workspace_id_override",
++            "MemoryEntity" to "tier",
++            "workspaces" to "shell_compatibility_mode",
++            "workspaces" to "tags",
++            "workspaces" to "type",
++            "workspaces" to "ssh_config",
+             "ssh_hosts" to "vaultCredentialRef",
+             "ssh_hosts" to "templateRef",
+             "ssh_hosts" to "fallbackHostsJson",
+             "ssh_hosts" to "jumpHost",
+             "ssh_hosts" to "sshOptions",
++            "ssh_hosts" to "platform",
++            "ssh_hosts" to "allowHostKeyRotation",
+         )
+ 
+-    private const val CONTEXT_COMPACTION_DDL =
+-        "CREATE TABLE IF NOT EXISTS `conversation_compaction` (`conversation_id` TEXT NOT NULL, `summary` TEXT NOT NULL, `tail_start_node_id` TEXT, `source_end_node_id` TEXT NOT NULL, `summary_model_id` TEXT NOT NULL, `is_auto` INTEGER NOT NULL, `source_token_estimate` INTEGER NOT NULL, `created_at` INTEGER NOT NULL, PRIMARY KEY(`conversation_id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )"
+-
+     /**
+-     * App-specific tables absent from an older backup, with their exact v25 create + index
+-     * statements. Every statement is IF NOT EXISTS so running it against a genuine agent
+-     * backup (where the tables already exist) is a no-op.
++     * App-specific tables absent from a 2.4.x backup, with their exact v27 create + index
++     * statements (the shape [LEGACY_BASELINE_VERSION] declares, so Room's 27 -> current
++     * migrations find what they expect). Every statement is IF NOT EXISTS so running it against
++     * a genuine backup of this app (where the tables already exist, possibly in a newer shape)
++     * is a no-op.
+      */
+-    private val APP_SPECIFIC_DDL: List<String> = listOf(
++    internal val APP_SPECIFIC_DDL: List<String> = listOf(
+         "CREATE TABLE IF NOT EXISTS `scheduled_jobs` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `prompt` TEXT, `assistantId` TEXT NOT NULL, `scheduleType` TEXT NOT NULL, `atUnixMs` INTEGER, `intervalSeconds` INTEGER, `enabled` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `nextRunAtMs` INTEGER, `mode` TEXT NOT NULL DEFAULT 'llm', `actionsJson` TEXT, `cronExpression` TEXT, `timezone` TEXT, `startAtUnixMs` INTEGER, `endAtUnixMs` INTEGER, `maxRuns` INTEGER, `runsSoFar` INTEGER NOT NULL DEFAULT 0, `catchup` TEXT NOT NULL DEFAULT 'fire_once', `description` TEXT, `tags` TEXT, PRIMARY KEY(`id`))",
+         "CREATE TABLE IF NOT EXISTS `scheduled_job_runs` (`id` TEXT NOT NULL, `jobId` TEXT NOT NULL, `mode` TEXT NOT NULL, `scheduledAtMs` INTEGER NOT NULL, `startedAtMs` INTEGER NOT NULL, `finishedAtMs` INTEGER, `outcome` TEXT NOT NULL, `conversationId` TEXT, `errorMessage` TEXT, PRIMARY KEY(`id`))",
+         "CREATE TABLE IF NOT EXISTS `ssh_hosts` (`name` TEXT NOT NULL, `host` TEXT NOT NULL, `port` INTEGER NOT NULL, `user` TEXT NOT NULL, `password` TEXT, `privateKey` TEXT, `passphrase` TEXT, `createdAtMs` INTEGER NOT NULL, PRIMARY KEY(`name`))",
+@@ -112,25 +136,6 @@ object ImportedDatabaseReconciler {
+         "CREATE INDEX IF NOT EXISTS `idx_runs_updated_at` ON `agent_runs` (`updated_at_ms`)",
+     )
+ 
+-    /**
+-     * Indices this app's 27->28 auto-migration adds on tables that already exist before that
+-     * step (`ConversationEntity`, `MemoryEntity`) or that [APP_SPECIFIC_DDL] just created fresh
+-     * (`scheduled_jobs`, `scheduled_job_runs`). That migration is a pure schema diff compiled
+-     * from app/schemas/.../27.json and 28.json, so it never runs on the "already current" path
+-     * below, which stamps the file straight to [EXPECTED_VERSION]: the indices would otherwise
+-     * be silently missing (issue #60, `Found: indices = {}` on `ConversationEntity`). Every
+-     * statement is `IF NOT EXISTS`, so running this against a database that already has the
+-     * indices - including a genuine backup already on v30 - is a safe no-op that touches no data.
+-     */
+-    internal val BACKFILL_INDEX_DDL: List<String> = listOf(
+-        "CREATE INDEX IF NOT EXISTS `index_ConversationEntity_assistant_id_is_pinned_update_at` ON `ConversationEntity` (`assistant_id`, `is_pinned`, `update_at`)",
+-        "CREATE INDEX IF NOT EXISTS `index_ConversationEntity_is_pinned_update_at` ON `ConversationEntity` (`is_pinned`, `update_at`)",
+-        "CREATE INDEX IF NOT EXISTS `index_MemoryEntity_assistant_id` ON `MemoryEntity` (`assistant_id`)",
+-        "CREATE INDEX IF NOT EXISTS `index_scheduled_jobs_enabled` ON `scheduled_jobs` (`enabled`)",
+-        "CREATE INDEX IF NOT EXISTS `index_scheduled_job_runs_jobId_startedAtMs` ON `scheduled_job_runs` (`jobId`, `startedAtMs`)",
+-        "CREATE INDEX IF NOT EXISTS `index_scheduled_job_runs_jobId_outcome` ON `scheduled_job_runs` (`jobId`, `outcome`)",
+-    )
+-
+     /**
+      * Call after a restore has written the database file, and only when the restore actually
+      * included the database. Safe to call when the file is a genuine agent backup (every
+@@ -216,44 +221,41 @@ object ImportedDatabaseReconciler {
+                     return Result.success(Unit)
+                 }
+ 
+-                // A file whose shared schema already matches this app's current schema must not
+-                // be migrated: Room would replay this app's 24->27 auto-migrations and re-ADD
+-                // columns the file already has, crashing with "duplicate column name" (an
+-                // a 2.4.x backup stamps user_version 24 but carries every modern column;
+-                // see issues #10, #11). Detect that case by the sentinel columns those very
+-                // migrations add.
+-                val alreadyCurrent = MODERN_COLUMN_SENTINELS_BY_TABLE.all { (table, column) ->
+-                    hasColumn(db, table, column)
++                // A 2.4.x file is stamped below v27 but already carries every column this app's
++                // 24 -> 27 auto-migrations add; letting Room replay them crashes with
++                // "duplicate column name" (issues #10, #11). Detect it by those very columns,
++                // and make sure it carries nothing newer (see POST_BASELINE_SENTINELS).
++                val legacyBaseline = version < LEGACY_BASELINE_VERSION &&
++                    LEGACY_BASELINE_SENTINELS.all { (table, column) -> hasColumn(db, table, column) }
++                val hasPostBaselineColumns = legacyBaseline &&
++                    POST_BASELINE_SENTINELS.any { (table, column) -> hasColumn(db, table, column) }
++                if (hasPostBaselineColumns) {
++                    AppLog.w(TAG, "reconcile: db stamped $version carries columns newer than v$LEGACY_BASELINE_VERSION; not re-stamping")
+                 }
+ 
+                 db.beginTransaction()
+                 try {
+                     APP_SPECIFIC_DDL.forEach(db::execSQL)
+ 
+-                    if (version == EXPECTED_VERSION || alreadyCurrent) {
+-                        // No migration should run: the file is either already stamped at the
+-                        // this app's version, or it is an older file whose shared schema already
+-                        // matches it. Point Room's identity row and user_version at this app so
+-                        // the integrity check passes now that every app-specific table is present.
+-                        db.execSQL(
+-                            "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY, identity_hash TEXT)"
+-                        )
+-                        db.execSQL(
+-                            "INSERT OR REPLACE INTO room_master_table (id, identity_hash) VALUES (42, ?)",
+-                            arrayOf(EXPECTED_IDENTITY_HASH),
+-                        )
+-                        if (version != EXPECTED_VERSION) {
+-                            // PRAGMA user_version is transactional (SQLiteOpenHelper sets it the
+-                            // same way inside its own upgrade transaction), so this commits or
+-                            // rolls back atomically with the DDL and identity row above.
+-                            db.version = EXPECTED_VERSION
++                    when {
++                        version == EXPECTED_VERSION -> stampIdentity(db, EXPECTED_IDENTITY_HASH)
++                        legacyBaseline && !hasPostBaselineColumns -> {
++                            // Shared tables equal this app's v27 and every app-specific table now
++                            // exists in its v27 shape: make the file a genuine v27 file, so Room
++                            // runs the ordinary 27 -> current migrations instead of the colliding
++                            // 24 -> 27 replays. PRAGMA user_version is transactional
++                            // (SQLiteOpenHelper sets it the same way inside its own upgrade
++                            // transaction), so this commits or rolls back atomically with the DDL
++                            // and identity row.
++                            stampIdentity(db, LEGACY_BASELINE_IDENTITY_HASH)
++                            db.version = LEGACY_BASELINE_VERSION
+                         }
+                     }
+                     db.setTransactionSuccessful()
+                 } finally {
+                     db.endTransaction()
+                 }
+-                AppLog.i(TAG, "reconcile: reconciled imported db (version=$version, alreadyCurrent=$alreadyCurrent)")
++                AppLog.i(TAG, "reconcile: reconciled imported db (version=$version, legacyBaseline=$legacyBaseline)")
+             }
+             Result.success(Unit)
+         } catch (t: Throwable) {
+@@ -265,6 +267,15 @@ object ImportedDatabaseReconciler {
+         }
+     }
+ 
++    /** Points Room's identity row at [identityHash] (creating the metadata table if absent). */
++    private fun stampIdentity(db: SQLiteDatabase, identityHash: String) {
++        db.execSQL("CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY, identity_hash TEXT)")
++        db.execSQL(
++            "INSERT OR REPLACE INTO room_master_table (id, identity_hash) VALUES (42, ?)",
++            arrayOf(identityHash),
++        )
++    }
++
+     /** True if [table] exists and has a column named [column]. Best-effort; false on error. */
+     private fun hasColumn(db: SQLiteDatabase, table: String, column: String): Boolean {
+         return try {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/db/migrations/AppDatabaseMigrations.kt b/app/src/main/java/me/rerere/rikkahub/data/db/migrations/AppDatabaseMigrations.kt
+new file mode 100644
+index 000000000..1aed64180
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/db/migrations/AppDatabaseMigrations.kt
+@@ -0,0 +1,28 @@
++package me.rerere.rikkahub.data.db.migrations
++
++import androidx.room.migration.Migration
++
++/**
++ * [me.rerere.rikkahub.data.db.AppDatabase] 的全部手写迁移（自动迁移由 `@Database(autoMigrations=…)` 声明）。
++ *
++ * 生产建库（DataSourceModule）与测试（导入备份的整链迁移回归）共用这一份清单，
++ * 避免测试里另抄一份、日后新增迁移时两边不一致。
++ */
++internal val APP_DATABASE_MIGRATIONS: Array<Migration> = arrayOf(
++    Migration_6_7,
++    Migration_11_12,
++    Migration_13_14,
++    Migration_14_15,
++    Migration_15_16,
++    Migration_23_24,
++    Migration_28_29,
++    Migration_29_30,
++    Migration_30_31,
++    Migration_31_32,
++    Migration_32_33,
++    Migration_33_34,
++    Migration_34_35,
++    Migration_35_36,
++    Migration_44_45,
++    Migration_45_46,
++)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxDefaults.kt b/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxDefaults.kt
+index e91f6dc45..02e87e1f4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxDefaults.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxDefaults.kt
+@@ -8,8 +8,13 @@ package me.rerere.rikkahub.data.preferences
+  */
+ object TermuxDefaults {
+ 
+-    /** Default max tool-call steps per turn (was hardcoded 32; 0 disables cap). */
++    // --- Per-turn tool-call step cap (app-wide) --------------------------------------------
++    // Was hardcoded 32 (issue #22 raised it). The wall-clock turn budget is the primary limit;
++    // this cap only has to stop a runaway loop. 0 does NOT disable the cap — the agent loop
++    // requires a positive step count — so every value is clamped into [MIN, MAX].
+     const val DEFAULT_MAX_TOOL_STEPS = 100
++    const val MIN_MAX_TOOL_STEPS     =   1
++    const val MAX_MAX_TOOL_STEPS     = 500
+ 
+     // --- Command capture timeout -----------------------------------------------------------
+     /** Default ms to wait for a Termux background command to complete. */
+@@ -74,4 +79,7 @@ object TermuxDefaults {
+      */
+     fun clampWorkingDir(dir: String): String =
+         dir.ifBlank { DEFAULT_WORKING_DIR }
++
++    fun clampMaxToolSteps(steps: Int): Int =
++        steps.coerceIn(MIN_MAX_TOOL_STEPS, MAX_MAX_TOOL_STEPS)
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxPreferences.kt b/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxPreferences.kt
+index f7d80a291..22bd6aafe 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxPreferences.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/preferences/TermuxPreferences.kt
+@@ -43,6 +43,7 @@ class TermuxPreferences(private val context: Context) {
+     private val maxStdoutKey      = intPreferencesKey("max_stdout_bytes")
+     private val maxStderrKey      = intPreferencesKey("max_stderr_bytes")
+     private val aptWrapKey        = booleanPreferencesKey("apt_wrap_enabled")
++    private val lastVerifiedMsKey = longPreferencesKey("last_verified_ms")
+ 
+     init {
+         // Seed the runtime holders SYNCHRONOUSLY from DataStore before starting the async
+@@ -62,6 +63,8 @@ class TermuxPreferences(private val context: Context) {
+             TermuxRuntime.maxStderrBytes     = initial.maxStderrBytes
+             TermuxRuntime.aptWrapEnabled     = initial.aptWrapEnabled
+             ToolRuntimeLimits.turnBudgetMs   = initial.turnBudgetMs
++            // Issue #14: restore the "verified/connected" indicator across app restarts.
++            me.rerere.rikkahub.data.ai.tools.local.TermuxIntegration.restoreVerifiedAt(initial.lastVerifiedMs)
+         }
+ 
+         // Async collectors keep the holders live on subsequent user edits. This scope is
+@@ -69,6 +72,18 @@ class TermuxPreferences(private val context: Context) {
+         // alive as long as the singleton itself. SupervisorJob means one failing collector
+         // doesn't kill the others.
+         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
++        // Main-thread construction skips the blocking seed above, so restore the verified
++        // timestamp asynchronously; only fill it if nothing has been verified meanwhile, so a
++        // verify that lands first is never overwritten by the stale persisted value.
++        scope.launch {
++            val persisted = store.data.first()[lastVerifiedMsKey] ?: 0L
++            val integration = me.rerere.rikkahub.data.ai.tools.local.TermuxIntegration
++            if (integration.lastVerifiedOkAtMs == 0L) integration.restoreVerifiedAt(persisted)
++        }
++        // Wire the write-back path so every future markVerifiedOk()/clearVerified() persists.
++        me.rerere.rikkahub.data.ai.tools.local.TermuxIntegration.persister = { ms ->
++            scope.launch { setLastVerifiedMs(ms) }
++        }
+         scope.launch {
+             commandTimeoutFlow()
+                 .distinctUntilChanged()
+@@ -185,6 +200,10 @@ class TermuxPreferences(private val context: Context) {
+         store.edit { it[aptWrapKey] = enabled }
+     }
+ 
++    suspend fun setLastVerifiedMs(ms: Long) {
++        store.edit { it[lastVerifiedMsKey] = ms }
++    }
++
+     /**
+      * One-shot suspend snapshot for callers that need all fields at once (e.g. the VM's
+      * combined state flow). Fields are clamped on read, same as the individual flow accessors.
+@@ -199,6 +218,7 @@ class TermuxPreferences(private val context: Context) {
+             maxStdoutBytes     = TermuxDefaults.clampMaxStdout(prefs[maxStdoutKey]              ?: TermuxDefaults.DEFAULT_MAX_STDOUT),
+             maxStderrBytes     = TermuxDefaults.clampMaxStderr(prefs[maxStderrKey]              ?: TermuxDefaults.DEFAULT_MAX_STDERR),
+             aptWrapEnabled     = prefs[aptWrapKey]                                              ?: TermuxDefaults.DEFAULT_APT_WRAP_ENABLED,
++            lastVerifiedMs     = prefs[lastVerifiedMsKey]                                       ?: 0L,
+         )
+     }
+ 
+@@ -218,4 +238,5 @@ data class TermuxRuntimeConfig(
+     val maxStdoutBytes: Int,
+     val maxStderrBytes: Int,
+     val aptWrapEnabled: Boolean,
++    val lastVerifiedMs: Long = 0L,
+ )
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt b/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt
+index f0dc225f6..d38f458f4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/repository/ConversationRepository.kt
+@@ -568,7 +568,7 @@ internal fun conversationToConversationEntityImpl(conversation: Conversation): C
+         maxToolStepsOverride = conversation.maxToolStepsOverride ?: 0,
+         isSubAgentRun = conversation.isSubAgentRun,
+         // 会话级模型：空串 = 跟随所属助手（旧的空字段行沿用助手模型，行为不变）
+-        chatModelId = conversation.chatModelId?.toString() ?: "",
++        chatModelId = encodeChatModelId(conversation.chatModelId),
+     )
+ }
+ 
+@@ -598,8 +598,20 @@ internal fun conversationEntityToConversationImpl(
+             ?.let { runCatching { Uuid.parse(it) }.getOrNull() },
+         maxToolStepsOverride = conversationEntity.maxToolStepsOverride.takeIf { it > 0 },
+         isSubAgentRun = conversationEntity.isSubAgentRun,
+-        chatModelId = conversationEntity.chatModelId
+-            .ifEmpty { null }
+-            ?.let { runCatching { Uuid.parse(it) }.getOrNull() },
++        chatModelId = decodeChatModelId(conversationEntity.chatModelId),
+     )
+ }
++
++/**
++ * Encodes [Conversation.chatModelId] for the `chat_model_id` column. `null` (no override)
++ * stores as the empty string, matching the `folder_id` convention.
++ */
++internal fun encodeChatModelId(chatModelId: Uuid?): String = chatModelId?.toString() ?: ""
++
++/**
++ * Decodes the `chat_model_id` column back to [Conversation.chatModelId]. A blank column means
++ * "no override". A malformed stored value must not throw — a corrupt row would otherwise make
++ * the conversation unopenable — so it decodes to `null`.
++ */
++internal fun decodeChatModelId(stored: String): Uuid? =
++    stored.ifEmpty { null }?.let { runCatching { Uuid.parse(it) }.getOrNull() }
+diff --git a/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt b/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
+index 3cacc66ed..19bc97159 100644
+--- a/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
++++ b/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
+@@ -43,22 +43,7 @@ import me.rerere.rikkahub.data.db.AppDatabase
+ import me.rerere.rikkahub.data.db.DatabaseVersionGuard
+ import me.rerere.rikkahub.data.db.fts.MessageFtsManager
+ import me.rerere.rikkahub.data.db.fts.SimpleDictManager
+-import me.rerere.rikkahub.data.db.migrations.Migration_11_12
+-import me.rerere.rikkahub.data.db.migrations.Migration_13_14
+-import me.rerere.rikkahub.data.db.migrations.Migration_14_15
+-import me.rerere.rikkahub.data.db.migrations.Migration_15_16
+-import me.rerere.rikkahub.data.db.migrations.Migration_23_24
+-import me.rerere.rikkahub.data.db.migrations.Migration_28_29
+-import me.rerere.rikkahub.data.db.migrations.Migration_29_30
+-import me.rerere.rikkahub.data.db.migrations.Migration_30_31
+-import me.rerere.rikkahub.data.db.migrations.Migration_31_32
+-import me.rerere.rikkahub.data.db.migrations.Migration_32_33
+-import me.rerere.rikkahub.data.db.migrations.Migration_33_34
+-import me.rerere.rikkahub.data.db.migrations.Migration_34_35
+-import me.rerere.rikkahub.data.db.migrations.Migration_35_36
+-import me.rerere.rikkahub.data.db.migrations.Migration_44_45
+-import me.rerere.rikkahub.data.db.migrations.Migration_45_46
+-import me.rerere.rikkahub.data.db.migrations.Migration_6_7
++import me.rerere.rikkahub.data.db.migrations.APP_DATABASE_MIGRATIONS
+ import me.rerere.rikkahub.data.gemini.GeminiAccountRepository
+ import me.rerere.rikkahub.data.gemini.GeminiCredentialStore
+ import me.rerere.rikkahub.data.gemini.GeminiOAuthManager
+@@ -99,24 +84,8 @@ val dataSourceModule =
+             Room
+                 .databaseBuilder(context, AppDatabase::class.java, "rikka_hub")
+                 .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+-                .addMigrations(
+-                    Migration_6_7,
+-                    Migration_11_12,
+-                    Migration_13_14,
+-                    Migration_14_15,
+-                    Migration_15_16,
+-                    Migration_23_24,
+-                    Migration_28_29,
+-                    Migration_29_30,
+-                    Migration_30_31,
+-                    Migration_31_32,
+-                    Migration_32_33,
+-                    Migration_33_34,
+-                    Migration_34_35,
+-                    Migration_35_36,
+-                    Migration_44_45,
+-                    Migration_45_46,
+-                ).addCallback(
++                .addMigrations(*APP_DATABASE_MIGRATIONS)
++                .addCallback(
+                     object : RoomDatabase.Callback() {
+                         override fun onOpen(db: SupportSQLiteDatabase) {
+                             val dictDir = SimpleDictManager.extractDict(context)
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/CronJobScheduler.kt b/app/src/main/java/me/rerere/rikkahub/service/CronJobScheduler.kt
+index dff63c40c..4a59a4017 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/CronJobScheduler.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/CronJobScheduler.kt
+@@ -32,11 +32,12 @@ class CronJobScheduler(
+     suspend fun schedule(job: ScheduledJobEntity) {
+         val nowMs = System.currentTimeMillis()
+         val nextRun = nextRunMs(job, nowMs)
+-        repo.update(job.copy(nextRunAtMs = nextRun))
+         if (nextRun == null) {
++            repo.update(terminalJobUpdate(job))
+             cancel(job.id)
+             return
+         }
++        repo.update(job.copy(nextRunAtMs = nextRun))
+         val delayMs = max(0L, nextRun - nowMs)
+         val req =
+             OneTimeWorkRequestBuilder<CronJobWorker>()
+@@ -117,5 +118,24 @@ class CronJobScheduler(
+                 }
+             }
+         }
++
++        /**
++         * Pure. Decides what to persist when [nextRunMs] returned null (schedule() is about
++         * to [cancel] the job's WorkManager work). Every other reason nextRunMs returns null
++         * (disabled, max_runs reached, end_at past, a "once" job that already fired) already
++         * has `enabled` reflecting reality by the time schedule() runs. An unparseable cron
++         * expression does not: cron_expression validation was tightened after some jobs may
++         * have been persisted (e.g. an out-of-range "@every 90m"), so a pre-existing row can
++         * newly fail to parse. Without this, schedule() would cancel the work forever while
++         * the job row still shows enabled=true, silently zombied with no way to tell.
++         */
++        internal fun terminalJobUpdate(job: ScheduledJobEntity): ScheduledJobEntity {
++            val unparseable = job.scheduleType == "cron" && job.cronExpression != null &&
++                CronExpressionParser.parse(job.cronExpression).isFailure
++            return job.copy(
++                nextRunAtMs = null,
++                enabled = if (unparseable) false else job.enabled,
++            )
++        }
+     }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt b/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt
+index 2ae13ad9f..22b3ba07c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt
+@@ -62,6 +62,28 @@ internal suspend fun awaitGenerationTerminal(
+     return completed != null
+ }
+ 
++/**
++ * Turn an [awaitGenerationTerminal] result into the LLM-mode run outcome, stopping the
++ * still-running generation on timeout via [stop]. Left uncalled, a timed-out generation
++ * keeps burning tokens indefinitely, and a later fire of the same job can start a second
++ * parallel generation while the first is still going. [stop] is responsible for its own
++ * failure handling (see the call site in [CronJobWorker.runLlm]) — this function only
++ * guarantees it is invoked before the timeout is reported. Split out (like
++ * [awaitGenerationTerminal]) so a JVM test can pin the stop-on-timeout contract without a
++ * live ChatService.
++ */
++internal suspend fun finishRunLlm(
++    completed: Boolean,
++    convId: Uuid,
++    stop: suspend () -> Unit,
++): Triple<String, String?, Uuid?> {
++    if (!completed) {
++        stop()
++        return Triple("timed_out", "llm turn exceeded 15min", convId)
++    }
++    return Triple("success", null, convId)
++}
++
+ /**
+  * The slot to stamp into the run row. Manual fires (trigger_job_now) happen at nowMs and
+  * are NOT bound to any scheduled slot — stamping them with [jobNextRunAtMs] would poison
+@@ -92,6 +114,24 @@ internal fun shouldSuppressAsReplay(
+     return priorRow.startedAtMs >= nowMs - windowMs
+ }
+ 
++/**
++ * Ceiling on how many run-history rows a single job's max_runs can force [trim] to retain.
++ * schedule_job only validates max_runs >= 1, so without this cap [historyRetentionFor]
++ * scales with an unbounded max_runs and trim(keep=...) would retain the job's run history
++ * essentially forever.
++ */
++internal const val MAX_HISTORY_RETENTION = 1000
++
++/**
++ * How many run-history rows `ScheduledJobRunDao.trim` must retain for max_runs enforcement
++ * to stay correct. boundsExpired() derives the job's progress from
++ * `ScheduledJobRunRepository.countSuccessful`, which only sees rows that survived trim() —
++ * trimming below [maxRuns] silently caps the achievable success count at the trim floor, so
++ * a job configured for e.g. 150 runs would fire forever once history reaches 100 rows.
++ */
++internal fun historyRetentionFor(maxRuns: Int?, baseline: Int = 100): Int =
++    maxOf(baseline, maxRuns ?: 0).coerceAtMost(MAX_HISTORY_RETENTION)
++
+ /**
+  * Tracks which jobs currently have a worker actively running. Prevents two
+  * concurrent fires from racing on the same job — the second one writes a
+@@ -274,7 +314,7 @@ class CronJobWorker(
+             }
+ 
+             // Trim history at the end so this row's insert/update is reflected in the cap.
+-            runRepo.trim(jobId, keep = 100)
++            runRepo.trim(jobId, keep = historyRetentionFor(job.maxRuns))
+ 
+             return Result.success()
+         } finally {
+@@ -328,10 +368,9 @@ class CronJobWorker(
+                     flow = chatService.getGenerationJobStateFlow(conv.id),
+                     timeoutMs = 15L * 60_000L,
+                 )
+-            return if (!completed) {
+-                Triple("timed_out", "llm turn exceeded 15min", conv.id)
+-            } else {
+-                Triple("success", null, conv.id)
++            return finishRunLlm(completed, conv.id) {
++                runCatching { chatService.stopGeneration(conv.id) }
++                    .onFailure { AppLog.w(TAG, "runLlm: stopGeneration failed after timeout for ${job.id}", it) }
+             }
+         } catch (t: Throwable) {
+             return Triple("failed", "${t::class.simpleName}: ${t.message.orEmpty()}", conv.id)
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/MediaPlaybackService.kt b/app/src/main/java/me/rerere/rikkahub/service/MediaPlaybackService.kt
+index 78c8985f4..5d230d705 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/MediaPlaybackService.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/MediaPlaybackService.kt
+@@ -147,7 +147,6 @@ class MediaPlaybackService : Service() {
+     private var mediaPlayer: MediaPlayer? = null
+     private lateinit var mediaSession: MediaSessionCompat
+     private lateinit var audioManager: AudioManager
+-    private var audioFocusRequest: AudioFocusRequest? = null
+ 
+     // Mirrored metadata so get_media_status can read without a binder
+     @Volatile var currentSource: String? = null
+@@ -437,56 +436,63 @@ class MediaPlaybackService : Service() {
+     // Audio focus
+     // ------------------------------------------------------------------
+ 
+-    private fun requestAudioFocus(): Boolean {
+-        val focusListener =
+-            AudioManager.OnAudioFocusChangeListener { focusChange ->
+-                when (focusChange) {
+-                    // Permanent focus loss: PAUSE instead of stop. Stopping kills the
+-                    // foreground service entirely, which leaves the user with a dead
+-                    // session that subsequent seek_media / resume_media calls report as
+-                    // "no_session". Pausing keeps the session alive so the user can
+-                    // resume manually after whatever stole focus is done.
+-                    AudioManager.AUDIOFOCUS_LOSS -> {
+-                        pausePlayback()
+-                    }
+-
+-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+-                        pausePlayback()
+-                    }
+-
+-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+-                        mediaPlayer?.setVolume(0.2f, 0.2f)
+-                    }
+-
+-                    AudioManager.AUDIOFOCUS_GAIN -> {
+-                        mediaPlayer?.setVolume(1.0f, 1.0f)
+-                        resumePlayback()
++    // One listener + one request for the whole service lifetime (issue #30): building a fresh
++    // listener/request on every requestAudioFocus() made the framework treat a resume-triggered
++    // re-request as a different client stealing focus from our own still-held request, so
++    // resume_media instantly re-paused. See [AudioFocusHolder].
++    private val audioFocusHolder =
++        AudioFocusHolder<AudioManager.OnAudioFocusChangeListener, AudioFocusRequest>(
++            createListener = {
++                AudioManager.OnAudioFocusChangeListener { focusChange ->
++                    when (focusChange) {
++                        // Permanent focus loss: PAUSE instead of stop. Stopping kills the
++                        // foreground service entirely, which leaves the user with a dead
++                        // session that subsequent seek_media / resume_media calls report as
++                        // "no_session". Pausing keeps the session alive so the user can
++                        // resume manually after whatever stole focus is done.
++                        AudioManager.AUDIOFOCUS_LOSS -> {
++                            pausePlayback()
++                        }
++
++                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
++                            pausePlayback()
++                        }
++
++                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
++                            mediaPlayer?.setVolume(0.2f, 0.2f)
++                        }
++
++                        AudioManager.AUDIOFOCUS_GAIN -> {
++                            mediaPlayer?.setVolume(1.0f, 1.0f)
++                            resumePlayback()
++                        }
+                     }
+                 }
+-            }
++            },
++            createRequest = { listener ->
++                AudioFocusRequest
++                    .Builder(AudioManager.AUDIOFOCUS_GAIN)
++                    .apply {
++                        setAudioAttributes(
++                            AudioAttributes
++                                .Builder()
++                                .setUsage(AudioAttributes.USAGE_MEDIA)
++                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
++                                .build(),
++                        )
++                        setAcceptsDelayedFocusGain(true)
++                        setOnAudioFocusChangeListener(listener)
++                    }.build()
++            },
++            doRequest = { request ->
++                audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
++            },
++            doAbandon = { request -> audioManager.abandonAudioFocusRequest(request) },
++        )
+ 
+-        val request =
+-            AudioFocusRequest
+-                .Builder(AudioManager.AUDIOFOCUS_GAIN)
+-                .apply {
+-                    setAudioAttributes(
+-                        AudioAttributes
+-                            .Builder()
+-                            .setUsage(AudioAttributes.USAGE_MEDIA)
+-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+-                            .build(),
+-                    )
+-                    setAcceptsDelayedFocusGain(true)
+-                    setOnAudioFocusChangeListener(focusListener)
+-                }.build()
+-        audioFocusRequest = request
+-        return audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+-    }
++    private fun requestAudioFocus(): Boolean = audioFocusHolder.requestFocus()
+ 
+-    private fun abandonAudioFocus() {
+-        audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+-        audioFocusRequest = null
+-    }
++    private fun abandonAudioFocus() = audioFocusHolder.abandon()
+ 
+     // ------------------------------------------------------------------
+     // MediaPlayer cleanup
+@@ -670,3 +676,29 @@ class MediaPlaybackService : Service() {
+             positionMs
+         }
+ }
++
++/**
++ * Owns the single audio-focus listener + request pair for [MediaPlaybackService] (issue #30).
++ * Both are created lazily on the first [requestFocus] and then reused for every later request,
++ * including after [abandon], so the framework always sees the same client. Generic over the
++ * listener/request types so a plain JVM test can pin the reuse contract without Android.
++ */
++internal class AudioFocusHolder<Listener, Request>(
++    private val createListener: () -> Listener,
++    private val createRequest: (Listener) -> Request,
++    private val doRequest: (Request) -> Boolean,
++    private val doAbandon: (Request) -> Unit,
++) {
++    private var listener: Listener? = null
++    private var request: Request? = null
++
++    fun requestFocus(): Boolean {
++        val stableListener = listener ?: createListener().also { listener = it }
++        val stableRequest = request ?: createRequest(stableListener).also { request = it }
++        return doRequest(stableRequest)
++    }
++
++    fun abandon() {
++        request?.let { doAbandon(it) }
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTools.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTools.kt
+index 7217d73d2..6125c09a1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTools.kt
+@@ -171,6 +171,14 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
+     val isPending = tool.isPending
+     val isDenied = tool.approvalState is ToolApprovalState.Denied
+     val images = tool.output.filterIsInstance<UIMessagePart.Image>()
++    // Text parts nested in tool.output (e.g. run_js's webview payload) that carry
++    // rikkahub.webview metadata never reach the top-level Text rendering branch in
++    // ChatMessage.kt, since tool output is always folded into this step. Surface them
++    // here so skill webview cards render (#38).
++    val webviewParts =
++        tool.output
++            .filterIsInstance<UIMessagePart.Text>()
++            .filter { it.hasSkillWebviewMeta() }
+ 
+     // 诊断（「审批停住但无按钮」排查）：渲染侧看到的审批状态与回调可用性。
+     // 只有它和 GenLoop 的 approval-check 一起看，才能区分「状态没到 UI」与「到了但回调为空」。
+@@ -183,9 +191,10 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
+         if (isPending) AppLog.i("ToolApprovalUI", line) else AppLog.d("ToolApprovalUI", line)
+     }
+ 
+-    // Summary detection is delegated to the registered renderer; image output and
+-    // denial reasons are common to all tools.
+-    val hasExtraContent = renderer.hasSummary(context) || isDenied || images.isNotEmpty()
++    // Summary detection is delegated to the registered renderer; image output, webview
++    // cards and denial reasons are common to all tools.
++    val hasExtraContent =
++        renderer.hasSummary(context) || isDenied || images.isNotEmpty() || webviewParts.isNotEmpty()
+     val stepStatus =
+         resolveToolStepStatus(
+             isPending = isPending,
+@@ -392,6 +401,9 @@ fun ChainOfThoughtScope.ChatMessageToolStep(
+                 {
+                     ToolSummarySurface {
+                         renderer.Summary(context)
++                        webviewParts.forEach { webviewPart ->
++                            SkillWebviewCardOrNull(part = webviewPart)
++                        }
+                         if (images.isNotEmpty()) {
+                             LazyRow(
+                                 horizontalArrangement = Arrangement.spacedBy(4.dp),
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCard.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCard.kt
+index 94fe167a5..8aa7f52a2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCard.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCard.kt
+@@ -111,8 +111,21 @@ internal fun SkillWebviewCardOrNull(
+                     // Routes through the in-app browser so the persistent profile, tool
+                     // toggles, and HARDLINE all apply uniformly. Falls back to about:blank
+                     // if the URL was somehow lost between metadata write + render.
++                    //
++                    // When the skill declared `iframe: true` for a remote URL, top-level
++                    // navigation would hit the endpoint's own "must be used in an iframe"
++                    // rejection page (e.g. the Google Maps Embed API). Open a locally built
++                    // wrapper page that embeds it instead. It is handed over as a `data:` URL
++                    // rather than a cache file: the browser's file:// whitelist only admits
++                    // filesDir/skills, and a data: page needs no disk write at all.
+                     runCatching {
+-                        context.startActivity(BrowserActivity.intent(context, webview.url))
++                        val launchUrl =
++                            if (shouldWrapInIframe(webview.url, webview.iframe)) {
++                                iframeWrapperDataUrl(webview.url)
++                            } else {
++                                webview.url
++                            }
++                        context.startActivity(BrowserActivity.intent(context, launchUrl))
+                     }
+                 }) {
+                     Text(stringResource(R.string.skill_webview_card_open))
+@@ -142,3 +155,59 @@ private fun extractWebviewMeta(metadata: JsonObject?): WebviewMeta? {
+     val source = webview["source"]?.jsonPrimitive?.contentOrNull
+     return WebviewMeta(url = url, iframe = iframe, source = source)
+ }
++
++/**
++ * Cheap predicate for whether this part carries a usable `rikkahub.webview` metadata
++ * block, without doing the full render. Shares [extractWebviewMeta] so it can never
++ * disagree with what [SkillWebviewCardOrNull] actually renders — used by the tool step to
++ * decide whether a `run_js` tool's nested output parts should be rendered as webview cards.
++ */
++internal fun UIMessagePart.Text.hasSkillWebviewMeta(): Boolean =
++    extractWebviewMeta(metadata) != null
++
++/**
++ * True only when the skill declared `iframe: true` and [url] is a remote `http`/`https`
++ * address. A `file://` skill page (e.g. the virtual-piano skill) is already local and
++ * full-screen — wrapping it in an iframe buys nothing and would break any relative asset
++ * paths inside it.
++ */
++internal fun shouldWrapInIframe(url: String, iframe: Boolean): Boolean {
++    if (!iframe) return false
++    val scheme = url.substringBefore("://", missingDelimiterValue = "").lowercase()
++    return scheme == "http" || scheme == "https"
++}
++
++/**
++ * Builds a minimal full-height HTML document that embeds [url] in an `<iframe>`. Some skill
++ * endpoints (e.g. the Google Maps Embed API) render a plain-text rejection page
++ * ("must be used in an iframe") when navigated to top-level, but render correctly when
++ * embedded. [url] may be skill-authored and is therefore untrusted — it is HTML-attribute-
++ * escaped before interpolation so it cannot break out of the `src` attribute.
++ */
++internal fun buildIframeWrapperHtml(url: String): String {
++    val escapedUrl =
++        url
++            .replace("&", "&amp;")
++            .replace("\"", "&quot;")
++            .replace("<", "&lt;")
++            .replace(">", "&gt;")
++            .replace("'", "&#39;")
++    return """
++        <!DOCTYPE html>
++        <html>
++        <head>
++        <meta charset="utf-8">
++        <meta name="viewport" content="width=device-width, initial-scale=1.0">
++        <style>html, body { height: 100%; margin: 0; }</style>
++        </head>
++        <body>
++        <iframe src="$escapedUrl" style="width:100%; height:100%; border:0; display:block"></iframe>
++        </body>
++        </html>
++    """.trimIndent()
++}
++
++/** [buildIframeWrapperHtml] for [url] as a self-contained base64 `data:` URL. */
++internal fun iframeWrapperDataUrl(url: String): String =
++    "data:text/html;charset=utf-8;base64," +
++        java.util.Base64.getEncoder().encodeToString(buildIframeWrapperHtml(url).toByteArray(Charsets.UTF_8))
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/locallm/SettingLocalLlmViewModel.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/locallm/SettingLocalLlmViewModel.kt
+index 7b9b81451..b85dac49d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/locallm/SettingLocalLlmViewModel.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/locallm/SettingLocalLlmViewModel.kt
+@@ -13,7 +13,9 @@ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ import me.rerere.ai.provider.LITERT_PROVIDER_ID
+ import me.rerere.ai.provider.LLAMACPP_PROVIDER_ID
++import me.rerere.ai.provider.Modality
+ import me.rerere.ai.provider.Model
++import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.ProviderSetting
+ import me.rerere.locallm.AcceleratorProbe
+ import me.rerere.locallm.LocalRuntime
+@@ -180,7 +182,7 @@ class SettingLocalLlmViewModel(
+                         inputModalities = model.inputModalities,
+                         abilities = model.abilities,
+                     )
+-                val target = LiteRtModelMetadata.deriveCapabilities(model.modelId)
++                val target = deriveLocalModelCapabilities(runtime, model.modelId)
+                 val merged = LiteRtModelMetadata.mergeAdditive(current, target)
+                 if (merged.inputModalities == model.inputModalities &&
+                     merged.abilities == model.abilities
+@@ -271,7 +273,7 @@ class SettingLocalLlmViewModel(
+             val knownModelIds = currentProvider.models.map { it.modelId }.toSet()
+             val missing = finalInstalled.keys.filter { it !in knownModelIds }
+             for (fileName in missing) {
+-                val caps = LiteRtModelMetadata.deriveCapabilities(fileName)
++                val caps = deriveLocalModelCapabilities(runtime, fileName)
+                 val model =
+                     Model(
+                         modelId = fileName,
+@@ -439,7 +441,7 @@ class SettingLocalLlmViewModel(
+                 is ModelInstall.Progress.Done -> {
+                     _downloadProgress.value = null
+                     prefs.addInstalledModel(runtime, fileName, p.file.absolutePath)
+-                    val caps = LiteRtModelMetadata.deriveCapabilities(fileName)
++                    val caps = deriveLocalModelCapabilities(runtime, fileName)
+                     val model =
+                         Model(
+                             modelId = fileName,
+@@ -447,15 +449,11 @@ class SettingLocalLlmViewModel(
+                             inputModalities = caps.inputModalities,
+                             abilities = caps.abilities,
+                         )
+-                    updateMyProvider { provider -> provider.addModel(model) }
++                    // Re-downloading a file already registered updates that entry in place
++                    // instead of appending a same-modelId duplicate (see registerInstalledModel).
++                    updateMyProvider { provider -> registerInstalledModel(provider, model) }
+                     // Enable the provider automatically after the first successful download.
+-                    updateMyProvider { provider ->
+-                        when (provider) {
+-                            is ProviderSetting.LiteRtLocal -> provider.copy(enabled = true)
+-                            is ProviderSetting.LlamaCppLocal -> provider.copy(enabled = true)
+-                            else -> provider
+-                        }
+-                    }
++                    updateMyProvider { provider -> enableAfterFirstDownload(provider) }
+                     refreshFromDisk()
+                 }
+ 
+@@ -483,7 +481,7 @@ class SettingLocalLlmViewModel(
+     ) {
+         viewModelScope.launch {
+             prefs.addInstalledModel(runtime, fileName, absolutePath)
+-            val caps = LiteRtModelMetadata.deriveCapabilities(fileName)
++            val caps = deriveLocalModelCapabilities(runtime, fileName)
+             val model =
+                 Model(
+                     modelId = fileName,
+@@ -491,14 +489,9 @@ class SettingLocalLlmViewModel(
+                     inputModalities = caps.inputModalities,
+                     abilities = caps.abilities,
+                 )
+-            updateMyProvider { provider -> provider.addModel(model) }
++            updateMyProvider { provider -> registerInstalledModel(provider, model) }
+             // Enable the provider automatically after a successful import, same as a download.
+-            updateMyProvider { provider ->
+-                when (provider) {
+-                    is ProviderSetting.LiteRtLocal -> provider.copy(enabled = true)
+-                    else -> provider
+-                }
+-            }
++            updateMyProvider { provider -> enableAfterFirstDownload(provider) }
+             refreshFromDisk()
+         }
+     }
+@@ -551,3 +544,62 @@ class SettingLocalLlmViewModel(
+             LocalRuntime.LlamaCpp -> me.rerere.llamacpp.LlamaCppCatalog.ENTRIES.first().sizeBytes + 200_000_000L
+         }
+ }
++
++/**
++ * Auto-enable transform applied after a model download/import completes: local-runtime
++ * provider settings (LiteRT, llama.cpp) flip to `enabled = true` so the just-installed model
++ * becomes usable without a second trip to Settings. Everything else passes through unchanged;
++ * a total function over [ProviderSetting] so it is directly unit-testable.
++ */
++internal fun enableAfterFirstDownload(provider: ProviderSetting): ProviderSetting =
++    when (provider) {
++        is ProviderSetting.LiteRtLocal -> provider.copy(enabled = true)
++        is ProviderSetting.LlamaCppLocal -> provider.copy(enabled = true)
++        else -> provider
++    }
++
++/**
++ * Registers a just-installed local model on [provider]. [ProviderSetting.addModel] is a plain
++ * append, so calling it for a file name that already has a registered [Model] would leave two
++ * entries with the same `modelId` but different [Model.id]s — the older an unreachable ghost
++ * that id-keyed deletion can never clean up. When an existing model already has [model]'s
++ * `modelId`, update that entry in place (keeping its [Model.id]) instead of appending.
++ */
++internal fun registerInstalledModel(provider: ProviderSetting, model: Model): ProviderSetting {
++    val existing = provider.models.firstOrNull { it.modelId == model.modelId }
++    return if (existing != null) {
++        provider.editModel(model.copy(id = existing.id))
++    } else {
++        provider.addModel(model)
++    }
++}
++
++/**
++ * Runtime-aware capability derivation for an installed model file. LiteRT routes through the
++ * catalog-driven [LiteRtModelMetadata.deriveCapabilities]. llama.cpp has no vision support in
++ * this build, so it always reports TEXT-only input (routing a GGUF through the LiteRT table
++ * could wrongly grant IMAGE); TOOL is assumed, REASONING comes from a matching
++ * [me.rerere.llamacpp.LlamaCppCatalog] entry's `thinking` tag.
++ */
++internal fun deriveLocalModelCapabilities(
++    runtime: LocalRuntime,
++    fileName: String,
++): LiteRtModelMetadata.Capabilities =
++    when (runtime) {
++        LocalRuntime.LiteRT -> LiteRtModelMetadata.deriveCapabilities(fileName)
++        LocalRuntime.LlamaCpp -> {
++            val tags =
++                me.rerere.llamacpp.LlamaCppCatalog.ENTRIES
++                    .firstOrNull { it.file == fileName }
++                    ?.tags
++                    .orEmpty()
++            LiteRtModelMetadata.Capabilities(
++                inputModalities = listOf(Modality.TEXT),
++                abilities =
++                    buildList {
++                        add(ModelAbility.TOOL)
++                        if ("thinking" in tags) add(ModelAbility.REASONING)
++                    },
++            )
++        }
++    }
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsTest.kt
+new file mode 100644
+index 000000000..78d005ee1
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsTest.kt
+@@ -0,0 +1,111 @@
++package me.rerere.rikkahub.data.ai.tools
++
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import me.rerere.workspace.WorkspaceLayout
++import me.rerere.workspace.WorkspaceTreeEntry
++import me.rerere.workspace.WorkspaceTreeResult
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * [40] G1/G2 纯函数覆盖（WorkspaceToolsHelpers.kt），按本地 API 改写：
++ * - [pathOutsideWritableRoots]：写入类工具的强制审批闸门。本地版本以 [WorkspaceLayout.writableRoots]
++ *   为准（而非写死的前缀表），并先折叠 `..` 再比较 —— `..` 走私仍被判为可写区之外。
++ * - [formatWorkspaceTree]：workspace_read_folder 返回给模型的目录树文本（[D]/[F]/[L] 标记）。
++ */
++class WorkspaceToolsTest {
++
++    private val layout = WorkspaceLayout(
++        workspaceDir = "/workspace",
++        writableRoots = listOf("/workspace", "/tmp", "/skills"),
++    )
++
++    private fun outside(path: String) = buildJsonObject { put("path", path) }.pathOutsideWritableRoots(layout, "path")
++
++    @Test
++    fun `clean path inside a writable root is not outside`() {
++        assertFalse(outside("/workspace/notes.txt"))
++        assertFalse(outside("/tmp/scratch"))
++        assertFalse(outside("/workspace"))
++        assertFalse(outside("/skills/foo"))
++    }
++
++    @Test
++    fun `path outside every writable root is outside`() {
++        assertTrue(outside("/etc/passwd"))
++        assertTrue(outside("/var/log/x"))
++    }
++
++    @Test
++    fun `dotdot smuggle attempt is treated as outside even with a writable prefix`() {
++        assertTrue(outside("/workspace/../etc/x"))
++        assertTrue(outside("/tmp/../../etc/passwd"))
++    }
++
++    @Test
++    fun `missing or relative path fails closed`() {
++        assertTrue(buildJsonObject { }.pathOutsideWritableRoots(layout, "path"))
++        assertTrue(outside("workspace/notes.txt"))
++    }
++
++    @Test
++    fun `formatWorkspaceTree renders an empty directory as just its root line`() {
++        val text = formatWorkspaceTree("/workspace", WorkspaceTreeResult(entries = emptyList(), truncated = false))
++        assertEquals("/workspace\n", text)
++    }
++
++    @Test
++    fun `formatWorkspaceTree indents nested entries by depth`() {
++        val result = WorkspaceTreeResult(
++            entries = listOf(
++                WorkspaceTreeEntry(path = "src", name = "src", isDirectory = true, sizeBytes = 0, depth = 1),
++                WorkspaceTreeEntry(path = "src/a.txt", name = "a.txt", isDirectory = false, sizeBytes = 12, depth = 2),
++                WorkspaceTreeEntry(path = "b.txt", name = "b.txt", isDirectory = false, sizeBytes = 3, depth = 1),
++            ),
++            truncated = false,
++        )
++
++        val text = formatWorkspaceTree("/workspace", result)
++
++        assertEquals(
++            "/workspace\n" +
++                "  [D] src\n" +
++                "    [F] a.txt (12B)\n" +
++                "  [F] b.txt (3B)\n",
++            text,
++        )
++    }
++
++    @Test
++    fun `formatWorkspaceTree marks symlinks with their target`() {
++        val result = WorkspaceTreeResult(
++            entries = listOf(
++                WorkspaceTreeEntry(path = "l", name = "l", isDirectory = false, sizeBytes = 7, depth = 1, isSymlink = true, linkTarget = "real.txt"),
++                WorkspaceTreeEntry(path = "d", name = "d", isDirectory = true, sizeBytes = 0, depth = 1, isSymlink = true, linkTarget = "dir"),
++            ),
++            truncated = false,
++        )
++
++        val text = formatWorkspaceTree("/workspace", result)
++
++        assertTrue(text.contains("  [L] l -> real.txt (7B)\n"))
++        assertTrue(text.contains("  [L] d -> dir/\n"))
++    }
++
++    @Test
++    fun `formatWorkspaceTree appends a truncation notice when capped`() {
++        val result = WorkspaceTreeResult(
++            entries = listOf(
++                WorkspaceTreeEntry(path = "a.txt", name = "a.txt", isDirectory = false, sizeBytes = 1, depth = 1),
++            ),
++            truncated = true,
++        )
++
++        val text = formatWorkspaceTree("/workspace", result)
++
++        assertTrue(text.endsWith("(truncated: more entries omitted)\n"))
++    }
++}
+diff --git a/stale-tests/data/ai/tools/local/BrowserTypeScriptTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/BrowserTypeScriptTest.kt
+similarity index 100%
+rename from stale-tests/data/ai/tools/local/BrowserTypeScriptTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/BrowserTypeScriptTest.kt
+diff --git a/stale-tests/data/ai/tools/local/HistoryNavResolutionTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/HistoryNavResolutionTest.kt
+similarity index 100%
+rename from stale-tests/data/ai/tools/local/HistoryNavResolutionTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/HistoryNavResolutionTest.kt
+diff --git a/stale-tests/data/ai/tools/local/ScheduleJobToolValidationTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/ScheduleJobToolValidationTest.kt
+similarity index 100%
+rename from stale-tests/data/ai/tools/local/ScheduleJobToolValidationTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/ScheduleJobToolValidationTest.kt
+diff --git a/stale-tests/data/datastore/migration/PreferenceStoreMigrationHelpersTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/migration/PreferenceStoreMigrationHelpersTest.kt
+similarity index 99%
+rename from stale-tests/data/datastore/migration/PreferenceStoreMigrationHelpersTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/datastore/migration/PreferenceStoreMigrationHelpersTest.kt
+index 1e35a284c..4f859fc0a 100644
+--- a/stale-tests/data/datastore/migration/PreferenceStoreMigrationHelpersTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/migration/PreferenceStoreMigrationHelpersTest.kt
+@@ -1,5 +1,6 @@
+ package me.rerere.rikkahub.data.datastore.migration
+ 
++import kotlinx.serialization.json.JsonNull
+ import kotlinx.serialization.json.JsonObject
+ import kotlinx.serialization.json.jsonArray
+ import kotlinx.serialization.json.jsonObject
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt b/app/src/test/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt
+new file mode 100644
+index 000000000..a9169eadd
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/db/ImportedDatabaseReconcilerTest.kt
+@@ -0,0 +1,242 @@
++package me.rerere.rikkahub.data.db
++
++import android.app.Application
++import android.content.Context
++import android.database.sqlite.SQLiteDatabase
++import androidx.room.Room
++import androidx.room.testing.MigrationTestHelper
++import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
++import androidx.test.platform.app.InstrumentationRegistry
++import java.io.File
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.jsonArray
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import me.rerere.rikkahub.data.db.migrations.APP_DATABASE_MIGRATIONS
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Assert.fail
++import org.junit.Assume.assumeFalse
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++/**
++ * [ImportedDatabaseReconciler] 的 JVM 覆盖（Robolectric 提供真实 SQLite）。
++ *
++ * 1. 常量与导出 schema 同步：当前版本跟随 [AppDatabase.VERSION]；2.4.x 基线（v27）的 hash、
++ *    补建表 DDL 与 27.json 逐字一致；[ImportedDatabaseReconciler.POST_BASELINE_SENTINELS]
++ *    覆盖 27 → 当前 在已有表上新增的每一列（以后再加列忘了同步，这里直接红）。
++ * 2. issues #10/#11 回归（2.4.x 备份导入后首启 "duplicate column name"）：用 27.json 建出与
++ *    2.4.1 备份同形的库（共享表 = v27，删掉本应用独有表，stamp 成 24 + 外来 identity）：
++ *    - 不 reconcile 直接交给 Room：重放 24→25 撞列崩溃；
++ *    - reconcile 后：被改写成真正的 v27 文件，Room 走正常 27→当前 迁移链打开、校验通过，数据保留。
++ * 3. 本应用当前版本的真实备份：reconcile 不改动版本，Room 照常打开。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class ImportedDatabaseReconcilerTest {
++
++    private val testDb = "reconciler-legacy-241-unit-test"
++
++    // 2.4.1 备份的真实标记：user_version 24 + 它自己的（外来）identity
++    private val legacyVersion = 24
++    private val legacyIdentity = "0ea1aaebfa031c7995c45a1e35822e1a"
++
++    private val appSpecificTables = listOf(
++        "scheduled_jobs", "scheduled_job_runs", "ssh_hosts", "telegram_chats",
++        "workflows", "workflow_runs", "agent_runs",
++    )
++
++    @get:Rule
++    val helper: MigrationTestHelper = MigrationTestHelper(
++        InstrumentationRegistry.getInstrumentation(),
++        AppDatabase::class.java,
++        emptyList(),
++        FrameworkSQLiteOpenHelperFactory(),
++    )
++
++    private val context: Context get() = InstrumentationRegistry.getInstrumentation().targetContext
++
++    @After
++    fun tearDown() {
++        context.deleteDatabase(testDb)
++    }
++
++    // ---------- 常量与 schema 导出同步 ----------
++
++    private val schemaDir: File =
++        listOf(
++            "app/schemas/me.rerere.rikkahub.data.db.AppDatabase",
++            "schemas/me.rerere.rikkahub.data.db.AppDatabase",
++        ).map(::File).first { it.isDirectory }
++
++    private fun schema(version: Int): JsonObject =
++        Json.parseToJsonElement(File(schemaDir, "$version.json").readText()).jsonObject["database"]!!.jsonObject
++
++    private fun JsonObject.entities(): Map<String, JsonObject> =
++        this["entities"]!!.jsonArray.map { it.jsonObject }
++            .associateBy { it["tableName"]!!.jsonPrimitive.content }
++
++    @Test
++    fun `expected version follows AppDatabase VERSION`() {
++        assertEquals(AppDatabase.VERSION, ImportedDatabaseReconciler.EXPECTED_VERSION)
++    }
++
++    @Test
++    fun `legacy baseline constants match schema 27`() {
++        val db = schema(ImportedDatabaseReconciler.LEGACY_BASELINE_VERSION)
++        assertEquals("27", db["version"]!!.jsonPrimitive.content)
++        assertEquals(
++            ImportedDatabaseReconciler.LEGACY_BASELINE_IDENTITY_HASH,
++            db["identityHash"]!!.jsonPrimitive.content,
++        )
++    }
++
++    @Test
++    fun `app specific DDL is byte-identical to schema 27`() {
++        val entities = schema(ImportedDatabaseReconciler.LEGACY_BASELINE_VERSION).entities()
++        val expected = appSpecificTables.flatMap { table ->
++            val e = entities.getValue(table)
++            listOf(e["createSql"]!!.jsonPrimitive.content.replace("\${TABLE_NAME}", table)) +
++                e["indices"]?.jsonArray.orEmpty().map {
++                    it.jsonObject["createSql"]!!.jsonPrimitive.content.replace("\${TABLE_NAME}", table)
++                }
++        }
++        assertEquals(expected, ImportedDatabaseReconciler.APP_SPECIFIC_DDL)
++        ImportedDatabaseReconciler.APP_SPECIFIC_DDL.forEach {
++            assertTrue("not idempotent: $it", it.contains(" IF NOT EXISTS "))
++        }
++    }
++
++    @Test
++    fun `post baseline sentinels cover every column added after v27`() {
++        val base = schema(ImportedDatabaseReconciler.LEGACY_BASELINE_VERSION).entities()
++        val current = schema(AppDatabase.VERSION).entities()
++        fun columns(e: JsonObject) = e["fields"]!!.jsonArray.map { it.jsonObject["columnName"]!!.jsonPrimitive.content }.toSet()
++        val added = base.keys.intersect(current.keys).flatMap { table ->
++            (columns(current.getValue(table)) - columns(base.getValue(table))).map { table.lowercase() to it }
++        }.toSet()
++        val sentinels = ImportedDatabaseReconciler.POST_BASELINE_SENTINELS.map { (t, c) -> t.lowercase() to c }.toSet()
++        assertEquals(added, sentinels)
++        // 基线哨兵列必须确实存在于 v27
++        val baseConversation = columns(base.getValue("ConversationEntity"))
++        ImportedDatabaseReconciler.LEGACY_BASELINE_SENTINELS.forEach { (_, c) -> assertTrue(c in baseConversation) }
++    }
++
++    // ---------- 2.4.x 导入回归 ----------
++
++    /**
++     * Robolectric 的 native SQLite 运行时没有 Linux aarch64 构建（CI 的 x86_64 正常）。
++     * 只在该平台跳过真正开库的用例，避免本地 arm64 环境误报；其余平台照常执行。
++     */
++    private fun assumeNativeSqlite() {
++        val os = System.getProperty("os.name").orEmpty()
++        val arch = System.getProperty("os.arch").orEmpty()
++        assumeFalse(
++            "Robolectric native SQLite is not available on Linux $arch",
++            os.startsWith("Linux") && (arch == "aarch64" || arch == "arm64"),
++        )
++    }
++
++
++    /** 用 27.json 建库、写一条会话，再降级成 2.4.1 备份的样子（无独有表、user_version 24、外来 identity）。 */
++    private fun createLegacy241Backup() {
++        helper.createDatabase(testDb, ImportedDatabaseReconciler.LEGACY_BASELINE_VERSION).apply {
++            execSQL(
++                "INSERT INTO ConversationEntity (id, title, nodes, create_at, update_at) VALUES (?, ?, ?, ?, ?)",
++                arrayOf<Any?>("c1", "hello", "[]", 1_000L, 1_000L),
++            )
++            close()
++        }
++        SQLiteDatabase.openDatabase(context.getDatabasePath(testDb).absolutePath, null, SQLiteDatabase.OPEN_READWRITE).use { raw ->
++            appSpecificTables.forEach { raw.execSQL("DROP TABLE IF EXISTS `$it`") }
++            raw.execSQL("UPDATE room_master_table SET identity_hash = ? WHERE id = 42", arrayOf<Any?>(legacyIdentity))
++            raw.version = legacyVersion
++        }
++    }
++
++    private fun openWithRoom(): AppDatabase =
++        Room.databaseBuilder(context, AppDatabase::class.java, testDb)
++            .addMigrations(*APP_DATABASE_MIGRATIONS)
++            .allowMainThreadQueries()
++            .build()
++
++    private fun rawVersion(): Int =
++        SQLiteDatabase.openDatabase(context.getDatabasePath(testDb).absolutePath, null, SQLiteDatabase.OPEN_READONLY)
++            .use { it.version }
++
++    @Test
++    fun `without reconcile a 2_4_1 backup reproduces the duplicate column crash`() {
++        assumeNativeSqlite()
++        createLegacy241Backup()
++        val room = openWithRoom()
++        try {
++            room.openHelper.writableDatabase.query("SELECT COUNT(*) FROM ConversationEntity").use { it.moveToFirst() }
++            fail("expected Room to crash replaying the 24 -> 25 migration on a 2.4.1 file")
++        } catch (expected: Throwable) {
++            val chain = generateSequence(expected) { it.cause }.mapNotNull { it.message }.joinToString(" | ")
++            assertTrue(
++                "expected a duplicate-column failure, got: $chain",
++                chain.contains("custom_system_prompt") || chain.contains("duplicate column"),
++            )
++        } finally {
++            room.close()
++        }
++    }
++
++    @Test
++    fun `after reconcile a 2_4_1 backup migrates to the current schema and keeps data`() {
++        assumeNativeSqlite()
++        createLegacy241Backup()
++
++        val result = ImportedDatabaseReconciler.reconcileDatabaseFile(context.getDatabasePath(testDb))
++        assertTrue("reconcile should succeed: ${result.exceptionOrNull()}", result.isSuccess)
++        assertEquals(ImportedDatabaseReconciler.LEGACY_BASELINE_VERSION, rawVersion())
++
++        val room = openWithRoom()
++        try {
++            val db = room.openHelper.writableDatabase // 走 27 → 当前 迁移链并按当前 schema 校验
++            assertEquals(AppDatabase.VERSION, db.version)
++            db.query("SELECT title FROM ConversationEntity WHERE id = 'c1'").use { c ->
++                assertTrue("seeded conversation row should survive the restore", c.moveToFirst())
++                assertEquals("hello", c.getString(0))
++            }
++            for (table in appSpecificTables) {
++                db.query("SELECT COUNT(*) FROM `$table`").use { c ->
++                    assertTrue("app-specific table $table should exist after reconcile", c.moveToFirst())
++                    assertEquals("app-specific table $table should start empty", 0, c.getInt(0))
++                }
++            }
++        } finally {
++            room.close()
++        }
++    }
++
++    @Test
++    fun `a current-version backup is left at its version and opens`() {
++        assumeNativeSqlite()
++        helper.createDatabase(testDb, AppDatabase.VERSION).close()
++
++        val result = ImportedDatabaseReconciler.reconcileDatabaseFile(context.getDatabasePath(testDb))
++        assertTrue(result.isSuccess)
++        assertEquals(AppDatabase.VERSION, rawVersion())
++
++        val room = openWithRoom()
++        try {
++            room.openHelper.writableDatabase.query("SELECT COUNT(*) FROM ConversationEntity").use { assertTrue(it.moveToFirst()) }
++        } finally {
++            room.close()
++        }
++    }
++
++    @Test
++    fun `a missing file is a successful no-op`() {
++        val missing = File(context.cacheDir, "does-not-exist.db")
++        assertTrue(ImportedDatabaseReconciler.reconcileDatabaseFile(missing).isSuccess)
++    }
++}
+diff --git a/stale-tests/data/preferences/TermuxDefaultsTest.kt b/app/src/test/java/me/rerere/rikkahub/data/preferences/TermuxDefaultsTest.kt
+similarity index 90%
+rename from stale-tests/data/preferences/TermuxDefaultsTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/preferences/TermuxDefaultsTest.kt
+index 25b5ad943..4bb65f7c7 100644
+--- a/stale-tests/data/preferences/TermuxDefaultsTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/preferences/TermuxDefaultsTest.kt
+@@ -166,10 +166,24 @@ class TermuxDefaultsTest {
+     }
+ 
+     @Test
+-    fun maxToolSteps_defaultMatchesTheOldHardcodedLimit() {
+-        // 32 was GenerationHandler's hardcoded maxSteps before issue #22 made it configurable.
+-        // Pinning it here keeps an existing user's behaviour identical until they change it.
+-        assertEquals(32, TermuxDefaults.DEFAULT_MAX_TOOL_STEPS)
++    fun maxToolSteps_defaultIs100() {
++        // 32 was the old hardcoded maxSteps; issue #22 raised this build's default to 100
++        // (long Termux chains were truncated mid-task). Pin it so a change is deliberate.
++        assertEquals(100, TermuxDefaults.DEFAULT_MAX_TOOL_STEPS)
++    }
++
++    @Test
++    fun maxToolSteps_runtimeHolderClampsWrites() {
++        val limits = me.rerere.rikkahub.data.ai.limits.ToolRuntimeLimits
++        val prev = limits.maxToolSteps
++        try {
++            limits.maxToolSteps = 0
++            assertEquals(TermuxDefaults.MIN_MAX_TOOL_STEPS, limits.maxToolSteps)
++            limits.maxToolSteps = Int.MAX_VALUE
++            assertEquals(TermuxDefaults.MAX_MAX_TOOL_STEPS, limits.maxToolSteps)
++        } finally {
++            limits.maxToolSteps = prev
++        }
+     }
+ 
+     @Test
+diff --git a/stale-tests/data/preferences/TermuxRuntimeWiringTest.kt b/app/src/test/java/me/rerere/rikkahub/data/preferences/TermuxRuntimeWiringTest.kt
+similarity index 100%
+rename from stale-tests/data/preferences/TermuxRuntimeWiringTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/preferences/TermuxRuntimeWiringTest.kt
+diff --git a/stale-tests/data/repository/ConversationRepositoryChatModelIdTest.kt b/app/src/test/java/me/rerere/rikkahub/data/repository/ConversationRepositoryChatModelIdTest.kt
+similarity index 100%
+rename from stale-tests/data/repository/ConversationRepositoryChatModelIdTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/repository/ConversationRepositoryChatModelIdTest.kt
+diff --git a/stale-tests/service/AudioFocusHolderTest.kt b/app/src/test/java/me/rerere/rikkahub/service/AudioFocusHolderTest.kt
+similarity index 100%
+rename from stale-tests/service/AudioFocusHolderTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/service/AudioFocusHolderTest.kt
+diff --git a/stale-tests/service/CronJobSchedulerTest.kt b/app/src/test/java/me/rerere/rikkahub/service/CronJobSchedulerTest.kt
+similarity index 100%
+rename from stale-tests/service/CronJobSchedulerTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/service/CronJobSchedulerTest.kt
+diff --git a/stale-tests/service/CronJobWorkerHistoryRetentionTest.kt b/app/src/test/java/me/rerere/rikkahub/service/CronJobWorkerHistoryRetentionTest.kt
+similarity index 100%
+rename from stale-tests/service/CronJobWorkerHistoryRetentionTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/service/CronJobWorkerHistoryRetentionTest.kt
+diff --git a/stale-tests/service/CronJobWorkerRunLlmTimeoutTest.kt b/app/src/test/java/me/rerere/rikkahub/service/CronJobWorkerRunLlmTimeoutTest.kt
+similarity index 100%
+rename from stale-tests/service/CronJobWorkerRunLlmTimeoutTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/service/CronJobWorkerRunLlmTimeoutTest.kt
+diff --git a/stale-tests/ui/components/message/SkillWebviewCardIframeTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCardIframeTest.kt
+similarity index 100%
+rename from stale-tests/ui/components/message/SkillWebviewCardIframeTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCardIframeTest.kt
+diff --git a/stale-tests/ui/components/message/SkillWebviewCardMetaTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCardMetaTest.kt
+similarity index 100%
+rename from stale-tests/ui/components/message/SkillWebviewCardMetaTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/ui/components/message/SkillWebviewCardMetaTest.kt
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceFolderExportPlanTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceFolderExportPlanTest.kt
+new file mode 100644
+index 000000000..dd42dd010
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceFolderExportPlanTest.kt
+@@ -0,0 +1,63 @@
++package me.rerere.rikkahub.ui.pages.extensions.workspace
++
++import me.rerere.workspace.WorkspaceFileEntry
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * [planWorkspaceFolderExport]（#40 G4 文件夹导出）的纯函数覆盖。
++ * 从 stale-tests 的 WorkspaceDetailVMTest 拆出；树形视图（flattenWorkspaceTree）的用例仍留在
++ * stale-tests —— 本地文件页没有可展开的树形视图。
++ */
++class WorkspaceFolderExportPlanTest {
++
++    private fun file(name: String, path: String) = WorkspaceFileEntry(
++        path = path,
++        name = name,
++        isDirectory = false,
++        sizeBytes = 1,
++        updatedAt = 0L,
++    )
++
++    private fun dir(name: String, path: String) = WorkspaceFileEntry(
++        path = path,
++        name = name,
++        isDirectory = true,
++        sizeBytes = 0,
++        updatedAt = 0L,
++    )
++
++    @Test
++    fun `export plan enumerates parents before children with correct parent paths`() {
++        val listing = mapOf(
++            "notes" to listOf(dir("sub", "notes/sub"), file("a.txt", "notes/a.txt")),
++            "notes/sub" to listOf(file("b.txt", "notes/sub/b.txt")),
++        )
++
++        val plan = planWorkspaceFolderExport("notes", listing)
++
++        assertEquals(
++            listOf(
++                Triple("notes/sub", "notes", true),
++                Triple("notes/sub/b.txt", "notes/sub", false),
++                Triple("notes/a.txt", "notes", false),
++            ),
++            plan.map { Triple(it.sourcePath, it.parentPath, it.isDirectory) },
++        )
++    }
++
++    @Test
++    fun `export plan for an empty folder is empty`() {
++        val plan = planWorkspaceFolderExport("empty", mapOf("empty" to emptyList()))
++        assertEquals(emptyList<Any>(), plan)
++    }
++
++    @Test
++    fun `a missing listing level is skipped instead of failing the whole export`() {
++        val listing = mapOf("root" to listOf(dir("gone", "root/gone"), file("a.txt", "root/a.txt")))
++
++        val plan = planWorkspaceFolderExport("root", listing)
++
++        assertEquals(listOf("root/gone", "root/a.txt"), plan.map { it.sourcePath })
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorReportTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorReportTest.kt
+new file mode 100644
+index 000000000..e7da4a11f
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/doctor/DoctorReportTest.kt
+@@ -0,0 +1,125 @@
++package me.rerere.rikkahub.ui.pages.setting.doctor
++
++import android.app.Application
++import android.content.Context
++import me.rerere.rikkahub.R
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++
++/**
++ * [DoctorReport.format] 的格式化覆盖 —— Doctor 页「复制报告」与 Telegram /doctor 共用的纯文本报告。
++ *
++ * 报告标题、分类名、行标题现在都走字符串资源（需要 Context），所以用 Robolectric 提供真实
++ * 资源；断言一律从同一 Context 取期望文本，不写死某一语言的措辞。`Generated` 行依赖墙钟，
++ * 不断言；其余（标题、严重度汇总、分类分组、严重度标记、空分类跳过、顺序、无尾随空白）都断言。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], application = Application::class)
++class DoctorReportTest {
++
++    private lateinit var context: Context
++
++    @Before
++    fun setUp() {
++        context = RuntimeEnvironment.getApplication()
++    }
++
++    // 行标题必须是字符串资源；这里借用分类名资源，只要求能被解析成稳定文本
++    private fun check(
++        id: String,
++        category: DoctorCategory,
++        severity: Severity,
++        labelRes: Int = R.string.doctor_category_diagnostics,
++        detail: String = "detail-$id",
++    ) = DoctorCheck(id = id, category = category, labelRes = labelRes, detail = detail, severity = severity)
++
++    private fun categoryName(category: DoctorCategory) = context.getString(category.displayNameRes)
++
++    @Test fun `header line is the supplied header`() {
++        val out = DoctorReport.format(context, emptyList(), header = "custom header")
++        assertTrue(out.startsWith("custom header\n"))
++    }
++
++    @Test fun `default header comes from the string resource`() {
++        val out = DoctorReport.format(context, emptyList())
++        assertTrue(out.startsWith(context.getString(R.string.doctor_report_header) + "\n"))
++    }
++
++    @Test fun `summary counts every severity`() {
++        val out = DoctorReport.format(
++            context,
++            listOf(
++                check("a", DoctorCategory.Permissions, Severity.FAIL),
++                check("b", DoctorCategory.Permissions, Severity.WARN),
++                check("c", DoctorCategory.Permissions, Severity.WARN),
++                check("d", DoctorCategory.Services, Severity.OK),
++                check("e", DoctorCategory.Services, Severity.INFO),
++            ),
++        )
++        assertTrue(out.contains(context.getString(R.string.doctor_report_summary, "fail=1  warn=2  ok=1  info=1")))
++    }
++
++    @Test fun `summary shows zero for absent severities`() {
++        val out = DoctorReport.format(context, listOf(check("a", DoctorCategory.Database, Severity.OK)))
++        assertTrue(out.contains(context.getString(R.string.doctor_report_summary, "fail=0  warn=0  ok=1  info=0")))
++    }
++
++    @Test fun `rows are grouped under their category display name`() {
++        val out = DoctorReport.format(
++            context,
++            listOf(
++                check("a", DoctorCategory.Permissions, Severity.OK),
++                check("b", DoctorCategory.Database, Severity.FAIL),
++            ),
++        )
++        assertTrue(out.contains("## ${categoryName(DoctorCategory.Permissions)}"))
++        assertTrue(out.contains("## ${categoryName(DoctorCategory.Database)}"))
++    }
++
++    @Test fun `empty categories are skipped`() {
++        val out = DoctorReport.format(context, listOf(check("a", DoctorCategory.Network, Severity.OK)))
++        assertTrue(out.contains("## ${categoryName(DoctorCategory.Network)}"))
++        assertTrue(!out.contains("## ${categoryName(DoctorCategory.Termux)}"))
++    }
++
++    @Test fun `each severity gets its mark`() {
++        val label = context.getString(R.string.doctor_category_diagnostics)
++        val out = DoctorReport.format(
++            context,
++            listOf(
++                check("a", DoctorCategory.Diagnostics, Severity.OK),
++                check("b", DoctorCategory.Diagnostics, Severity.INFO),
++                check("c", DoctorCategory.Diagnostics, Severity.WARN),
++                check("d", DoctorCategory.Diagnostics, Severity.FAIL),
++            ),
++        )
++        assertTrue(out.contains("[ok]    $label — detail-a"))
++        assertTrue(out.contains("[info]  $label — detail-b"))
++        assertTrue(out.contains("[warn]  $label — detail-c"))
++        assertTrue(out.contains("[fail]  $label — detail-d"))
++    }
++
++    @Test fun `categories appear in enum declaration order`() {
++        val out = DoctorReport.format(
++            context,
++            listOf(
++                check("a", DoctorCategory.Maintenance, Severity.OK),
++                check("b", DoctorCategory.Permissions, Severity.OK),
++            ),
++        )
++        val permIdx = out.indexOf("## ${categoryName(DoctorCategory.Permissions)}")
++        val maintIdx = out.indexOf("## ${categoryName(DoctorCategory.Maintenance)}")
++        assertTrue(permIdx in 0 until maintIdx)
++    }
++
++    @Test fun `output has no trailing whitespace`() {
++        val out = DoctorReport.format(context, listOf(check("a", DoctorCategory.Database, Severity.OK)))
++        assertEquals(out, out.trimEnd())
++    }
++}
+diff --git a/stale-tests/ui/pages/setting/locallm/SettingLocalLlmCapabilitiesTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/locallm/SettingLocalLlmCapabilitiesTest.kt
+similarity index 100%
+rename from stale-tests/ui/pages/setting/locallm/SettingLocalLlmCapabilitiesTest.kt
+rename to app/src/test/java/me/rerere/rikkahub/ui/pages/setting/locallm/SettingLocalLlmCapabilitiesTest.kt
+diff --git a/stale-tests/README.md b/stale-tests/README.md
+index 821481ed0..53fd757e4 100644
+--- a/stale-tests/README.md
++++ b/stale-tests/README.md
+@@ -1,30 +1,41 @@
+ # stale-tests
+ 
+ Unit tests quarantined on 2026-09-10 because the test source set did NOT compile
+-(722 errors), which blocked `:app:testDebugUnitTest` entirely.
++(722 errors), which blocked `:app:testDebugUnitTest` entirely. They came from an
++abandoned upstream merge (2.4.10 / 2.5.0, i.e. the ExTV/rikkahub-agent fork) and
++referenced feature code the local tree did not have.
+ 
+-## Why they do not compile
++Nothing here is compiled or executed. When a feature is ported, move its test back
++with `git mv` into `app/src/test/java/...`, make it compile against the real local
++API, and keep `:app:compileDebugUnitTestKotlin` green.
+ 
+-These files were carried in from an abandoned upstream merge (2.4.10 / 2.5.0) and
+-reference APIs that do NOT exist anywhere in the current main sources, e.g.:
++## 已回收（2026-11-13，fix/stale-tests 分支）
+ 
+-    formatWorkspaceTree, hasSkillWebviewMeta, buildIframeWrapperHtml,
+-    shouldWrapInIframe, buildTypeScript, decodeChatModelId, encodeChatModelId,
+-    deriveLocalModelCapabilities, enableAfterFirstDownload, finishRunLlm,
+-    finishSubAgentWait, terminalJobUpdate, historyRetentionFor,
+-    MAX_HISTORY_RETENTION, registerInstalledModel, AudioFocusHolder,
+-    clampMaxToolSteps, AutoCompactionThresholdMode,
+-    contextCompactionTargetTokensK, getContextCompactionTargetTokens
++| 测试 | 处理 |
++|---|---|
++| WorkspaceTreeTest | 原样回收（tree()/maxListEntries 已在） |
++| DoctorReportTest | DoctorReport.format 需要 Context，改走 Robolectric |
++| CronJobSchedulerTest / CronJobWorkerHistoryRetentionTest / CronJobWorkerRunLlmTimeoutTest / ScheduleJobToolValidationTest | 移植 terminalJobUpdate、historyRetentionFor/MAX_HISTORY_RETENTION、finishRunLlm；max_runs 上限 1000 |
++| TermuxDefaultsTest / TermuxRuntimeWiringTest | 移植 clampMaxToolSteps 与校验通过状态持久化 |
++| AudioFocusHolderTest | 移植 AudioFocusHolder |
++| ConversationRepositoryChatModelIdTest | 移植 encode/decodeChatModelId |
++| SkillWebviewCardMetaTest / SkillWebviewCardIframeTest | 移植 hasSkillWebviewMeta、shouldWrapInIframe、buildIframeWrapperHtml（以 data: URL 打开） |
++| BrowserTypeScriptTest / HistoryNavResolutionTest | 移植 buildTypeScript、resolveHistoryNav |
++| SettingLocalLlmCapabilitiesTest | 移植 deriveLocalModelCapabilities、enableAfterFirstDownload、registerInstalledModel |
++| WorkspaceToolsTest | 按本地 pathOutsideWritableRoots + WorkspaceLayout 改写 |
++| PreferenceStoreMigrationHelpersTest | 只缺 JsonNull 导入 |
++| WorkspaceDetailVMTest 的导出计划用例 | 拆到 WorkspaceFolderExportPlanTest（planWorkspaceFolderExport 本地已有） |
+ 
+-Verified by grep over app/src/main + ai/src + agent-tools/src: 19 of 20 sampled
+-symbols have ZERO hits. So they cannot be repaired by editing the tests alone --
+-they are a checklist of feature code that the local tree does not have yet.
++## 仍留在这里的
+ 
+-## How to use this directory
++| 测试 | 原因 |
++|---|---|
++| browser/BrowserAiActionTest.kt | 依赖 ExTV 的浏览器 AI 操作条重设计（BrowserAiActionKind / BrowserAiActionOutcome 等新模型），外加 16 个新字符串 × 7 种语言；属于 UI 功能移植，不是测试修补。 |
++| data/datastore/PreferencesStoreTest.kt | 依赖 AutoCompactionThresholdMode / getContextCompactionTargetTokens 等 ExTV 的自动压缩阈值体系。本地已有 autoCompressMode，照搬会造成两套并存的自动压缩配置，需要先做设计取舍。 |
++| service/ChatServiceTest.kt | 18 例：2 例依赖 AutoCompactionThresholdMode（同上，会形成第二套自动压缩）；另有 findToolCallPart / replaceToolCallPart / isStalledTurn 本地不存在。外部搜索策略（shouldUseExternalWebSearch）与 backgroundTextGenerationParams 的 6 例理论上可拆出单独回收。 |
++| ui/pages/extensions/workspace/WorkspaceDetailVMTest.kt | 只剩 flattenWorkspaceTree 用例；本地文件页没有可展开的树形视图，等该 UI 移植后再回收。 |
+ 
+-* Treat each file as a feature checklist item for the pending upstream port
+-  （详见项目内部归档记录）.
+-* When a feature is ported, move its test back with `git mv` into
+-  `app/src/test/java/...` and make it compile against the real local API.
+-* Nothing here is compiled or executed. PRs that re-add a file must also make
+-  `:app:compileDebugUnitTestKotlin` pass.
++## 备注
++
++* ImportedDatabaseReconcilerTest 中真正开库的 3 个用例依赖 Robolectric native SQLite，
++  该运行时没有 Linux aarch64 构建，在 arm64 Linux 上会被 `assumeFalse` 跳过；CI（x86_64）照常执行。
+diff --git a/stale-tests/data/ai/tools/WorkspaceToolsTest.kt b/stale-tests/data/ai/tools/WorkspaceToolsTest.kt
+deleted file mode 100644
+index 7a0ab44b5..000000000
+--- a/stale-tests/data/ai/tools/WorkspaceToolsTest.kt
++++ /dev/null
+@@ -1,80 +0,0 @@
+-package me.rerere.rikkahub.data.ai.tools
+-
+-import me.rerere.workspace.WorkspaceTreeEntry
+-import me.rerere.workspace.WorkspaceTreeResult
+-import org.junit.Assert.assertEquals
+-import org.junit.Assert.assertFalse
+-import org.junit.Assert.assertTrue
+-import org.junit.Test
+-
+-/**
+- * Coverage for [40] G1/G2 pure helpers in WorkspaceTools.kt:
+- * - [String.isOutsideWritableRoots]: the writable-root prefix check, including the ".." smuggle fix.
+- * - [formatWorkspaceTree]: the workspace_read_folder model-facing text renderer.
+- */
+-class WorkspaceToolsTest {
+-
+-    @Test
+-    fun `clean path inside a writable root is not outside`() {
+-        assertFalse("/workspace/notes.txt".isOutsideWritableRoots())
+-        assertFalse("/tmp/scratch".isOutsideWritableRoots())
+-        assertFalse("/workspace".isOutsideWritableRoots())
+-    }
+-
+-    @Test
+-    fun `path outside every writable root is outside`() {
+-        assertTrue("/etc/passwd".isOutsideWritableRoots())
+-        assertTrue("/skills/foo".isOutsideWritableRoots())
+-    }
+-
+-    @Test
+-    fun `dotdot smuggle attempt is treated as outside even with a writable prefix`() {
+-        assertTrue("/workspace/../etc/x".isOutsideWritableRoots())
+-        assertTrue("/tmp/../../etc/passwd".isOutsideWritableRoots())
+-    }
+-
+-    @Test
+-    fun `formatWorkspaceTree renders empty directory`() {
+-        val text = formatWorkspaceTree("/workspace", WorkspaceTreeResult(entries = emptyList(), truncated = false))
+-        assertEquals("/workspace/ (empty)", text)
+-    }
+-
+-    @Test
+-    fun `formatWorkspaceTree indents nested entries by depth`() {
+-        val result = WorkspaceTreeResult(
+-            entries = listOf(
+-                WorkspaceTreeEntry(path = "src", name = "src", isDirectory = true, sizeBytes = 0, depth = 1),
+-                WorkspaceTreeEntry(path = "src/a.txt", name = "a.txt", isDirectory = false, sizeBytes = 12, depth = 2),
+-                WorkspaceTreeEntry(path = "b.txt", name = "b.txt", isDirectory = false, sizeBytes = 3, depth = 1),
+-            ),
+-            truncated = false,
+-        )
+-
+-        val text = formatWorkspaceTree("/workspace", result)
+-
+-        assertEquals(
+-            """
+-            /workspace/
+-              src/
+-                a.txt (12 bytes)
+-              b.txt (3 bytes)
+-            """.trimIndent(),
+-            text,
+-        )
+-    }
+-
+-    @Test
+-    fun `formatWorkspaceTree appends a truncation notice when capped`() {
+-        val result = WorkspaceTreeResult(
+-            entries = listOf(
+-                WorkspaceTreeEntry(path = "a.txt", name = "a.txt", isDirectory = false, sizeBytes = 1, depth = 1),
+-            ),
+-            truncated = true,
+-        )
+-
+-        val text = formatWorkspaceTree("/workspace", result)
+-
+-        assertTrue(text.contains("truncated"))
+-        assertTrue(text.endsWith("truncated: showing 1 entries; narrow the path for a complete listing)"))
+-    }
+-}
+diff --git a/stale-tests/data/db/ImportedDatabaseReconcilerTest.kt b/stale-tests/data/db/ImportedDatabaseReconcilerTest.kt
+deleted file mode 100644
+index 862525602..000000000
+--- a/stale-tests/data/db/ImportedDatabaseReconcilerTest.kt
++++ /dev/null
+@@ -1,65 +0,0 @@
+-package me.rerere.rikkahub.data.db
+-
+-import org.junit.Assert.assertEquals
+-import org.junit.Assert.assertTrue
+-import org.junit.Test
+-
+-/**
+- * Unit coverage for the pure SQL-list constants behind [ImportedDatabaseReconciler].
+- *
+- * [ImportedDatabaseReconciler.reconcileDatabaseFile] itself opens a real
+- * `android.database.sqlite.SQLiteDatabase`, which is not available in this repo's plain JVM
+- * unit tests (no Robolectric), so it cannot be exercised here. What *is* pure, plain Kotlin is
+- * [ImportedDatabaseReconciler.BACKFILL_INDEX_DDL] and the [ImportedDatabaseReconciler.EXPECTED_VERSION]
+- * / [ImportedDatabaseReconciler.EXPECTED_IDENTITY_HASH] constants it stamps a reconciled file with.
+- *
+- * Issue #60: restoring an official upstream backup (db stamped at v24) and letting the
+- * reconciler jump it straight to [ImportedDatabaseReconciler.EXPECTED_VERSION] skipped the
+- * fork's 27->28 auto-migration entirely, so `ConversationEntity` ended up with no indices at
+- * all (`Found: indices = {}`) even though Room's compiled schema for v30 expects two. This test
+- * pins the fix: every index that migration would have added is present in the backfill list,
+- * every statement is idempotent, and the stamped version/hash match what app/schemas/.../30.json
+- * actually declares - so a future schema bump that forgets to update the reconciler shows up as
+- * a failing assertion here instead of a silent restore crash.
+- */
+-class ImportedDatabaseReconcilerTest {
+-
+-    @Test
+-    fun `expected version matches the fork's current AppDatabase version`() {
+-        assertEquals(30, ImportedDatabaseReconciler.EXPECTED_VERSION)
+-    }
+-
+-    @Test
+-    fun `expected identity hash matches schema 30`() {
+-        assertEquals("4969a8576be916e3bd22e4a9a48a272d", ImportedDatabaseReconciler.EXPECTED_IDENTITY_HASH)
+-    }
+-
+-    @Test
+-    fun `backfills both ConversationEntity indices Room's 27-28 migration adds`() {
+-        val ddl = ImportedDatabaseReconciler.BACKFILL_INDEX_DDL
+-        assertTrue(ddl.any {
+-            it.contains("index_ConversationEntity_assistant_id_is_pinned_update_at") &&
+-                it.contains("ON `ConversationEntity` (`assistant_id`, `is_pinned`, `update_at`)")
+-        })
+-        assertTrue(ddl.any {
+-            it.contains("index_ConversationEntity_is_pinned_update_at") &&
+-                it.contains("ON `ConversationEntity` (`is_pinned`, `update_at`)")
+-        })
+-    }
+-
+-    @Test
+-    fun `backfills the MemoryEntity and scheduled-job indices from the same migration`() {
+-        val ddl = ImportedDatabaseReconciler.BACKFILL_INDEX_DDL
+-        assertTrue(ddl.any { it.contains("index_MemoryEntity_assistant_id") })
+-        assertTrue(ddl.any { it.contains("index_scheduled_jobs_enabled") })
+-        assertTrue(ddl.any { it.contains("index_scheduled_job_runs_jobId_startedAtMs") })
+-        assertTrue(ddl.any { it.contains("index_scheduled_job_runs_jobId_outcome") })
+-    }
+-
+-    @Test
+-    fun `every backfill statement is idempotent`() {
+-        ImportedDatabaseReconciler.BACKFILL_INDEX_DDL.forEach {
+-            assertTrue("not idempotent: $it", it.startsWith("CREATE INDEX IF NOT EXISTS"))
+-        }
+-    }
+-}
+diff --git a/stale-tests/ui/pages/extensions/workspace/WorkspaceDetailVMTest.kt b/stale-tests/ui/pages/extensions/workspace/WorkspaceDetailVMTest.kt
+index d0b73a350..d3008b53a 100644
+--- a/stale-tests/ui/pages/extensions/workspace/WorkspaceDetailVMTest.kt
++++ b/stale-tests/ui/pages/extensions/workspace/WorkspaceDetailVMTest.kt
+@@ -6,7 +6,8 @@ import org.junit.Test
+ 
+ /**
+  * Coverage for the pure helpers backing the workspace Files tab tree view and folder
+- * export (#40 G3/G4): [flattenWorkspaceTree] and [planWorkspaceFolderExport].
++ * export (#40 G3/G4): [flattenWorkspaceTree]. The [planWorkspaceFolderExport] cases now live in
++ * app/src/test/.../WorkspaceFolderExportPlanTest.kt (the helper is ported; the tree view is not).
+  */
+ class WorkspaceDetailVMTest {
+ 
+@@ -72,29 +73,4 @@ class WorkspaceDetailVMTest {
+ 
+         assertEquals(listOf("src" to 0), rows.map { it.entry.path to it.depth })
+     }
+-
+-    @Test
+-    fun `export plan enumerates parents before children with correct parent paths`() {
+-        val listing = mapOf(
+-            "notes" to listOf(dir("sub", "notes/sub"), file("a.txt", "notes/a.txt")),
+-            "notes/sub" to listOf(file("b.txt", "notes/sub/b.txt")),
+-        )
+-
+-        val plan = planWorkspaceFolderExport("notes", listing)
+-
+-        assertEquals(
+-            listOf(
+-                Triple("notes/sub", "notes", true),
+-                Triple("notes/sub/b.txt", "notes/sub", false),
+-                Triple("notes/a.txt", "notes", false),
+-            ),
+-            plan.map { Triple(it.sourcePath, it.parentPath, it.isDirectory) },
+-        )
+-    }
+-
+-    @Test
+-    fun `export plan for an empty folder is empty`() {
+-        val plan = planWorkspaceFolderExport("empty", mapOf("empty" to emptyList()))
+-        assertEquals(emptyList<Any>(), plan)
+-    }
+ }
+diff --git a/stale-tests/ui/pages/setting/doctor/DoctorReportTest.kt b/stale-tests/ui/pages/setting/doctor/DoctorReportTest.kt
+deleted file mode 100644
+index 45f40cee4..000000000
+--- a/stale-tests/ui/pages/setting/doctor/DoctorReportTest.kt
++++ /dev/null
+@@ -1,99 +0,0 @@
+-package me.rerere.rikkahub.ui.pages.setting.doctor
+-
+-import org.junit.Assert.assertEquals
+-import org.junit.Assert.assertTrue
+-import org.junit.Test
+-
+-/**
+- * Pure-formatter coverage for [DoctorReport.format] - the plain-text report shared by the
+- * Doctor screen's "Copy report" button and the Telegram /doctor command. The `Generated:`
+- * line is wall-clock dependent and intentionally not asserted; everything else (header,
+- * severity summary, category grouping, severity marks, empty-category skipping) is.
+- */
+-class DoctorReportTest {
+-
+-    private fun check(
+-        id: String,
+-        category: DoctorCategory,
+-        severity: Severity,
+-        label: String = "label-$id",
+-        detail: String = "detail-$id",
+-    ) = DoctorCheck(id = id, category = category, label = label, detail = detail, severity = severity)
+-
+-    @Test fun `header line is the supplied header`() {
+-        val out = DoctorReport.format(emptyList(), header = "custom header")
+-        assertTrue(out.startsWith("custom header\n"))
+-    }
+-
+-    @Test fun `default header is used when none supplied`() {
+-        val out = DoctorReport.format(emptyList())
+-        assertTrue(out.startsWith("RikkaHub-agent — diagnostic report\n"))
+-    }
+-
+-    @Test fun `summary counts every severity`() {
+-        val out = DoctorReport.format(
+-            listOf(
+-                check("a", DoctorCategory.Permissions, Severity.FAIL),
+-                check("b", DoctorCategory.Permissions, Severity.WARN),
+-                check("c", DoctorCategory.Permissions, Severity.WARN),
+-                check("d", DoctorCategory.Services, Severity.OK),
+-                check("e", DoctorCategory.Services, Severity.INFO),
+-            ),
+-        )
+-        assertTrue(out.contains("Summary: fail=1  warn=2  ok=1  info=1"))
+-    }
+-
+-    @Test fun `summary shows zero for absent severities`() {
+-        val out = DoctorReport.format(listOf(check("a", DoctorCategory.Database, Severity.OK)))
+-        assertTrue(out.contains("Summary: fail=0  warn=0  ok=1  info=0"))
+-    }
+-
+-    @Test fun `rows are grouped under their category display name`() {
+-        val out = DoctorReport.format(
+-            listOf(
+-                check("a", DoctorCategory.Permissions, Severity.OK),
+-                check("b", DoctorCategory.Database, Severity.FAIL),
+-            ),
+-        )
+-        assertTrue(out.contains("## ${DoctorCategory.Permissions.displayName}"))
+-        assertTrue(out.contains("## ${DoctorCategory.Database.displayName}"))
+-    }
+-
+-    @Test fun `empty categories are skipped`() {
+-        val out = DoctorReport.format(listOf(check("a", DoctorCategory.Network, Severity.OK)))
+-        assertTrue(out.contains("## ${DoctorCategory.Network.displayName}"))
+-        assertTrue(!out.contains("## ${DoctorCategory.Termux.displayName}"))
+-    }
+-
+-    @Test fun `each severity gets its mark`() {
+-        val out = DoctorReport.format(
+-            listOf(
+-                check("a", DoctorCategory.Diagnostics, Severity.OK, label = "ok-row"),
+-                check("b", DoctorCategory.Diagnostics, Severity.INFO, label = "info-row"),
+-                check("c", DoctorCategory.Diagnostics, Severity.WARN, label = "warn-row"),
+-                check("d", DoctorCategory.Diagnostics, Severity.FAIL, label = "fail-row"),
+-            ),
+-        )
+-        assertTrue(out.contains("[ok]    ok-row — detail-a"))
+-        assertTrue(out.contains("[info]  info-row — detail-b"))
+-        assertTrue(out.contains("[warn]  warn-row — detail-c"))
+-        assertTrue(out.contains("[fail]  fail-row — detail-d"))
+-    }
+-
+-    @Test fun `categories appear in enum declaration order`() {
+-        val out = DoctorReport.format(
+-            listOf(
+-                check("a", DoctorCategory.Maintenance, Severity.OK),
+-                check("b", DoctorCategory.Permissions, Severity.OK),
+-            ),
+-        )
+-        val permIdx = out.indexOf("## ${DoctorCategory.Permissions.displayName}")
+-        val maintIdx = out.indexOf("## ${DoctorCategory.Maintenance.displayName}")
+-        assertTrue(permIdx in 0 until maintIdx)
+-    }
+-
+-    @Test fun `output has no trailing whitespace`() {
+-        val out = DoctorReport.format(listOf(check("a", DoctorCategory.Database, Severity.OK)))
+-        assertEquals(out, out.trimEnd())
+-    }
+-}
+diff --git a/stale-tests/workspace/WorkspaceTreeTest.kt b/workspace/src/test/java/me/rerere/workspace/WorkspaceTreeTest.kt
+similarity index 100%
+rename from stale-tests/workspace/WorkspaceTreeTest.kt
+rename to workspace/src/test/java/me/rerere/workspace/WorkspaceTreeTest.kt
