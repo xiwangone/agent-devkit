@@ -1,0 +1,136 @@
+diff --git a/app/src/main/assets/chroot/chroot-run.sh b/app/src/main/assets/chroot/chroot-run.sh
+index cc8a9b84f..eed307310 100755
+--- a/app/src/main/assets/chroot/chroot-run.sh
++++ b/app/src/main/assets/chroot/chroot-run.sh
+@@ -373,7 +373,7 @@ case "$1" in
+         exit $rc
+         ;;
+     *)
+-        echo "usage: chroot-run.sh <rootfs_dir> {shell|exec <cmd...>|prepare|unmount}" >&2
++        echo "usage: chroot-run.sh <rootfs_dir> {shell|exec <cmd...>|prepare|unmount|fixowner}" >&2
+         exit 2
+         ;;
+ esac
+diff --git a/deps/chroot/chroot-run.sh b/deps/chroot/chroot-run.sh
+index cc8a9b84f..eed307310 100755
+--- a/deps/chroot/chroot-run.sh
++++ b/deps/chroot/chroot-run.sh
+@@ -373,7 +373,7 @@ case "$1" in
+         exit $rc
+         ;;
+     *)
+-        echo "usage: chroot-run.sh <rootfs_dir> {shell|exec <cmd...>|prepare|unmount}" >&2
++        echo "usage: chroot-run.sh <rootfs_dir> {shell|exec <cmd...>|prepare|unmount|fixowner}" >&2
+         exit 2
+         ;;
+ esac
+diff --git a/workspace/src/main/java/me/rerere/workspace/ChrootShellRunner.kt b/workspace/src/main/java/me/rerere/workspace/ChrootShellRunner.kt
+index e2cbbc2e3..12e5a0c3c 100644
+--- a/workspace/src/main/java/me/rerere/workspace/ChrootShellRunner.kt
++++ b/workspace/src/main/java/me/rerere/workspace/ChrootShellRunner.kt
+@@ -31,7 +31,7 @@ class ChrootShellRunner(
+         val token = cmdFile.name.removePrefix("$COMMAND_FILE-")
+         try {
+             val process = try {
+-                newSuProcess(context.linuxDir, execCommandFor(cmdFile), context.dnsServers)
++                newSuProcess(context.linuxDir, execCommandFor(cmdFile), context.dnsServers, chrootWorkdirFor(context.cwd))
+             } catch (e: IOException) {
+                 // 无 root 设备：su 不可用时返回结构化失败，不让异常上抛穿调用链；
+                 // 记一条 w，否则「chroot 后端不可用」只出现在返回的 stderr 里，
+@@ -64,7 +64,7 @@ class ChrootShellRunner(
+         // 交互 bash——命令从未执行，且该进程 hasAlive 恒真，5 个就把每工作区名额占满。
+         val cmdFile = writeCommandFile(context)
+         return try {
+-            newSuProcess(context.linuxDir, execCommandFor(cmdFile), context.dnsServers).also { process ->
++            newSuProcess(context.linuxDir, execCommandFor(cmdFile), context.dnsServers, chrootWorkdirFor(context.cwd)).also { process ->
+                 // 只删自己的命令文件：同字符串服务的并发任务共用同一前缀，
+                 // 用通配符清理会互删对方尚未读取的文件。
+                 Thread {
+@@ -193,8 +193,7 @@ class ChrootShellRunner(
+             if (context.cwd.isNotBlank()) {
+                 // 与 ProotShellRunner.prootCwd 对齐：cwd 是「相对工作区根」的路径（如 subdir 或 /subdir），
+                 // 在 chroot 内必须解析到 /workspace/<path>；直接 cd 原始值会跑到 rootfs 根目录下。
+-                val rel = context.cwd.trim().trimStart('/')
+-                val target = if (rel.isEmpty()) "/workspace" else "/workspace/$rel"
++                val target = chrootWorkdirFor(context.cwd)
+                 append("cd -- ").append(shellQuote(target)).append(" 2>/dev/null || cd -- ")
+                     .append(shellQuote(context.cwd)).append(" 2>/dev/null || true\n")
+             }
+@@ -226,6 +225,19 @@ class ChrootShellRunner(
+         return cmdFile
+     }
+ 
++    /**
++     * 调用方 cwd（相对工作区根，如 subdir 或 /subdir）映射到 chroot 内的工作目录。
++     * 空 cwd 落到 ROOTFS_WORKSPACE_DIR；前后斜杠都去掉，避免拼出 `//` 或尾随 `/`。
++     */
++    internal fun chrootWorkdirFor(cwd: String): String {
++        val normalized = cwd.trim().trim('/')
++        return if (normalized.isBlank()) {
++            WorkspaceManager.ROOTFS_WORKSPACE_DIR
++        } else {
++            "${WorkspaceManager.ROOTFS_WORKSPACE_DIR}/$normalized"
++        }
++    }
++
+     /** POSIX 单引号转义（内嵌单引号拆成 `'\''`）。 */
+     private fun shellQuote(raw: String): String = "'" + raw.replace("'", "'\\''") + "'"
+ 
+@@ -233,6 +245,7 @@ class ChrootShellRunner(
+         linuxDir: File,
+         inner: String,
+         dnsServers: List<String> = emptyList(),
++        workdir: String? = null,
+     ): Process {
+         val validDns = ShellDnsConfig.parseServers(dnsServers.joinToString(" "))
+         return ProcessBuilder("su", "-c", suCommand(linuxDir, inner, validDns))
+@@ -242,6 +255,13 @@ class ChrootShellRunner(
+                 } else {
+                     environment().remove("CHROOT_DNS")
+                 }
++                // chroot-run.sh 用 $WORKDIR（默认 /workspace）做入口 cd；命令文件里另有一次 cd 兜底，
++                // 两者同值：入口目录先对，后面即使 cd 行失败也不会跑到 rootfs 根目录。
++                if (!workdir.isNullOrBlank()) {
++                    environment()["CHROOT_WORKDIR"] = workdir
++                } else {
++                    environment().remove("CHROOT_WORKDIR")
++                }
+             }.start()
+     }
+ 
+diff --git a/workspace/src/test/java/me/rerere/workspace/ChrootShellRunnerTest.kt b/workspace/src/test/java/me/rerere/workspace/ChrootShellRunnerTest.kt
+index 121dfe95f..978d5df9e 100644
+--- a/workspace/src/test/java/me/rerere/workspace/ChrootShellRunnerTest.kt
++++ b/workspace/src/test/java/me/rerere/workspace/ChrootShellRunnerTest.kt
+@@ -105,4 +105,31 @@ class ChrootShellRunnerTest {
+         assertTrue(result.supported)
+         assertTrue(!ChrootProbeResult(pass = 5, fail = 1, warn = 0, raw = "").supported)
+     }
++
++    /**
++     * env 值原样进命令文件（POSIX 单引号转义），不做脱敏替换：
++     * 命令文件是 chroot 内执行的脚本，值被改写会让命令拿到错误的值。
++     */
++    @Test
++    fun `writeCommandFile prepends exported env when env is non-empty`() {
++        val runner = newRunner()
++        val linux = tmp.newFolder("linux-env")
++        val ctx = newContext(linux).copy(
++            command = "echo \$API_KEY",
++            cwd = "",
++            env = mapOf("API_KEY" to "sec'ret"),
++        )
++        val file = runner.writeCommandFile(ctx)
++        assertEquals("export API_KEY='sec'\\''ret'\necho \$API_KEY", file.readText())
++        file.delete()
++    }
++
++    @Test
++    fun `chrootWorkdirFor maps cwd to workspace dir`() {
++        val runner = newRunner()
++        assertEquals("/workspace/sub/dir", runner.chrootWorkdirFor("/sub/dir/"))
++        assertEquals("/workspace", runner.chrootWorkdirFor(""))
++        assertEquals("/workspace", runner.chrootWorkdirFor("/"))
++        assertEquals("/workspace/subdir", runner.chrootWorkdirFor("subdir"))
++    }
+ }
