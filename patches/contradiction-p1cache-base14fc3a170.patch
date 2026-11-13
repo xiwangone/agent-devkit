@@ -1,0 +1,439 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/AppDiagnosticsTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/AppDiagnosticsTools.kt
+index 48fc396ad..acd7d9e2b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/AppDiagnosticsTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/AppDiagnosticsTools.kt
+@@ -3,6 +3,8 @@ package me.rerere.rikkahub.data.ai.tools.local
+ import android.content.Context
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withTimeout
++import kotlinx.serialization.encodeToString
++import kotlinx.serialization.json.Json
+ import kotlinx.serialization.json.JsonArray
+ import kotlinx.serialization.json.JsonObject
+ import kotlinx.serialization.json.JsonPrimitive
+@@ -29,6 +31,7 @@ import me.rerere.rikkahub.data.datastore.Settings
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.findChatModelFor
+ import me.rerere.rikkahub.ui.pages.setting.doctor.DoctorChecks
++import java.security.MessageDigest
+ import java.util.concurrent.ConcurrentHashMap
+ 
+ /**
+@@ -42,11 +45,50 @@ import java.util.concurrent.ConcurrentHashMap
+ 
+ // ---------- test_model ----------
+ 
+-private val TEST_MODEL_CACHE = ConcurrentHashMap<String, String>()
++/** 探测结果缓存：5 分钟 TTL；key 含端点配置指纹，改 key/地址/自定义头后旧结论不再命中。 */
++private const val TEST_MODEL_CACHE_TTL_MS = 5 * 60 * 1000L
++private const val TEST_MODEL_CACHE_MAX_ENTRIES = 128
++
++private val TEST_MODEL_CACHE = ConcurrentHashMap<String, CachedTestModelResult>()
++
++/** test_model 的一条缓存记录（internal 以便单测断言过期判定）。 */
++internal data class CachedTestModelResult(
++    val payload: String,
++    val expiresAtMillis: Long,
++) {
++    fun isFresh(nowMillis: Long = System.currentTimeMillis()): Boolean = nowMillis < expiresAtMillis
++}
++
++/**
++ * test_model 的缓存 key：provider id + 模型 id + 端点配置指纹。
++ *
++ * 探测结论取决于 apiKey / baseUrl / 自定义头等输入，但这些字段只在各 provider 子类上、
++ * 基类没有统一访问点；把整份配置序列化后取 SHA-256，既覆盖全部子类与模型自定义头/体，
++ * 也不把明文写进 key（只存指纹）。改配置 → 指纹变 → 旧结论不再命中；
++ * TTL 兜住指纹之外的变化（如服务端状态变化）。
++ */
++internal fun testModelCacheKey(providerSetting: ProviderSetting, model: Model): String {
++    val fingerprint = sha256Hex(Json.encodeToString(providerSetting) + "|" + Json.encodeToString(model))
++    return "${providerSetting.id}|${model.modelId}|$fingerprint"
++}
++
++private fun sha256Hex(input: String): String =
++    MessageDigest.getInstance("SHA-256")
++        .digest(input.toByteArray())
++        .joinToString("") { "%02x".format(it) }
++
++/** 淘汰过期条目；仍超上限则整表清空（诊断缓存，重测可恢复）。 */
++private fun evictStaleTestModelResults() {
++    val now = System.currentTimeMillis()
++    TEST_MODEL_CACHE.forEach { (key, value) ->
++        if (!value.isFresh(now)) TEST_MODEL_CACHE.remove(key)
++    }
++    if (TEST_MODEL_CACHE.size > TEST_MODEL_CACHE_MAX_ENTRIES) TEST_MODEL_CACHE.clear()
++}
+ 
+ /**
+  * 对指定 provider + model 跑探测（非流式 / 流式 / 工具调用）。
+- * 复用「提供商编辑页测试连接」核心逻辑；结果按「端点+模型」缓存，免重复现测。
++ * 复用「提供商编辑页测试连接」核心逻辑；结果按「端点配置+模型」缓存 5 分钟，免重复现测。
+  * 并发约束：单请求 max_tokens 50 + 10s 超时。
+  */
+ fun testModelTool(
+@@ -87,10 +129,13 @@ fun testModelTool(
+         val settings = settingsStore.settingsFlow.first()
+         val (providerSetting, model) = resolveTestModelTarget(settings, providerName, modelId, invocationContext)
+ 
+-        val cacheKey = "${providerSetting.id}|${model.modelId}"
++        val cacheKey = testModelCacheKey(providerSetting, model)
+         if (!force) {
+             TEST_MODEL_CACHE[cacheKey]?.let { cached ->
+-                return@Tool listOf(UIMessagePart.Text(cached))
++                if (cached.isFresh()) {
++                    return@Tool listOf(UIMessagePart.Text(cached.payload))
++                }
++                TEST_MODEL_CACHE.remove(cacheKey)
+             }
+         }
+ 
+@@ -103,7 +148,9 @@ fun testModelTool(
+             put("streaming", probeToJson(results.streaming))
+             put("tool_call", probeToJson(results.toolCall))
+         }.toString()
+-        TEST_MODEL_CACHE[cacheKey] = payload
++        TEST_MODEL_CACHE[cacheKey] =
++            CachedTestModelResult(payload, System.currentTimeMillis() + TEST_MODEL_CACHE_TTL_MS)
++        evictStaleTestModelResults()
+         listOf(UIMessagePart.Text(payload))
+     },
+ )
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformer.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformer.kt
+index 4b312c2f4..ebc512fc9 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformer.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformer.kt
+@@ -22,6 +22,7 @@ import me.rerere.rikkahub.data.datastore.findProvider
+ import org.koin.core.component.KoinComponent
+ import org.koin.core.component.get
+ import java.io.File
++import java.net.URI
+ 
+ private const val TAG = "OcrTransformer"
+ 
+@@ -48,6 +49,46 @@ internal fun selectUncachedImageUrls(
+     .filterNot(isCached)
+     .toList()
+ 
++/**
++ * OCR 缓存 key：图片 URL + 文件 mtime/size + OCR 模型 id。
++ *
++ * 只用裸 URL 时，原地改图、换 OCR 模型都会继续命中旧文本；mtime/size 与模型 id
++ * 进 key 后，这两类变化都会重新识别（口径同 WorkspaceFilesPage 的 Coil key：
++ * path + updatedAt + sizeBytes）。文件读不到（已删/路径非法）时退化为 URL + 模型 id，
++ * 仍比裸 URL 强（换模型必失效）。
++ */
++internal fun buildOcrCacheKey(
++    url: String,
++    ocrModelId: String,
++    lastModified: Long?,
++    length: Long?,
++): String = "$url|${lastModified ?: -1}|${length ?: -1}|$ocrModelId"
++
++/** 读文件 mtime/size 后拼缓存 key。 */
++internal fun resolveOcrCacheKey(url: String, ocrModelId: String): String {
++    val stat = runCatching {
++        val file = File(URI(url))
++        if (file.isFile) file.lastModified() to file.length() else null
++    }.getOrNull()
++    return buildOcrCacheKey(url, ocrModelId, stat?.first, stat?.second)
++}
++
++/** OCR 结果包一层展示标签。 */
++internal fun wrapOcrResult(content: String): String = """
++    <image_file_ocr>
++       $content
++    </image_file_ocr>
++    * The image_file_ocr tag contains a description of an image that the user uploaded to you, not the user's prompt.
++""".trimIndent()
++
++/**
++ * 空白模型输出是否可缓存：否。
++ *
++ * 空白通常是临时失败或模型配置问题；缓存它会让该图永久读不出（同文件内超时路径
++ * 明确不缓存，是同一条规则的另一半）。
++ */
++internal fun shouldCacheOcrResult(rawText: String): Boolean = rawText.isNotBlank()
++
+ object OcrTransformer : InputMessageTransformer, KoinComponent {
+     private val cache by lazy {
+         val context = get<Context>()
+@@ -83,9 +124,12 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
+         }
+         if (!hasImages) return messages
+ 
++        val ocrModelId = get<SettingsStore>().settingsFlow.value.ocrModelId.toString()
+         return withContext(Dispatchers.IO) {
+             try {
+-                val uncachedUrls = selectUncachedImageUrls(messages) { cache.get(it) != null }
++                val uncachedUrls = selectUncachedImageUrls(messages) {
++                    cache.get(resolveOcrCacheKey(it, ocrModelId)) != null
++                }
+                 if (uncachedUrls.isNotEmpty()) {
+                     val uncachedSet = uncachedUrls.toSet()
+                     val triggers = messages.flatMap { message ->
+@@ -120,13 +164,14 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
+     }
+ 
+     suspend fun performOcr(part: UIMessagePart.Image): String = runCatching {
++        val settings = get<SettingsStore>().settingsFlow.value
+         // Check cache first
+-        cache.get(part.url)?.let { cachedResult ->
++        val cacheKey = resolveOcrCacheKey(part.url, settings.ocrModelId.toString())
++        cache.get(cacheKey)?.let { cachedResult ->
+             AppLog.i(TAG, "performOcr: cache hit for ${part.url}")
+             return cachedResult
+         }
+ 
+-        val settings = get<SettingsStore>().settingsFlow.value
+         val model = settings.findModelById(settings.ocrModelId)
+         if (model == null) {
+             AppLog.w(TAG, "performOcr: no OCR model configured (id=${settings.ocrModelId}); image NOT read: ${part.url}")
+@@ -161,18 +206,14 @@ object OcrTransformer : InputMessageTransformer, KoinComponent {
+             // should be allowed to reach the model again.
+             return "[Image: could not be read — the OCR model did not respond in time]"
+         }
+-        val content = result.message.toText().ifBlank { "[ERROR, OCR failed]" }
++        val rawText = result.message.toText()
++        val content = rawText.ifBlank { "[ERROR, OCR failed]" }
+         // OCR text is user content: log the length only, never the text itself.
+         AppLog.i(TAG, "performOcr: ok (${content.length} chars) for ${part.url}")
+-        val ocrResult = """
+-            <image_file_ocr>
+-               $content
+-            </image_file_ocr>
+-            * The image_file_ocr tag contains a description of an image that the user uploaded to you, not the user's prompt.
+-        """.trimIndent()
+-
+-        // Cache the result
+-        cache.put(part.url, ocrResult)
++        val ocrResult = wrapOcrResult(content)
++
++        // 空白输出不缓存：通常是临时失败或模型配置问题，缓存会让该图永久读不出。
++        if (shouldCacheOcrResult(rawText)) cache.put(cacheKey, ocrResult)
+         return ocrResult
+     }.getOrElse {
+         // Let a real cancellation (e.g. the user's /stop) propagate instead of swallowing
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt
+index 4d2dfa10b..3525f101c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt
+@@ -495,7 +495,11 @@ class CredentialVaultRepository(
+         runCatching { VaultProviderKeyRefs.removeOne(entry.name) }
+     }
+ 
+-    suspend fun clearAll() = dao.clearAll()
++    suspend fun clearAll() {
++        dao.clearAll()
++        // 缓存是全量 name→明文：不清掉，已删凭证的 `$$引用` 会继续解析出明文
++        runCatching { VaultProviderKeyRefs.clear() }
++    }
+ 
+     suspend fun count(): Int = dao.count()
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefs.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefs.kt
+index 0d3e1cc42..e28e49758 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefs.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefs.kt
+@@ -174,6 +174,18 @@ object VaultProviderKeyRefs {
+         signalCacheChanged()
+     }
+ 
++    /**
++     * 清空全部引用缓存（清空凭证库后调用）。
++     *
++     * 缓存是全量 name→明文：不清掉，已删凭证的 `$$引用` 会继续解析出明文，
++     * `canResolve` 也继续报 true，直到重启或下次保存/导入。钩子本身不用动，
++     * 指向空缓存后未命中按原样返回，与“引用已失效”的降级行为一致。
++     */
++    fun clear() {
++        cache = emptyMap()
++        signalCacheChanged()
++    }
++
+     /** 当前是否能解析某个引用（`名字` 或 `名字.字段`；只回答存在性，不返回值）。 */
+     fun canResolve(name: String): Boolean = cache.containsKey(name)
+ 
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/TestModelCacheTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/TestModelCacheTest.kt
+new file mode 100644
+index 000000000..421c2bb71
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/TestModelCacheTest.kt
+@@ -0,0 +1,71 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import me.rerere.ai.provider.CustomHeader
++import me.rerere.ai.provider.Model
++import me.rerere.ai.provider.ProviderSetting
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * test_model 缓存 key 与 TTL 的契约：探测结论取决于 apiKey / baseUrl / 自定义头等输入，
++ * key 里缺了它们，改配置、服务挂掉、修好后都会返回同一份旧结论。
++ *
++ * 注意：key 里含序列化后的配置指纹；断言时用同一实例或 copy（id 保持不变），
++ * 新构造的实例自带随机 id，本来就该算另一个 key。
++ */
++class TestModelCacheTest {
++
++    private fun setting(apiKey: String = "sk-a", baseUrl: String = "https://api.openai.com/v1") =
++        ProviderSetting.OpenAI(apiKey = apiKey, baseUrl = baseUrl)
++
++    private fun model(customHeaders: List<CustomHeader> = emptyList()) =
++        Model(modelId = "gpt-5", customHeaders = customHeaders)
++
++    @Test
++    fun `same inputs produce the same key`() {
++        val s = setting()
++        val m = model()
++        assertEquals(testModelCacheKey(s, m), testModelCacheKey(s, m))
++        assertEquals(testModelCacheKey(s, m), testModelCacheKey(s.copy(apiKey = "sk-a"), m.copy()))
++    }
++
++    @Test
++    fun `rotated apiKey changes the key`() {
++        val s = setting()
++        val m = model()
++        assertNotEquals(testModelCacheKey(s, m), testModelCacheKey(s.copy(apiKey = "sk-b"), m))
++    }
++
++    @Test
++    fun `changed baseUrl changes the key`() {
++        val s = setting()
++        val m = model()
++        assertNotEquals(testModelCacheKey(s, m), testModelCacheKey(s.copy(baseUrl = "https://b.example"), m))
++    }
++
++    @Test
++    fun `changed model custom headers change the key`() {
++        val s = setting()
++        val m = model()
++        val withHeader = m.copy(customHeaders = listOf(CustomHeader("X-Test", "1")))
++        assertNotEquals(testModelCacheKey(s, m), testModelCacheKey(s, withHeader))
++    }
++
++    @Test
++    fun `different model id changes the key`() {
++        val s = setting()
++        val m = model()
++        assertNotEquals(testModelCacheKey(s, m), testModelCacheKey(s, m.copy(modelId = "gpt-4")))
++    }
++
++    @Test
++    fun `cached entry is fresh before expiry and stale at expiry`() {
++        val entry = CachedTestModelResult("payload", expiresAtMillis = 1_000L)
++        assertTrue(entry.isFresh(nowMillis = 999L))
++        assertFalse(entry.isFresh(nowMillis = 1_000L))
++        assertFalse(entry.isFresh(nowMillis = 1_001L))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformerTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformerTest.kt
+index 10a996e44..1a1e461dc 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformerTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/transformers/OcrTransformerTest.kt
+@@ -1,9 +1,12 @@
+ package me.rerere.rikkahub.data.ai.transformers
+ 
++import java.io.File
+ import me.rerere.ai.core.MessageRole
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.ui.UIMessagePart
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotEquals
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+@@ -62,4 +65,40 @@ class OcrTransformerTest {
+         val result = selectUncachedImageUrls(emptyList()) { false }
+         assertTrue(result.isEmpty())
+     }
++
++    @Test
++    fun `cache key changes with mtime size and model`() {
++        val base = buildOcrCacheKey("file:///a.png", "model-1", 100L, 200L)
++        assertEquals(base, buildOcrCacheKey("file:///a.png", "model-1", 100L, 200L))
++        assertNotEquals(base, buildOcrCacheKey("file:///a.png", "model-1", 101L, 200L))
++        assertNotEquals(base, buildOcrCacheKey("file:///a.png", "model-1", 100L, 201L))
++        assertNotEquals(base, buildOcrCacheKey("file:///a.png", "model-2", 100L, 200L))
++        assertNotEquals(base, buildOcrCacheKey("file:///b.png", "model-1", 100L, 200L))
++    }
++
++    @Test
++    fun `blank ocr output is not cacheable`() {
++        assertFalse(shouldCacheOcrResult(""))
++        assertFalse(shouldCacheOcrResult("   "))
++        assertTrue(shouldCacheOcrResult("a cat on a mat"))
++    }
++
++    @Test
++    fun `wrapped result carries content and tag`() {
++        val wrapped = wrapOcrResult("a cat")
++        assertTrue(wrapped.contains("a cat"))
++        assertTrue(wrapped.contains("<image_file_ocr>"))
++    }
++
++    @Test
++    fun `resolve key stats a real file and falls back for a missing one`() {
++        val tmp = File.createTempFile("ocr-key-test", ".png").apply {
++            writeText("x")
++            deleteOnExit()
++        }
++        val key = resolveOcrCacheKey("file://${tmp.absolutePath}", "model-1")
++        assertTrue(key.contains("${tmp.lastModified()}|${tmp.length()}|model-1"))
++        val missing = resolveOcrCacheKey("file:///definitely/not/here.png", "model-1")
++        assertTrue(missing.contains("|-1|-1|model-1"))
++    }
+ }
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefsClearTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefsClearTest.kt
+new file mode 100644
+index 000000000..6a1564cec
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/VaultProviderKeyRefsClearTest.kt
+@@ -0,0 +1,42 @@
++package me.rerere.rikkahub.data.vault
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * [VaultProviderKeyRefs.clear] 的契约：清空凭证库后，内存里的 `$$引用` 缓存必须同步失效，
++ * 否则已删凭证的明文会继续被解析出来，直到重启或下次保存/导入。
++ */
++class VaultProviderKeyRefsClearTest {
++
++    @Test
++    fun `clear drops all refs including field keys`() {
++        VaultProviderKeyRefs.replaceCacheForTest(
++            mapOf(
++                "GITHUB_TOKEN" to "sk-secret",
++                "GITHUB_TOKEN.api_key" to "field-value",
++                "OTHER" to "other-value",
++            )
++        )
++        assertTrue(VaultProviderKeyRefs.canResolve("GITHUB_TOKEN"))
++
++        VaultProviderKeyRefs.clear()
++
++        assertFalse(VaultProviderKeyRefs.canResolve("GITHUB_TOKEN"))
++        assertFalse(VaultProviderKeyRefs.canResolve("GITHUB_TOKEN.api_key"))
++        assertFalse(VaultProviderKeyRefs.canResolve("OTHER"))
++        assertEquals("\$\$GITHUB_TOKEN", VaultProviderKeyRefs.resolveValue("\$\$GITHUB_TOKEN"))
++        assertNull(VaultProviderKeyRefs.resolveOrNull("\$\$GITHUB_TOKEN"))
++    }
++
++    @Test
++    fun `clear bumps revision so ref UI re-evaluates`() {
++        VaultProviderKeyRefs.replaceCacheForTest(mapOf("GITHUB_TOKEN" to "sk-secret"))
++        val before = VaultProviderKeyRefs.revision.value
++        VaultProviderKeyRefs.clear()
++        assertEquals(before + 1, VaultProviderKeyRefs.revision.value)
++    }
++}
