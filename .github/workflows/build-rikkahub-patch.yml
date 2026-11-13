@@ -4,12 +4,19 @@ name: build-rikkahub-patch
 # patch 分支里的 patch，跑编译 + 单测。不碰 rikkahub-agents 本仓
 # （只读 clone + runner 本地打 patch），结果用 gh 拉回来看。
 #
-# 用法：
-#   gh workflow run build-rikkahub-patch.yml --repo xiwangone/agent-devkit --ref main \
-#     -f base_sha=<sha> -f patch_ref=<分支> -f patch_path=<分支内路径>
+# 两种触发方式：
+#   1. 手动 dispatch（需要 token 有 Actions:write 权限）：
+#      gh workflow run build-rikkahub-patch.yml --repo xiwangone/agent-devkit --ref main \
+#        -f base_sha=<sha> -f patch_ref=<分支> -f patch_path=<分支内路径>
+#   2. 推 patch 分支（不用 token，推完就跑；各输入取默认值，
+#      patch_ref 取当前分支名）：
+#      git push origin patch/<名字>
 #
-# 注意：runner 是 4 核 16G / 14G 盘的标准免费 runner；Gradle 缓存
-# （modules-2 / build-cache-1）按本仓单独存，首跑是冷的，跑几轮后热起来。
+# 注意：
+# - runner 是 4 核 16G / 14G 盘的标准免费 runner；Gradle 缓存
+#   （modules-2 / build-cache-1）按本仓单独存，首跑是冷的，跑几轮后热起来。
+# - inputs 上下文不能用在 uses: 行（GitHub 启动时直接拒掉整个 run，
+#   0 个 job、没日志），所以 uses: 行一律用 github.event.inputs.X || 默认值。
 
 on:
   workflow_dispatch:
@@ -30,6 +37,9 @@ on:
         description: "要跑的 Gradle 任务"
         required: false
         default: ":app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest"
+  push:
+    branches:
+      - "patch/**"
 
 permissions:
   contents: read
@@ -41,12 +51,16 @@ jobs:
     env:
       GRADLE_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
       _JAVA_OPTIONS: "-Djava.net.preferIPv4Stack=true"
+      BASE_SHA: ${{ github.event.inputs.base_sha || '14fc3a17099d91ff07a00c144731c4a4427af7bb' }}
+      PATCH_REF: ${{ github.event.inputs.patch_ref || github.ref_name }}
+      PATCH_PATH: ${{ github.event.inputs.patch_path || 'patches/stale-tests-14fc3a170.patch' }}
+      GRADLE_TASKS: ${{ github.event.inputs.gradle_tasks || ':app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest' }}
     steps:
       - name: 取 rikkahub-agents（base，工作区根目录）
         uses: actions/checkout@v4
         with:
           repository: xiwangone/rikkahub-agents
-          ref: ${{ inputs.base_sha }}
+          ref: ${{ env.BASE_SHA }}
           fetch-depth: 1
           submodules: true
 
@@ -54,20 +68,24 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: xiwangone/agent-devkit
-          ref: ${{ inputs.patch_ref }}
+          ref: ${{ env.PATCH_REF }}
           path: patch-src
           fetch-depth: 1
 
       - name: 打 patch（先 --check）
         run: |
           set -e
-          git apply --check "patch-src/${{ inputs.patch_path }}"
-          git apply "patch-src/${{ inputs.patch_path }}"
+          git apply --check "patch-src/${PATCH_PATH}"
+          git apply "patch-src/${PATCH_PATH}"
           echo "--- 改动规模 ---"
           git diff --stat | tail -3
 
+      # 注意：steps[*].uses 里任何上下文都不可用（连 github 都不行），
+      # action ref 只能写死字面值。这里 pin 到当前 base 的 SHA；
+      # setup-build-env 只是装 JDK/SDK 的环境动作，变化极少，
+      # 换 base 时如它改了再手动 bump 这个 SHA。
       - name: 准备构建环境（复用本仓 setup-build-env）
-        uses: xiwangone/rikkahub-agents/.github/actions/setup-build-env@${{ inputs.base_sha }}
+        uses: xiwangone/rikkahub-agents/.github/actions/setup-build-env@14fc3a17099d91ff07a00c144731c4a4427af7bb
 
       - name: 缓存 Gradle 发行版
         uses: actions/cache@v4
@@ -99,7 +117,7 @@ jobs:
 
       - name: 编译 + 单测
         run: |
-          ./gradlew ${{ inputs.gradle_tasks }} --no-daemon --no-configuration-cache -x :web:buildWebUi -Pkotlin.compiler.execution.strategy=in-process --max-workers=2 2>&1 | tee gradle-verify.log
+          ./gradlew ${GRADLE_TASKS} --no-daemon --no-configuration-cache -x :web:buildWebUi -Pkotlin.compiler.execution.strategy=in-process --max-workers=2 2>&1 | tee gradle-verify.log
 
       - name: 磁盘用量（跑后）
         if: always()
