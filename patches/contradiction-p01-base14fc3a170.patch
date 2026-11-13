@@ -1,0 +1,133 @@
+diff --git a/ai/src/main/java/me/rerere/ai/ui/Message.kt b/ai/src/main/java/me/rerere/ai/ui/Message.kt
+index 1edaae9f5..3971549a8 100644
+--- a/ai/src/main/java/me/rerere/ai/ui/Message.kt
++++ b/ai/src/main/java/me/rerere/ai/ui/Message.kt
+@@ -350,11 +350,24 @@ fun UIMessage.finishPendingTools(
+  *     助手消息的工具项。
+  *
+  * ⚠ 只用于**构造请求**：调用方不得把结果写回会话，否则等于为「能发出去」而篡改用户历史。
++ *
++ * 理由同样按「执行是否开始过」分叉（见 [abandonUnexecutedTools]）：从未开始的工具写 [reason]
++ * （"未执行"是事实）；开始过但结果没回来的写 [interruptedAttemptReason]（"状态未知、先核实"）。
++ * 默认 [interruptedAttemptReason] = [reason]，不传时行为不变。请求路径的调用方必须传与生成前
++ * 清理同文的中断理由，否则补桩会覆盖重放安全通道的定案、把"可能已执行"说成单纯缺结果，诱导
++ * 模型重跑同一条命令形成重复副作用。
+  */
+ @Suppress("DEPRECATION")
+-fun List<UIMessage>.repairToolPairing(reason: String): List<UIMessage> =
++fun List<UIMessage>.repairToolPairing(
++    reason: String,
++    interruptedAttemptReason: String = reason,
++): List<UIMessage> =
+     migrateToolMessages().map { message ->
+-        if (message.role == MessageRole.ASSISTANT) message.abandonUnexecutedTools(reason) else message
++        if (message.role == MessageRole.ASSISTANT) {
++            message.abandonUnexecutedTools(reason, interruptedAttemptReason)
++        } else {
++            message
++        }
+     }
+ 
+ /**
+diff --git a/ai/src/test/java/me/rerere/ai/ui/ToolPairingRepairTest.kt b/ai/src/test/java/me/rerere/ai/ui/ToolPairingRepairTest.kt
+index 3a0abb075..7394efaf2 100644
+--- a/ai/src/test/java/me/rerere/ai/ui/ToolPairingRepairTest.kt
++++ b/ai/src/test/java/me/rerere/ai/ui/ToolPairingRepairTest.kt
+@@ -72,6 +72,44 @@ class ToolPairingRepairTest {
+         assertTrue("合并后应带上工具结果", tool.output.isNotEmpty())
+     }
+ 
++    @Test
++    fun `开始过的工具在请求副本里写状态未知、从未开始的才写未执行`() {
++        val messages =
++            listOf(
++                UIMessage(role = MessageRole.USER, parts = listOf(UIMessagePart.Text("hi"))),
++                UIMessage(
++                    role = MessageRole.ASSISTANT,
++                    parts = listOf(
++                        UIMessagePart.Tool(
++                            toolCallId = "call-started",
++                            toolName = "shell",
++                            input = "{}",
++                            executionStartedAt = 1_000L,
++                        ),
++                        UIMessagePart.Tool(toolCallId = "call-never", toolName = "shell", input = "{}"),
++                    ),
++                ),
++            )
++
++        val repaired =
++            messages.repairToolPairing(
++                "test reason",
++                "interrupted_unknown_outcome: verify the target state before retrying",
++            )
++
++        val tools = repaired[1].parts.filterIsInstance<UIMessagePart.Tool>()
++        val started = tools.single { it.toolCallId == "call-started" }
++        val never = tools.single { it.toolCallId == "call-never" }
++        val startedText = (started.output.single() as UIMessagePart.Text).text
++        val neverText = (never.output.single() as UIMessagePart.Text).text
++        assertTrue(
++            "开始过的工具必须写状态未知，否则模型会重跑可能已发生的副作用",
++            startedText.contains("interrupted_unknown_outcome"),
++        )
++        assertTrue("从未开始的工具才写未执行", neverText.contains("test reason"))
++        assertFalse("从未开始的工具不能写状态未知", neverText.contains("interrupted_unknown_outcome"))
++    }
++
+     @Test
+     fun `已配对的正常历史不会被改动`() {
+         val messages =
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt
+index fa3402512..ccf6f9d7e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/GenerationLoop.kt
+@@ -189,10 +189,13 @@ internal data class LoopGuardDecision(
+  * —— 副作用**可能已发生**（进程在执行中途被杀）。刻意不断言「未执行」：必须告知「状态未知、
+  * 先核实再重试」，否则模型重跑同一条 shell/git 命令就是重复计费/重复发送/重复覆盖。
+  *
+- * 两处消费，必须同文（历史上正是只有一处用对、另一处用错才出的误报）：
++ * 三处消费，必须同文（历史上正是只有一处用对、另一处用错才出的误报）：
+  *  1. 本文件 generateText 顶部的 replay 安全通道（请求路径）；
+  *  2. ChatService.checkInvalidMessages 的生成前清理（持久化路径，先于 replay 通道执行，
+  *     若不在此分叉，replay 的这一句永远轮不到）。
++ *  3. ToolPairingRepairTransformer 的请求路径配对修复（inputTransformers 首位）：它在
++ *     replay 通道之后跑，会合成 output 并覆盖 approvalState；若不用同文，replay 通道的
++ *     定案会被"单纯缺结果"覆盖，模型看到的就是未分叉的理由。
+  */
+ internal const val INTERRUPTED_UNKNOWN_OUTCOME_REASON =
+     "interrupted_unknown_outcome: a previous attempt to execute this tool started " +
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/ToolPairingRepairTransformer.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/ToolPairingRepairTransformer.kt
+index aa2866ce4..5dc9e2815 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/ToolPairingRepairTransformer.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/transformers/ToolPairingRepairTransformer.kt
+@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.ai.transformers
+ 
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.ui.repairToolPairing
++import me.rerere.rikkahub.data.ai.INTERRUPTED_UNKNOWN_OUTCOME_REASON
+ 
+ /**
+  * 发送前修复「未执行工具」造成的协议破损。
+@@ -14,6 +15,12 @@ import me.rerere.ai.ui.repairToolPairing
+  * [me.rerere.ai.ui.abandonUnexecutedTools]，与生成前清理**同一判据**，避免两套逻辑漂移）。补桩内容里写明原因，
+  * 模型读到后能知道「这里曾有一次没有结果的调用」，不会误以为什么都没发生而重复执行。
+  *
++ * 理由按「执行是否开始过」分叉：从未开始的工具写 [REASON]（"未执行"是事实）；开始过但结果没
++ * 回来的写与重放安全通道、生成前清理同文的 [INTERRUPTED_UNKNOWN_OUTCOME_REASON]（"状态未知、
++ * 先核实"）。三处必须同文：本 transformer 在请求装配时跑在重放通道之后，补桩会合成 output 并
++ * 覆盖 approvalState —— 若此处不分叉，重放通道的定案会被"单纯缺结果"覆盖，模型读到后可能
++ * 重跑副作用已发生的工具（重复发送、重复提交、重复计费）。
++ *
+  * 两点约束：
+  *  1. **只改发送出去的副本**：transformer 的结果仅用于构造请求，不回写会话与落库 —— 消息本体与
+  *     界面展示保持原样，不为「能发出去」而篡改用户历史；
+@@ -23,7 +30,7 @@ object ToolPairingRepairTransformer : InputMessageTransformer {
+     override suspend fun transform(
+         ctx: TransformerContext,
+         messages: List<UIMessage>,
+-    ): List<UIMessage> = messages.repairToolPairing(REASON)
++    ): List<UIMessage> = messages.repairToolPairing(REASON, INTERRUPTED_UNKNOWN_OUTCOME_REASON)
+ 
+     private const val REASON = "tool result missing at request time"
+ }
