@@ -53,7 +53,10 @@ jobs:
       _JAVA_OPTIONS: "-Djava.net.preferIPv4Stack=true"
       BASE_SHA: ${{ github.event.inputs.base_sha || '14fc3a17099d91ff07a00c144731c4a4427af7bb' }}
       PATCH_REF: ${{ github.event.inputs.patch_ref || github.ref_name }}
-      PATCH_PATH: ${{ github.event.inputs.patch_path || 'patches/stale-tests-14fc3a170.patch' }}
+      # 注意：dispatch 时 inputs.patch_path 取不到值会用声明的默认值；
+      # push 触发时 inputs 整个为空，这里故意不写 || 默认值，
+      # 由下面“打 patch”一步按分支名推导（patch/<名> → patches/<名>.patch）。
+      PATCH_PATH: ${{ github.event.inputs.patch_path }}
       GRADLE_TASKS: ${{ github.event.inputs.gradle_tasks || ':app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest' }}
     steps:
       - name: 取 rikkahub-agents（base，工作区根目录）
@@ -75,6 +78,9 @@ jobs:
       - name: 打 patch（先 --check）
         run: |
           set -e
+          # push 触发时 inputs 为空，按分支名推导：patch/<名> → patches/<名>.patch
+          if [ -z "$PATCH_PATH" ]; then PATCH_PATH="patches/${GITHUB_REF_NAME#patch/}.patch"; fi
+          echo "base=$BASE_SHA patch_ref=$PATCH_REF patch_path=$PATCH_PATH"
           git apply --check "patch-src/${PATCH_PATH}"
           git apply "patch-src/${PATCH_PATH}"
           echo "--- 改动规模 ---"
