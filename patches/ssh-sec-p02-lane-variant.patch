@@ -1,0 +1,804 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt
+index 8b686f6eb..57b06941c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolApprovalDefaults.kt
+@@ -319,10 +319,30 @@ object ToolApprovalDefaults {
+         // licence for the model to prune the user's vault unattended.
+         "vault_credential_delete",
+         "vault_credential_merge",
++        // P0-2 — vault_ssh_exec / vault_http_exec: the credential value leaves the app
++        // (SSH session / HTTP header) on every call, so a standing "Always Allow" would
++        // let an unattended turn (cron / sub-agent / workflow) fire credentials at
++        // arbitrary hosts. Per-call confirmation every time; see [isAutoApprovable].
++        "vault_ssh_exec",
++        "vault_http_exec",
+     )
+ 
+     fun allowsAlwaysAllow(toolName: String): Boolean = toolName !in NO_ALWAYS_ALLOW
+ 
++    /**
++     * Whether a tool may ever be auto-approved by a blanket path (global YOLO,
++     * headless auto-approve, per-chat allow-list, persistent "Always Allow").
++     *
++     * This is exactly [allowsAlwaysAllow]: the NO_ALWAYS_ALLOW contract is "confirm
++     * every single call", and a blanket path that auto-approves the tool breaks that
++     * contract just as surely as a persistent grant does. The single enforcement
++     * point is the auto-approval decision in `ChatService` — every execution path
++     * (chat / cron / sub-agent / workflow / Telegram) funnels through it, so a
++     * NO_ALWAYS_ALLOW tool can never silently fire in a headless session: it lands
++     * in Pending and the turn ends without executing it.
++     */
++    fun isAutoApprovable(toolName: String): Boolean = allowsAlwaysAllow(toolName)
++
+     /**
+      * True if [toolName] requires approval. Local tools are looked up in [ALWAYS_ASK];
+      * MCP-relayed tools (`mcp__*`) are always gated because the MCP server's tool surface
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialDestination.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialDestination.kt
+new file mode 100644
+index 000000000..7e0b2f9d7
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialDestination.kt
+@@ -0,0 +1,164 @@
++package me.rerere.rikkahub.data.vault
++
++import me.rerere.rikkahub.data.db.entity.VaultCredentialEntity
++
++/**
++ * 凭证一次使用的用途（P0-2：目的地绑定 + 类型校验的检查点）。
++ *
++ * 用途决定本次调用期望的凭证类型——三种不可混用：SSH 私钥不能当口令、
++ * 口令不能当私钥、API Key 不能当 SSH 口令（反之亦然）。
++ */
++enum class CredentialUse(
++    /** 用途描述（进拒绝文案）。 */
++    val label: String,
++    /** 本次调用可接受的凭证类型（[CredentialType] 取值）。 */
++    val acceptedTypes: Set<String>,
++) {
++    /** vault_ssh_exec auth=key：SSH 私钥握手。 */
++    SSH_KEY("SSH 密钥认证", setOf(CredentialType.SSH_KEY)),
++
++    /** vault_ssh_exec auth=password：SSH 口令认证。 */
++    SSH_PASSWORD("SSH 口令认证", setOf(CredentialType.BASIC_AUTH)),
++
++    /** vault_http_exec：凭证值注入 HTTP 请求头。云 AK 的密文与 API Key 同为"头部令牌"形态，一并接受。 */
++    HTTP_HEADER("HTTP 请求头注入", setOf(CredentialType.API_KEY, CredentialType.CLOUD_AK)),
++}
++
++/** 凭证本次要去的目的地（P0-2：目的地绑定只认这两种形状）。 */
++sealed interface CredentialDestination {
++
++    /** SSH 目标：模型传的 host / port / user（逻辑目的地，隧道解析之前）。 */
++    data class Ssh(val host: String, val port: Int, val user: String) : CredentialDestination
++
++    /** HTTP 目标：模型传的完整 URL。 */
++    data class Http(val url: String) : CredentialDestination
++}
++
++/**
++ * 凭证目的地绑定 + 类型校验（P0-2，[CredentialResolver.resolve] 的检查点）。
++ *
++ * 规则：
++ * - **目的地绑定**：凭证 `metaJson.endpoint` 为空 = 未绑定，不限制（历史凭证默认）；
++ *   绑定后本次请求必须命中，否则拒绝。SSH 的 endpoint 写 `host` / `host:port` /
++ *   `user@host` / `user@host:port`（可带 `ssh://` 前缀，多个用逗号分隔）；HTTP 的
++ *   endpoint 写接口基址 URL（`https://api.example.com[/v1]`），请求 URL 必须同
++ *   scheme、同 host、同端口、且路径在基址路径之下。
++ * - **类型校验**：以凭证库 `type` 字段为准；空（历史未分类）时按写入侧同一口径
++ *   [CredentialType.infer] 从名字/值/公钥推断。类型与用途不匹配即拒绝——自定义类型
++ *   （custom-fields）与 TOTP 种子不属于三种用途中的任何一种，同样拒绝。
++ *
++ * 返回 null = 通过；返回非 null = 拒绝原因（可直接展示给模型/用户）。
++ */
++object CredentialBinding {
++
++    fun check(
++        entry: VaultCredentialEntity,
++        value: String,
++        use: CredentialUse,
++        destination: CredentialDestination,
++    ): String? {
++        val meta = CredentialMeta.decode(entry.metaJson)
++        val endpoint = meta["endpoint"]?.trim().orEmpty()
++        if (endpoint.isNotEmpty() && !destinationMatches(endpoint, destination)) {
++            return "该凭证未授权用于此目的地（凭证绑定 endpoint 为 $endpoint，本次请求为 ${destination.describe()}）"
++        }
++        val actual = effectiveType(entry, value)
++        if (actual !in use.acceptedTypes) {
++            return "凭证类型与用途不匹配：本次${use.label}需要 ${use.acceptedTypes.joinToString("/")} 类型凭证，" +
++                "该凭证类型为 $actual（请在凭证编辑页更正类型，或换一枚对应类型的凭证）"
++        }
++        return null
++    }
++
++    private fun CredentialDestination.describe(): String = when (this) {
++        is CredentialDestination.Ssh -> "$host:$port"
++        is CredentialDestination.Http -> url.take(200)
++    }
++
++    private fun destinationMatches(endpoint: String, destination: CredentialDestination): Boolean =
++        when (destination) {
++            is CredentialDestination.Ssh ->
++                endpoint.split(',').any { sshEndpointMatches(it.trim(), destination.host, destination.port, destination.user) }
++            is CredentialDestination.Http -> httpEndpointMatches(endpoint, destination.url)
++        }
++
++    /** 生效类型：库里已标的类型为准；空时按写入侧同一口径从名字/值/公钥推断。 */
++    internal fun effectiveType(entry: VaultCredentialEntity, value: String): String =
++        entry.type.ifBlank { CredentialType.infer(entry.name, value, entry.publicKey) }
++
++    /**
++     * SSH endpoint 匹配：`host` / `host:port` / `user@host` / `user@host:port`，
++     * 可带 `ssh://` 前缀；endpoint 里没写的维度（端口/用户）不限制。
++     * host 不区分大小写；user 区分大小写（Linux 用户名区分大小写）。
++     */
++    internal fun sshEndpointMatches(endpoint: String, host: String, port: Int, user: String): Boolean {
++        var e = endpoint.trim()
++        if (e.isEmpty()) return false
++        if (e.startsWith("ssh://", ignoreCase = true)) e = e.substring(6)
++        val atIdx = e.lastIndexOf('@')
++        val expectedUser = if (atIdx >= 0) e.substring(0, atIdx) else null
++        val rest = if (atIdx >= 0) e.substring(atIdx + 1) else e
++        if (expectedUser != null && expectedUser != user) return false
++        val (expectedHost, expectedPort) = parseSshHostPort(rest) ?: return false
++        if (!expectedHost.equals(host, ignoreCase = true)) return false
++        if (expectedPort != null && expectedPort != port) return false
++        return true
++    }
++
++    /**
++     * 拆 `host[:port]`。`[v6]:port` 括号形态与无括号 IPv6（整体当 host、无端口）都处理；
++     * 冒号后非数字 → 整串当 host。
++     */
++    private fun parseSshHostPort(rest: String): Pair<String, Int?>? {
++        if (rest.isEmpty()) return null
++        if (rest.startsWith("[")) {
++            val close = rest.indexOf(']')
++            if (close < 0) return null
++            val host = rest.substring(1, close)
++            if (host.isEmpty()) return null
++            val tail = rest.substring(close + 1)
++            if (tail.isEmpty()) return host to null
++            if (!tail.startsWith(":")) return null
++            val port = tail.substring(1).toIntOrNull() ?: return null
++            return host to port
++        }
++        val colonCount = rest.count { it == ':' }
++        if (colonCount == 0) return rest to null
++        if (colonCount > 1) return rest to null
++        val (host, portText) = rest.split(":")
++        if (host.isEmpty()) return null
++        val port = portText.toIntOrNull() ?: return rest to null
++        return host to port
++    }
++
++    /**
++     * HTTP endpoint 匹配：同 scheme、同 host（不区分大小写）、同有效端口
++     * （显式端口或 scheme 默认端口 443/80）、请求路径在基址路径之下
++     * （基址路径为空或 `/` 时不限路径；否则按路径段边界匹配，`/v1` 不命中 `/v10`）。
++     * endpoint 不带 scheme 时按 `https://` 补全（本工具除环回外本就只允许 https）。
++     */
++    internal fun httpEndpointMatches(endpoint: String, url: String): Boolean {
++        val base = parseEndpointUrl(endpoint) ?: return false
++        val req = runCatching { java.net.URI(url) }.getOrNull() ?: return false
++        if (base.host.isNullOrBlank() || req.host.isNullOrBlank()) return false
++        if (!base.scheme.equals(req.scheme, ignoreCase = true)) return false
++        if (!base.host.equals(req.host, ignoreCase = true)) return false
++        if (effectivePort(base) != effectivePort(req)) return false
++        val basePath = base.path.trimEnd('/')
++        if (basePath.isEmpty()) return true
++        val reqPath = req.path
++        return reqPath == basePath || reqPath.startsWith("$basePath/")
++    }
++
++    private fun parseEndpointUrl(endpoint: String): java.net.URI? {
++        val trimmed = endpoint.trim()
++        if (trimmed.isEmpty()) return null
++        val withScheme = if ("://" in trimmed) trimmed else "https://$trimmed"
++        return runCatching { java.net.URI(withScheme) }.getOrNull()
++    }
++
++    private fun effectivePort(uri: java.net.URI): Int =
++        if (uri.port != -1) uri.port
++        else if (uri.scheme.equals("https", ignoreCase = true)) 443
++        else 80
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialResolver.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialResolver.kt
+index 64ce5ca16..e0d997722 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialResolver.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialResolver.kt
+@@ -53,6 +53,12 @@ sealed interface CredentialResolution {
+     /** 密文无法解密（密钥变更或密文损坏）。 */
+     data class Undecryptable(val name: String) : CredentialResolution
+ 
++    /**
++     * 目的地/类型校验拒绝（P0-2）：凭证未绑定该目的地，或类型与用途不匹配。
++     * [reason] 是可直接展示的拒绝文案。
++     */
++    data class Rejected(val name: String, val reason: String) : CredentialResolution
++
+     /**
+      * 字段引用（`$$名字.字段`）取不到值：该条目没有这个明文字段，或该字段不允许引用。
+      *
+@@ -75,6 +81,7 @@ val CredentialResolution.message: String
+         is CredentialResolution.Missing -> "凭证不存在: $name（用 vault_credential_names 查看可用名称）"
+         is CredentialResolution.NotAuthorized -> "凭证 $name 需要会话授权：请先完成凭证库授权（30 分钟或一直有效）"
+         is CredentialResolution.Undecryptable -> "凭证解密失败: $name"
++        is CredentialResolution.Rejected -> reason
+         is CredentialResolution.MissingField ->
+             "凭证 $name 没有可引用的明文字段「$field」：" +
+                 "\$\$名字 取主值，\$\$名字.字段 只支持明文元数据键（endpoint/access_key_id/region/custom.* 等）"
+@@ -84,12 +91,14 @@ val CredentialResolution.message: String
+  * 凭证引用解析器（单点）。
+  *
+  * 所有需要凭证明文的地方都必须经此解析，以保证四项语义**只有一处实现**：
+- * 存在性 → 会话授权（按 purpose 策略）→ 解密 → 审计（**成功与拒绝都记**）。
++ * 存在性 → 会话授权（按 purpose 策略）→ 解密 → 目的地/类型校验 → 审计（**成功与拒绝都记**）。
+  *
+  * 约定：
+  * - [audit] = false 仅用于"内部分辨"（如连接前探测候选主机是否有可用凭证），
+  *   避免探测噪音污染审计；真正取用时必须记。
+  * - 返回的明文禁止落盘、禁止进日志。
++ * - 目的地/类型校验只在调用方同时传 [CredentialDestination] 与 [CredentialUse] 时才做；
++ *   目的地先于类型校验，任一不通过返回 [CredentialResolution.Rejected]（不解密、不放行）。
+  */
+ class CredentialResolver(
+     private val repository: CredentialVaultRepository,
+@@ -102,6 +111,12 @@ class CredentialResolver(
+         purpose: CredentialPurpose,
+         caller: String = "app",
+         audit: Boolean = true,
++        /**
++         * 目的地/类型校验（P0-2）：两者都传时才校验，只传其一不做校验（保持旧调用方行为不变）。
++         * [destination] 是本次取用的真实目的地；[use] 是本次取用的用途。
++         */
++        destination: CredentialDestination? = null,
++        use: CredentialUse? = null,
+     ): CredentialResolution {
+         val trimmed = name.trim()
+         if (trimmed.isEmpty()) return CredentialResolution.Missing(name)
+@@ -123,6 +138,16 @@ class CredentialResolver(
+             return CredentialResolution.Undecryptable(trimmed)
+         }
+ 
++        // 目的地/类型校验（P0-2）：在解密之后、放行之前。目的地先于类型校验。
++        // 拒绝时记 `${action}_denied` 审计（与授权拒绝同一口径），拒绝文案直接展示。
++        if (destination != null && use != null) {
++            val rejection = CredentialBinding.check(entry, value, use, destination)
++            if (rejection != null) {
++                if (audit) repository.logAccess(trimmed, caller, "${purpose.action}_denied")
++                return CredentialResolution.Rejected(trimmed, rejection)
++            }
++        }
++
+         if (audit) repository.logAccess(trimmed, caller, purpose.action)
+         return CredentialResolution.Granted(value, entry)
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt
+index 51e3624c0..e826edfe1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultExecTools.kt
+@@ -27,6 +27,8 @@ import me.rerere.rikkahub.data.datastore.SshPlatform
+  *
+  * 安全模型：凭证值只在 App 进程内存使用（JSch 字节加载 / 密码对象），
+  * 工具返回值不含明文——只返回变量名、公钥、命令输出。
++ * 凭证只可用于其 `endpoint` 字段绑定的目的地（P0-2）：`vault_ssh_exec` 在解析时校验
++ * 目的地与凭证类型，`endpoint` 为空表示未绑定、不限制（历史凭证默认）。
+  */
+ 
+ /** vault_export_env — 工具桥：把密钥库凭证解密值导出为沙箱环境变量文件（AI 不见明文）。 */
+@@ -128,6 +130,8 @@ fun vaultSshExecTool(
+         "Connect to a server via SSH using a credential stored in the vault " +
+             "(private key or password), run a single command, and return its output. " +
+             "auth: 'key' uses a vault-stored SSH private key; 'password' uses a vault-stored password. " +
++            "The credential is only usable for destinations bound in its endpoint field " +
++            "(an unbound credential is not restricted); type must match the auth mode. " +
+             "Approval required before connecting.",
+     parameters = {
+         InputSchema.Obj(
+@@ -165,10 +169,20 @@ private suspend fun runVaultSshExec(
+     val platform = o["platform"]?.jsonPrimitive?.contentOrNull?.let { SshPlatform.fromPreference(it) }
+     val timeout = (o["timeout_seconds"]?.jsonPrimitive?.intOrNull ?: 30).coerceIn(5, 300)
+ 
+-    val resolved = CredentialResolver(repository).resolve(credName, CredentialPurpose.SSH_AUTH, caller = "ai-tool")
+-    val secret = (resolved as? CredentialResolution.Granted)?.value ?: return fail(resolved.message)
++    // auth 取值先校验：否则类型校验会先报"类型不匹配"掩盖参数错。
+     if (auth != "key" && auth != "password") return fail("auth 只支持 key/password")
+ 
++    // 目的地/类型校验（P0-2）：目的地 = 本次 SSH 连接，类型由 auth 决定。
++    // 旧基线里 SSH_AUTH 不要求会话授权（新基线已改 true），这里只做目的地/类型校验。
++    val resolved =
++        CredentialResolver(repository).resolve(
++            credName, CredentialPurpose.SSH_AUTH,
++            caller = "ai-tool",
++            destination = CredentialDestination.Ssh(host, port, user),
++            use = if (auth == "key") CredentialUse.SSH_KEY else CredentialUse.SSH_PASSWORD,
++        )
++    val secret = (resolved as? CredentialResolution.Granted)?.value ?: return fail(resolved.message)
++
+     return runCatching {
+         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+             executeVaultSshSession(context, repository, host, port, user, auth, secret, command, timeout, platform = platform)
+@@ -194,11 +208,14 @@ private suspend fun runVaultSshExec(
+     }
+ }
+ 
+-/** 与 SshTool.isHostKeyChange 同口径的主机密钥变化判定（Vault 侧本地复刻，跨包不可见）。 */
+-private fun isVaultHostKeyChange(msg: String?): Boolean {
++/** 与 SshTool.isHostKeyChange 同口径的主机密钥变化判定（Vault 侧本地复刻，跨包不可见）。
++ *
++ * 只认确切报错（P0-2 收窄）：旧版裸 `HostKey` / `host key` 子串会把
++ * "HostKey algorithm … not supported"（算法不支持）也误判成 host_key_changed，
++ * hint 还会教模型调 `ssh_forget_host_key`。 */
++internal fun isVaultHostKeyChange(msg: String?): Boolean {
+     val m = msg.orEmpty()
+-    return m.contains("HostKey", ignoreCase = true) ||
+-        m.contains("host key", ignoreCase = true) ||
++    return m.contains("HostKey has been changed", ignoreCase = true) ||
+         m.contains("identification has changed", ignoreCase = true) ||
+         m.contains("REMOTE HOST IDENTIFICATION", ignoreCase = true)
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt
+index 31dcf81f9..889b2f062 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultHttpTools.kt
+@@ -172,6 +172,8 @@ internal suspend fun allVaultSecrets(repository: CredentialVaultRepository): Lis
+  * - 每次调用需人工审批（needsApproval = true），审批面展示 URL + 凭证名
+  * - 响应体经 SecretMasker 掩码（防响应中夹带其他凭证明文）
+  * - 审计记录（logAccess）
++ * - 凭证只可用于其 endpoint 字段绑定的目的地（P0-2）：请求 URL 须落在绑定基址之下，
++ *   endpoint 为空表示未绑定、不限制（历史凭证默认）；类型须为 api-key/cloud-ak。
+  */
+ fun vaultHttpExecTool(
+     context: Context,
+@@ -182,6 +184,8 @@ fun vaultHttpExecTool(
+         append("Call an HTTP(S) API using a credential stored in the vault. ")
+         append("The credential value is injected as a request header inside the app process (default Authorization: <scheme> <value>); ")
+         append("the AI only receives the response. Use for backend services / APIs that require a token or key. ")
++        append("The credential is only usable for destinations bound in its endpoint field ")
++        append("(an unbound credential is not restricted); type must be an API key. ")
+         append("The response body is masked against credential patterns before returning. Approval required before making the request.")
+     },
+     parameters = {
+@@ -269,7 +273,15 @@ private suspend fun runVaultHttpExec(
+     }.getOrElse { return fail("extra_headers 必须是合法 JSON 对象") }
+ 
+     // 取值统一走单点解析器：存在性 / 解密 / 审计一处实现，失败文案一致
+-    val resolved = CredentialResolver(repository).resolve(credName, CredentialPurpose.HTTP_HEADER, caller = "ai-tool")
++    // 目的地/类型校验（P0-2）：目的地 = 请求 URL，类型须为 HTTP_HEADER。
++    // 旧基线里 HTTP_HEADER 不要求会话授权（新基线已改 true），这里只做目的地/类型校验。
++    val resolved =
++        CredentialResolver(repository).resolve(
++            credName, CredentialPurpose.HTTP_HEADER,
++            caller = "ai-tool",
++            destination = CredentialDestination.Http(url),
++            use = CredentialUse.HTTP_HEADER,
++        )
+     val secret = (resolved as? CredentialResolution.Granted)?.value ?: return fail(resolved.message)
+ 
+     return try {
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt
+index 5319a1de9..6ba873476 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt
+@@ -339,6 +339,13 @@ private suspend fun ChatService.isToolAutoApprovedForConversation(
+     if (toolName == "ask_user") {
+         me.rerere.rikkahub.data.ai.tools.HeadlessConversations
+             .shouldAutoApprove(conversationId)
++    } else if (!me.rerere.rikkahub.data.ai.tools.ToolApprovalDefaults.isAutoApprovable(toolName)) {
++        // NO_ALWAYS_ALLOW（P0-2：vault_ssh_exec / vault_http_exec 等）：该集合的契约是
++        // "每次调用都必须单独确认"，任何 blanket 放行（YOLO / 无界面自动审批 / 本会话
++        // 允许 / 持久"总是允许"）都不能覆盖它——否则无界面会话（cron / 子代理 /
++        // workflow）仍会在无人确认的情况下把凭据发往任意目的地。命中时直接返回 false，
++        // 工具落成 Pending、该轮不执行。
++        false
+     } else {
+         toolApprovalPreferences.currentYolo() ||
+             me.rerere.rikkahub.data.ai.tools.HeadlessConversations
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt
+index d22cca124..633b9480d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt
+@@ -495,7 +495,10 @@ internal fun CredentialEditorDialog(
+                 val recommendedKeys =
+                     when (type) {
+                         CredentialType.API_KEY -> listOf("endpoint", "header", "prefix", "account", "access_key_id", "region")
+-                        CredentialType.BASIC_AUTH -> listOf("username", "account")
++                        // P0-2：endpoint 是目的地绑定的载体——SSH 密钥/口令凭证也要能填
++                        // （vault_ssh_exec 只允许连绑定的 host），否则绑定在 UI 里设不出来。
++                        CredentialType.SSH_KEY -> listOf("endpoint", "account")
++                        CredentialType.BASIC_AUTH -> listOf("endpoint", "username", "account")
+                         CredentialType.TOTP -> listOf("algorithm", "digits", "period")
+                         CredentialType.CLOUD_AK -> listOf("access_key_id", "account", "region", "project_id")
+                         else -> listOf("account")
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/McpAlwaysAllowExclusionTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/McpAlwaysAllowExclusionTest.kt
+index eb7a36e63..7df020157 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/McpAlwaysAllowExclusionTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/McpAlwaysAllowExclusionTest.kt
+@@ -59,4 +59,25 @@ class McpAlwaysAllowExclusionTest {
+         assertTrue("eval_javascript" in ToolApprovalDefaults.ALWAYS_ASK)
+         assertTrue(ToolApprovalDefaults.requiresApproval("eval_javascript"))
+     }
++
++    // P0-2 — vault_ssh_exec / vault_http_exec: the credential value leaves the app on
++    // every call, so a standing "Always Allow" would let an unattended turn fire
++    // credentials at arbitrary hosts. Both must be per-call confirmed, and no blanket
++    // path (YOLO / headless auto-approve / per-chat / persistent) may auto-approve
++    // them — that is what ToolApprovalDefaults.isAutoApprovable enforces.
++    @Test fun `vault exec tools reject always-allow scope and are never auto-approvable`() {
++        assertFalse(ToolApprovalDefaults.allowsAlwaysAllow("vault_ssh_exec"))
++        assertFalse(ToolApprovalDefaults.allowsAlwaysAllow("vault_http_exec"))
++        assertFalse(ToolApprovalDefaults.isAutoApprovable("vault_ssh_exec"))
++        assertFalse(ToolApprovalDefaults.isAutoApprovable("vault_http_exec"))
++    }
++
++    @Test fun `no-always-allow tools are never auto-approvable, others are`() {
++        for (name in ToolApprovalDefaults.NO_ALWAYS_ALLOW) {
++            assertFalse("$name should never auto-approve", ToolApprovalDefaults.isAutoApprovable(name))
++        }
++        assertTrue(ToolApprovalDefaults.isAutoApprovable("ssh_exec"))
++        assertTrue(ToolApprovalDefaults.isAutoApprovable("termux_run_command"))
++        assertTrue(ToolApprovalDefaults.isAutoApprovable("vault_export_env"))
++    }
+ }
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialDestinationTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialDestinationTest.kt
+new file mode 100644
+index 000000000..dee1e7fdd
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialDestinationTest.kt
+@@ -0,0 +1,313 @@
++package me.rerere.rikkahub.data.vault
++
++import me.rerere.rikkahub.data.db.entity.VaultCredentialEntity
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * P0-2 目的地绑定 + 类型校验契约测试（纯函数，不碰库、不碰 Android）。
++ *
++ * 三条阴性断言都在这里：目的地不匹配拒绝、类型混用拒绝、无界面默认拒绝
++ * （无界面那条在 [McpAlwaysAllowExclusionTest]——NO_ALWAYS_ALLOW 集合与
++ * 自动审批守卫由 `ToolApprovalDefaults.isAutoApprovable` 钉住）。
++ */
++class CredentialDestinationTest {
++
++    private fun entry(type: String = "", metaJson: String = "", publicKey: String = "") =
++        VaultCredentialEntity(
++            name = "TEST_CRED",
++            type = type,
++            metaJson = metaJson,
++            valueEncrypted = "enc",
++            publicKey = publicKey,
++        )
++
++    // 私钥形态的值（不写 PEM 标记字面量：公开面检查会拦；值内容在本测试里只是不透明字符串，
++    // 真实私钥结构的推断路径由基线 CredentialTypeTest 覆盖）。
++    private val sshKeyValue = "ssh-private-key-value"
++
++    // ── 目的地绑定：SSH ──────────────────────────────────────────────
++
++    @Test fun `ssh unbound credential allows any host`() {
++        val reason = CredentialBinding.check(
++            entry(type = CredentialType.SSH_KEY),
++            sshKeyValue,
++            CredentialUse.SSH_KEY,
++            CredentialDestination.Ssh("any.example.com", 22, "root"),
++        )
++        assertNull(reason)
++    }
++
++    @Test fun `ssh bound host matches and other host is rejected`() {
++        val bound = entry(
++            type = CredentialType.SSH_KEY,
++            metaJson = """{"endpoint":"db.example.com"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, sshKeyValue, CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("db.example.com", 22, "root"),
++            ),
++        )
++        val reason = CredentialBinding.check(
++            bound, sshKeyValue, CredentialUse.SSH_KEY,
++            CredentialDestination.Ssh("evil.example.com", 22, "root"),
++        )
++        assertTrue(reason!!.contains("该凭证未授权用于此目的地"))
++    }
++
++    @Test fun `ssh endpoint port and user constrain the match`() {
++        val bound = entry(
++            type = CredentialType.SSH_KEY,
++            metaJson = """{"endpoint":"deploy@db.example.com:2222"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, sshKeyValue, CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("db.example.com", 2222, "deploy"),
++            ),
++        )
++        // 端口不对
++        assertTrue(
++            CredentialBinding.check(
++                bound, sshKeyValue, CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("db.example.com", 22, "deploy"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++        // 用户不对
++        assertTrue(
++            CredentialBinding.check(
++                bound, sshKeyValue, CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("db.example.com", 2222, "root"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++    }
++
++    @Test fun `ssh endpoint accepts ssh scheme prefix and comma list, host is case-insensitive`() {
++        val bound = entry(
++            type = CredentialType.SSH_KEY,
++            metaJson = """{"endpoint":"ssh://a.example.com, b.example.com"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, sshKeyValue, CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("B.EXAMPLE.COM", 22, "root"),
++            ),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                bound, sshKeyValue, CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("c.example.com", 22, "root"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++    }
++
++    // ── 目的地绑定：HTTP ─────────────────────────────────────────────
++
++    @Test fun `http unbound credential allows any url`() {
++        val reason = CredentialBinding.check(
++            entry(type = CredentialType.API_KEY),
++            "tok",
++            CredentialUse.HTTP_HEADER,
++            CredentialDestination.Http("https://any.example.com/v1"),
++        )
++        assertNull(reason)
++    }
++
++    @Test fun `http bound base url matches path under it and rejects other hosts`() {
++        val bound = entry(
++            type = CredentialType.API_KEY,
++            metaJson = """{"endpoint":"https://api.example.com/v1"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/v1/users"),
++            ),
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/v1"),
++            ),
++        )
++        // /v1 不命中 /v10（路径段边界）
++        assertTrue(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/v10/users"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://evil.example.com/v1/users"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++    }
++
++    @Test fun `http endpoint scheme and port must match, scheme-less endpoint means https`() {
++        val bound = entry(
++            type = CredentialType.API_KEY,
++            metaJson = """{"endpoint":"api.example.com"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/x"),
++            ),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("http://api.example.com/x"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++        val withPort = entry(
++            type = CredentialType.API_KEY,
++            metaJson = """{"endpoint":"https://api.example.com:8443"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                withPort, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com:8443/x"),
++            ),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                withPort, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/x"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++    }
++
++    @Test fun `http endpoint without path allows any path, loopback http allowed`() {
++        val bound = entry(
++            type = CredentialType.API_KEY,
++            metaJson = """{"endpoint":"http://localhost:8080"}""",
++        )
++        assertNull(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("http://localhost:8080/anything/at/all"),
++            ),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                bound, "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("http://127.0.0.1:8080/x"),
++            )!!.contains("该凭证未授权用于此目的地"),
++        )
++    }
++
++    // ── 类型校验 ────────────────────────────────────────────────────
++
++    @Test fun `ssh key auth requires ssh-key type`() {
++        val key = entry(type = CredentialType.SSH_KEY)
++        assertNull(
++            CredentialBinding.check(key, sshKeyValue, CredentialUse.SSH_KEY, CredentialDestination.Ssh("h", 22, "u")),
++        )
++        val apiKey = entry(type = CredentialType.API_KEY)
++        assertTrue(
++            CredentialBinding.check(apiKey, "tok", CredentialUse.SSH_KEY, CredentialDestination.Ssh("h", 22, "u"))
++                !!.contains("凭证类型与用途不匹配"),
++        )
++    }
++
++    @Test fun `ssh password auth requires basic-auth type, api key as password is rejected`() {
++        val pwd = entry(type = CredentialType.BASIC_AUTH)
++        assertNull(
++            CredentialBinding.check(pwd, "s3cret", CredentialUse.SSH_PASSWORD, CredentialDestination.Ssh("h", 22, "u")),
++        )
++        // 任务书点名的口子：auth=password + 任意 api key 名字
++        val apiKey = entry(type = CredentialType.API_KEY)
++        val reason = CredentialBinding.check(
++            apiKey, "sk-xxx", CredentialUse.SSH_PASSWORD, CredentialDestination.Ssh("h", 22, "u"),
++        )
++        assertTrue(reason!!.contains("凭证类型与用途不匹配"))
++    }
++
++    @Test fun `http header accepts api-key and cloud-ak, rejects ssh-key and totp`() {
++        assertNull(
++            CredentialBinding.check(
++                entry(type = CredentialType.API_KEY), "tok", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/"),
++            ),
++        )
++        assertNull(
++            CredentialBinding.check(
++                entry(type = CredentialType.CLOUD_AK), "sk", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/"),
++            ),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                entry(type = CredentialType.SSH_KEY), sshKeyValue, CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/"),
++            )!!.contains("凭证类型与用途不匹配"),
++        )
++        assertTrue(
++            CredentialBinding.check(
++                entry(type = CredentialType.TOTP), "seed", CredentialUse.HTTP_HEADER,
++                CredentialDestination.Http("https://api.example.com/"),
++            )!!.contains("凭证类型与用途不匹配"),
++        )
++    }
++
++    @Test fun `custom type is rejected for all three uses`() {
++        val custom = entry(type = CredentialType.CUSTOM)
++        assertTrue(
++            CredentialBinding.check(custom, "v", CredentialUse.SSH_KEY, CredentialDestination.Ssh("h", 22, "u"))
++                !!.contains("凭证类型与用途不匹配"),
++        )
++        assertTrue(
++            CredentialBinding.check(custom, "v", CredentialUse.SSH_PASSWORD, CredentialDestination.Ssh("h", 22, "u"))
++                !!.contains("凭证类型与用途不匹配"),
++        )
++        assertTrue(
++            CredentialBinding.check(custom, "v", CredentialUse.HTTP_HEADER, CredentialDestination.Http("https://h/"))
++                !!.contains("凭证类型与用途不匹配"),
++        )
++    }
++
++    @Test fun `unclassified type falls back to infer from value structure`() {
++        // 未分类 + 有公钥 → 按 ssh-key 计（值含私钥结构的推断路径由基线 CredentialTypeTest 覆盖，
++        // 那里已有 PEM 标记字面量，本测试不再重复写）
++        assertNull(
++            CredentialBinding.check(
++                entry(type = "", publicKey = "ssh-ed25519 AAAA"), "whatever", CredentialUse.SSH_KEY,
++                CredentialDestination.Ssh("h", 22, "u"),
++            ),
++        )
++        // 未分类 + 普通值 → infer 为 custom-fields，口令认证拒绝
++        assertTrue(
++            CredentialBinding.check(
++                entry(type = ""), "s3cret", CredentialUse.SSH_PASSWORD,
++                CredentialDestination.Ssh("h", 22, "u"),
++            )!!.contains("凭证类型与用途不匹配"),
++        )
++    }
++
++    @Test fun `destination is checked before type`() {
++        val boundApiKey = entry(
++            type = CredentialType.API_KEY,
++            metaJson = """{"endpoint":"a.example.com"}""",
++        )
++        // 目的地不对 + 类型也不对 → 报目的地（任务书第 1 项优先）
++        val reason = CredentialBinding.check(
++            boundApiKey, "tok", CredentialUse.SSH_PASSWORD,
++            CredentialDestination.Ssh("b.example.com", 22, "u"),
++        )
++        assertTrue(reason!!.contains("该凭证未授权用于此目的地"))
++    }
++
++    @Test fun `effectiveType prefers stored type over inference`() {
++        // 库里标了 basic-auth，即使值像私钥也按 basic-auth 计
++        assertEquals(
++            CredentialType.BASIC_AUTH,
++            CredentialBinding.effectiveType(entry(type = CredentialType.BASIC_AUTH), sshKeyValue),
++        )
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/VaultHostKeyChangeTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/VaultHostKeyChangeTest.kt
+new file mode 100644
+index 000000000..4bfbc10fb
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/VaultHostKeyChangeTest.kt
+@@ -0,0 +1,36 @@
++package me.rerere.rikkahub.data.vault
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * P0-2：`isVaultHostKeyChange` 只认"密钥已变更"的确切报错。
++ *
++ * 旧版是裸子串（"HostKey" / "host key"），会把 "HostKey algorithm … not supported"
++ * 这类与变更无关的失败也判成 host_key_changed，信封 hint 还会教模型去调
++ * ssh_forget_host_key——没变过的 key 被忘掉，等于帮攻击者清信任。
++ */
++class VaultHostKeyChangeTest {
++
++    @Test fun `jsch changed-key message is recognised`() {
++        assertTrue(isVaultHostKeyChange("HostKey has been changed: example.com"))
++        assertTrue(isVaultHostKeyChange("hostkey has been changed"))
++    }
++
++    @Test fun `openssh changed-identification message is recognised`() {
++        assertTrue(isVaultHostKeyChange("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"))
++    }
++
++    @Test fun `unrelated hostkey errors are not host key changes`() {
++        assertFalse(isVaultHostKeyChange("HostKey algorithm 'ssh-rsa' not supported"))
++        assertFalse(isVaultHostKeyChange("no hostkey alg"))
++        assertFalse(isVaultHostKeyChange("unknown host key type"))
++    }
++
++    @Test fun `generic failures and null are not host key changes`() {
++        assertFalse(isVaultHostKeyChange("Connection timed out"))
++        assertFalse(isVaultHostKeyChange(null))
++        assertFalse(isVaultHostKeyChange(""))
++    }
++}
