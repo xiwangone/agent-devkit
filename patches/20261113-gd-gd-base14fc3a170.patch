@@ -1,0 +1,736 @@
+diff --git a/ai/src/main/java/me/rerere/ai/agent/AgentLoop.kt b/ai/src/main/java/me/rerere/ai/agent/AgentLoop.kt
+index 4e8534a30..d73debdae 100644
+--- a/ai/src/main/java/me/rerere/ai/agent/AgentLoop.kt
++++ b/ai/src/main/java/me/rerere/ai/agent/AgentLoop.kt
+@@ -17,8 +17,7 @@ import kotlinx.coroutines.withTimeout
+ import kotlinx.datetime.TimeZone
+ import kotlinx.datetime.toLocalDateTime
+ import kotlinx.serialization.json.JsonElement
+-import kotlinx.serialization.json.buildJsonObject
+-import kotlinx.serialization.json.put
++import kotlinx.serialization.json.JsonPrimitive
+ import me.rerere.ai.core.MessageRole
+ import me.rerere.ai.core.TokenUsage
+ import me.rerere.ai.core.Tool
+@@ -335,7 +334,10 @@ internal class AgentLoop(
+     private suspend fun execute(tool: UIMessagePart.Tool): List<UIMessagePart> =
+         when (val state = tool.approvalState) {
+             is ToolApprovalState.Denied -> errorOutput(
+-                "Tool execution denied by user. Reason: ${state.reason.ifBlank { "No reason provided" }}",
++                error = "permission_denied",
++                message = "Tool execution denied by user. Reason: ${state.reason.ifBlank { "No reason provided" }}",
++                code = ToolErrorEnvelope.SERVER_ERROR,
++                recovery = ToolErrorEnvelope.RECOVERY_ABORT,
+             )
+ 
+             is ToolApprovalState.Answered -> listOf(UIMessagePart.Text(state.answer))
+@@ -348,7 +350,15 @@ internal class AgentLoop(
+         val definition = findTool(tool.toolName)
+         val args = parseArgs(tool)
+         val outcome = hooks.beforeToolCall(tool, args, ToolCallScopeImpl(tool, args))
+-        if (definition == null) return errorOutput("Tool ${tool.toolName} not found")
++        if (definition == null) {
++            return errorOutput(
++                error = "not_found",
++                message = "Tool ${tool.toolName} not found",
++                code = ToolErrorEnvelope.METHOD_NOT_FOUND,
++                recovery = ToolErrorEnvelope.RECOVERY_FIX_PARAM,
++                hint = "Check available tools and retry with a valid tool name.",
++            )
++        }
+         return when (outcome) {
+             is ToolCallOutcome.Intercept -> outcome.output.ifEmpty { placeholder() }
+             is ToolCallOutcome.Reject -> outcome.output.ifEmpty { placeholder() }
+@@ -383,7 +393,13 @@ internal class AgentLoop(
+         } catch (e: TimeoutCancellationException) {
+             // 超时由调用方给的预算掐掉，不能当成工具异常，也不能触发网络重试
+             hooks.toolFailureOutput(tool, e)
+-                ?: errorOutput("Tool ${tool.toolName} timed out after $timeout. It was not completed.")
++                ?: errorOutput(
++                    error = "timeout",
++                    message = "Tool ${tool.toolName} timed out after $timeout. It was not completed.",
++                    code = ToolErrorEnvelope.SERVER_ERROR,
++                    recovery = ToolErrorEnvelope.RECOVERY_RETRY,
++                    hint = "Retry or simplify the request parameters.",
++                )
+         } catch (e: CancellationException) {
+             // 取消必须向上传播，否则停止生成会被误报为工具执行错误
+             throw e
+@@ -391,7 +407,13 @@ internal class AgentLoop(
+             // 完整堆栈只记日志；回灌给模型的信封只留异常类名 + 首行 message，避免淹没真正的错误信息。
+             AppLogger.e(TAG, "Tool ${tool.toolName} failed", e)
+             hooks.toolFailureOutput(tool, e)
+-                ?: errorOutput(toolErrorMessage(e))
++                ?: errorOutput(
++                    error = "tool_failed",
++                    message = toolErrorMessage(e),
++                    code = ToolErrorEnvelope.INTERNAL_ERROR,
++                    recovery = ToolErrorEnvelope.RECOVERY_ABORT,
++                    extra = mapOf("exception" to JsonPrimitive(e.javaClass.simpleName)),
++                )
+         }
+     }
+ 
+@@ -409,12 +431,16 @@ internal class AgentLoop(
+     }
+ 
+     private fun invalidArgsOutput(tool: UIMessagePart.Tool): List<UIMessagePart> = errorOutput(
+-        buildString {
++        error = "invalid_argument",
++        message = buildString {
+             append("Invalid tool arguments JSON for ${tool.toolName}")
+             lastArgsParseError?.let { append("; parse error: $it") }
+             val rawInput = tool.input.take(500)
+             if (rawInput.isNotBlank()) append("; input: $rawInput")
+         },
++        code = ToolErrorEnvelope.INVALID_PARAMS,
++        recovery = ToolErrorEnvelope.RECOVERY_FIX_PARAM,
++        hint = "Provide valid JSON matching the tool schema.",
+     )
+ 
+     /** 回灌给模型的工具失败信封：只留异常类名 + 首行 message，完整堆栈见日志。 */
+@@ -463,8 +489,21 @@ internal class AgentLoop(
+     }
+ }
+ 
+-private fun errorOutput(error: String): List<UIMessagePart> =
+-    listOf(UIMessagePart.Text(buildJsonObject { put("error", error) }.toString()))
++private fun errorOutput(
++    error: String,
++    message: String,
++    code: Int = ToolErrorEnvelope.SERVER_ERROR,
++    recovery: String = ToolErrorEnvelope.RECOVERY_ABORT,
++    hint: String? = null,
++    extra: Map<String, JsonElement> = emptyMap(),
++): List<UIMessagePart> = ToolErrorEnvelope.partsFor(
++    error = error,
++    message = message,
++    code = code,
++    recovery = recovery,
++    hint = hint,
++    extra = extra,
++)
+ 
+ // 当前 receiver 只含本模型请求的 usage；不同请求累计一次，工具执行不增加 stepCount。
+ private fun UIMessage.withStepStats(
+diff --git a/ai/src/main/java/me/rerere/ai/agent/ToolErrorEnvelope.kt b/ai/src/main/java/me/rerere/ai/agent/ToolErrorEnvelope.kt
+new file mode 100644
+index 000000000..b77b2a4ff
+--- /dev/null
++++ b/ai/src/main/java/me/rerere/ai/agent/ToolErrorEnvelope.kt
+@@ -0,0 +1,94 @@
++package me.rerere.ai.agent
++
++import kotlinx.serialization.json.JsonElement
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import me.rerere.ai.ui.UIMessagePart
++
++/**
++ * AI 内核层工具错误信封唯一实现（对齐 JSON-RPC 2.0 §5.1 与 MCP 扩展错误码）。
++ *
++ * 格式形状：
++ * ```json
++ * {
++ *   "code": -32603,
++ *   "message": "...",
++ *   "data": {
++ *     "error": "internal_error",
++ *     "recovery": "abort",
++ *     "hint": "..."
++ *   }
++ * }
++ * ```
++ *
++ * app 侧的 [me.rerere.rikkahub.data.ai.tools.ToolErrors] 是本实现的门面：
++ * 它保留业务码 → (code, recovery) 映射表与便捷 API，JSON 构建走这里。
++ */
++object ToolErrorEnvelope {
++    // ---- JSON-RPC 2.0 §5.1 标准码 ----
++    const val PARSE_ERROR = -32700
++    const val INVALID_REQUEST = -32600
++    const val METHOD_NOT_FOUND = -32601
++    const val INVALID_PARAMS = -32602
++    const val INTERNAL_ERROR = -32603
++
++    // ---- MCP 扩展码 ----
++    const val SERVER_ERROR = -32000
++    const val RESOURCE_NOT_FOUND = -32002
++    const val REQUEST_CANCELLED = -32800
++    const val CONTENT_TOO_LARGE = -32801
++
++    // ---- 恢复指引建议 ----
++    const val RECOVERY_RETRY = "retry"
++    const val RECOVERY_FIX_PARAM = "fix_param"
++    const val RECOVERY_ABORT = "abort"
++
++    private val RESERVED_DATA_KEYS = setOf("error", "recovery", "hint")
++
++    /**
++     * 显式指定 JSON-RPC 分类码与恢复语义。
++     */
++    fun envelope(
++        code: Int,
++        message: String,
++        error: String? = null,
++        recovery: String? = null,
++        hint: String? = null,
++        extra: Map<String, JsonElement> = emptyMap(),
++    ): JsonObject = buildJsonObject {
++        put("code", code)
++        put("message", message)
++        put("data", buildJsonObject {
++            if (error != null) put("error", error)
++            if (recovery != null) put("recovery", recovery)
++            if (!hint.isNullOrBlank()) put("hint", hint)
++            for ((k, v) in extra) {
++                if (k !in RESERVED_DATA_KEYS) put(k, v)
++            }
++        })
++    }
++
++    /**
++     * 便捷构造：返回标准工具错误消息 Part 列表。
++     */
++    fun partsFor(
++        error: String,
++        message: String,
++        code: Int = SERVER_ERROR,
++        recovery: String = RECOVERY_ABORT,
++        hint: String? = null,
++        extra: Map<String, JsonElement> = emptyMap(),
++    ): List<UIMessagePart> = listOf(
++        UIMessagePart.Text(
++            envelope(
++                code = code,
++                message = message,
++                error = error,
++                recovery = recovery,
++                hint = hint,
++                extra = extra,
++            ).toString(),
++        ),
++    )
++}
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt
+index 213cef51c..1688d1f47 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt
+@@ -19,6 +19,7 @@ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.ModelAbility
+ import me.rerere.ai.provider.ModelType
+ import me.rerere.ai.provider.OpenRouterRouting
++import me.rerere.ai.registry.ModelRegistry
+ import me.rerere.ai.ui.ImageAspectRatio
+ import me.rerere.ai.ui.ImageGenerationItem
+ import me.rerere.ai.util.json
+@@ -95,6 +96,18 @@ fun parseImageDataUri(url: String): ParsedImageDataUri? {
+     return ParsedImageDataUri(mime = m.groupValues[1], base64 = m.groupValues[2])
+ }
+ 
++/**
++ * OpenRouter 接口返回的 raw 模态与注册表（内置规则 + 目录）取并集。
++ *
++ * 新模型刚拉下来时注册表可能还不知道它，能力只有 raw 值，所以 raw 永远保留，
++ * 注册表只补、不覆盖；内置表已有的能力也不会被 raw 覆盖掉。
++ */
++private fun unionModalities(raw: List<String>, known: List<Modality>): List<Modality> =
++    buildList {
++        add(Modality.TEXT)
++        if ("image" in raw || Modality.IMAGE in known) add(Modality.IMAGE)
++    }.distinct()
++
+ /**
+  * Map one item from OpenRouter's `GET /models` `data[]` into a [Model] with capabilities
+  * and pricing detected from `architecture` / `supported_parameters` / `pricing`, so image
+@@ -113,14 +126,8 @@ fun openRouterModelFromJson(modelObj: JsonObject): Model? {
+     val supported = strList(modelObj, "supported_parameters")
+     val pricing = modelObj["pricing"] as? JsonObject
+ 
+-    val inputModalities = buildList {
+-        add(Modality.TEXT)
+-        if ("image" in inMods) add(Modality.IMAGE)
+-    }.distinct()
+-    val outputModalities = buildList {
+-        add(Modality.TEXT)
+-        if ("image" in outMods) add(Modality.IMAGE)
+-    }.distinct()
++    val inputModalities = unionModalities(inMods, ModelRegistry.MODEL_INPUT_MODALITIES.getData(id))
++    val outputModalities = unionModalities(outMods, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData(id))
+     val abilities = buildList {
+         if ("tools" in supported || "tool_choice" in supported) add(ModelAbility.TOOL)
+         if ("reasoning" in supported || "include_reasoning" in supported) add(ModelAbility.REASONING)
+diff --git a/ai/src/test/java/me/rerere/ai/agent/AgentLoopErrorEnvelopeTest.kt b/ai/src/test/java/me/rerere/ai/agent/AgentLoopErrorEnvelopeTest.kt
+new file mode 100644
+index 000000000..8f641f831
+--- /dev/null
++++ b/ai/src/test/java/me/rerere/ai/agent/AgentLoopErrorEnvelopeTest.kt
+@@ -0,0 +1,172 @@
++package me.rerere.ai.agent
++
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.flow
++import kotlinx.coroutines.runBlocking
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import me.rerere.ai.core.MessageRole
++import me.rerere.ai.core.Tool
++import me.rerere.ai.provider.ImageGenerationParams
++import me.rerere.ai.provider.Model
++import me.rerere.ai.provider.Provider
++import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.TextGenerationParams
++import me.rerere.ai.provider.TextGenerationResult
++import me.rerere.ai.ui.ImageGenerationItem
++import me.rerere.ai.ui.StreamChunk
++import me.rerere.ai.ui.ToolApprovalState
++import me.rerere.ai.ui.UIMessage
++import me.rerere.ai.ui.UIMessagePart
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * [AgentLoop] 的失败回灌必须走 v2 信封（[ToolErrorEnvelope]，JSON-RPC 2.0 形状），
++ * 不得再产旧扁平形状 `{"error": "..."}`。
++ *
++ * 三路失败各有自己的业务码 / 分类码 / recovery：
++ * 拒绝 → permission_denied / -32000 / abort；
++ * 未知工具 → not_found / -32601 / fix_param；
++ * 执行抛错 → tool_failed / -32603 / abort。
++ */
++class AgentLoopErrorEnvelopeTest {
++
++    private val model = Model(modelId = "error-envelope-test")
++    private val setting = ProviderSetting.OpenAI()
++
++    /** 跑一轮循环：首步返回 [toolPart]，次步收工具输出并返回总结；返回工具输出的 JSON。 */
++    private fun runLoopAndCaptureToolOutput(
++        toolPart: UIMessagePart.Tool,
++        tools: List<Tool>,
++    ): JsonObject = runBlocking {
++        var providerCalls = 0
++        var captured: JsonObject? = null
++
++        val provider = object : Provider<ProviderSetting> {
++            override suspend fun listModels(providerSetting: ProviderSetting): List<Model> = emptyList()
++
++            override suspend fun generateText(
++                providerSetting: ProviderSetting,
++                messages: List<UIMessage>,
++                params: TextGenerationParams,
++            ): TextGenerationResult {
++                providerCalls++
++                if (providerCalls == 1) {
++                    return TextGenerationResult(
++                        id = "tool-call",
++                        model = model.modelId,
++                        message = UIMessage(
++                            role = MessageRole.ASSISTANT,
++                            parts = listOf(toolPart),
++                        ),
++                        finishReason = "tool_calls",
++                    )
++                }
++                // 次步收到的消息里带有工具输出（已由 AgentLoop 写回）。
++                val tool = messages.flatMap { it.parts }
++                    .filterIsInstance<UIMessagePart.Tool>()
++                    .first { it.output.isNotEmpty() }
++                val text = (tool.output[0] as UIMessagePart.Text).text
++                captured = Json.parseToJsonElement(text).jsonObject
++                return TextGenerationResult(
++                    id = "summary",
++                    model = model.modelId,
++                    message = UIMessage.assistant("done"),
++                    finishReason = "stop",
++                )
++            }
++
++            override suspend fun streamText(
++                providerSetting: ProviderSetting,
++                messages: List<UIMessage>,
++                params: TextGenerationParams,
++            ): Flow<StreamChunk> = flow { error("stream not used") }
++
++            override suspend fun generateImage(
++                providerSetting: ProviderSetting,
++                params: ImageGenerationParams,
++            ): Flow<ImageGenerationItem> = flow { error("image not used") }
++        }
++
++        val hooks = object : AgentHooks {
++            override suspend fun prepareStep(messages: List<UIMessage>) =
++                StepRequest(messages, TextGenerationParams(model))
++        }
++
++        runAgent(
++            AgentRequest(
++                provider = provider,
++                providerSetting = setting,
++                messages = listOf(UIMessage.user("start")),
++                tools = tools,
++                stream = false,
++                maxSteps = 2,
++                retry = RetryPolicy.NONE,
++            ),
++            hooks,
++        ).collect { /* 事件不断言，只关心工具输出 */ }
++
++        assertEquals(2, providerCalls)
++        return@runBlocking captured!!
++    }
++
++    private fun assertEnvelope(
++        env: JsonObject,
++        code: Int,
++        error: String,
++        recovery: String,
++    ) {
++        assertEquals(code, env["code"]!!.jsonPrimitive.content.toInt())
++        assertTrue(env["message"]!!.jsonPrimitive.content.isNotBlank())
++        val data = env["data"]!!.jsonObject
++        assertEquals(error, data["error"]!!.jsonPrimitive.content)
++        assertEquals(recovery, data["recovery"]!!.jsonPrimitive.content)
++        assertTrue("must not fall back to the flat v1 shape", "error" !in env)
++    }
++
++    @Test
++    fun `denied tool produces permission_denied envelope`() {
++        val env = runLoopAndCaptureToolOutput(
++            toolPart = UIMessagePart.Tool(
++                toolCallId = "denied-call",
++                toolName = "work",
++                input = "{}",
++                approvalState = ToolApprovalState.Denied("user said no"),
++            ),
++            tools = listOf(Tool("work", "no-op", execute = { emptyList() })),
++        )
++        assertEnvelope(env, ToolErrorEnvelope.SERVER_ERROR, "permission_denied", "abort")
++        assertTrue(env["message"]!!.jsonPrimitive.content.contains("denied by user"))
++    }
++
++    @Test
++    fun `unknown tool produces not_found envelope with hint`() {
++        val env = runLoopAndCaptureToolOutput(
++            toolPart = UIMessagePart.Tool("nf-call", "no-such-tool", "{}"),
++            tools = emptyList(),
++        )
++        assertEnvelope(env, ToolErrorEnvelope.METHOD_NOT_FOUND, "not_found", "fix_param")
++        assertTrue(env["message"]!!.jsonPrimitive.content.contains("no-such-tool"))
++        assertTrue(env["data"]!!.jsonObject["hint"]!!.jsonPrimitive.content.isNotBlank())
++    }
++
++    @Test
++    fun `failing tool produces tool_failed envelope with exception extra`() {
++        val env = runLoopAndCaptureToolOutput(
++            toolPart = UIMessagePart.Tool("fail-call", "work", "{}"),
++            tools = listOf(
++                Tool("work", "Synthetic failing tool", execute = {
++                    throw RuntimeException("boom-test-marker")
++                }),
++            ),
++        )
++        assertEnvelope(env, ToolErrorEnvelope.INTERNAL_ERROR, "tool_failed", "abort")
++        val data = env["data"]!!.jsonObject
++        assertEquals("RuntimeException", data["exception"]!!.jsonPrimitive.content)
++        assertTrue(data["error"]!!.jsonPrimitive.content.isNotBlank())
++    }
++}
+diff --git a/ai/src/test/java/me/rerere/ai/agent/ToolErrorEnvelopeTest.kt b/ai/src/test/java/me/rerere/ai/agent/ToolErrorEnvelopeTest.kt
+new file mode 100644
+index 000000000..006df62ca
+--- /dev/null
++++ b/ai/src/test/java/me/rerere/ai/agent/ToolErrorEnvelopeTest.kt
+@@ -0,0 +1,113 @@
++package me.rerere.ai.agent
++
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.jsonObject
++import kotlinx.serialization.json.jsonPrimitive
++import me.rerere.ai.ui.UIMessagePart
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * [ToolErrorEnvelope] 是 ai 内核层工具错误信封的唯一实现（JSON-RPC 2.0 形状）；
++ * app 侧 [me.rerere.rikkahub.data.ai.tools.ToolErrors] 只是它的门面。
++ */
++class ToolErrorEnvelopeTest {
++
++    @Test
++    fun `envelope has JSON-RPC shape`() {
++        val env = ToolErrorEnvelope.envelope(
++            code = ToolErrorEnvelope.INVALID_PARAMS,
++            message = "x and y are required",
++            error = "invalid_argument",
++            recovery = ToolErrorEnvelope.RECOVERY_FIX_PARAM,
++            hint = "Provide both x and y.",
++        )
++        assertEquals(-32602, env["code"]!!.jsonPrimitive.content.toInt())
++        assertEquals("x and y are required", env["message"]!!.jsonPrimitive.content)
++        val data = env["data"]!!.jsonObject
++        assertEquals("invalid_argument", data["error"]!!.jsonPrimitive.content)
++        assertEquals("fix_param", data["recovery"]!!.jsonPrimitive.content)
++        assertEquals("Provide both x and y.", data["hint"]!!.jsonPrimitive.content)
++    }
++
++    @Test
++    fun `envelope omits absent optional fields`() {
++        val env = ToolErrorEnvelope.envelope(
++            code = ToolErrorEnvelope.INTERNAL_ERROR,
++            message = "boom",
++        )
++        val data = env["data"]!!.jsonObject
++        assertFalse("error must be omitted when null", "error" in data)
++        assertFalse("recovery must be omitted when null", "recovery" in data)
++        assertFalse("hint must be omitted when blank", "hint" in data)
++    }
++
++    @Test
++    fun `envelope keeps extra but never lets it overwrite reserved keys`() {
++        val env = ToolErrorEnvelope.envelope(
++            code = ToolErrorEnvelope.SERVER_ERROR,
++            message = "m",
++            error = "tool_failed",
++            recovery = ToolErrorEnvelope.RECOVERY_ABORT,
++            extra = mapOf(
++                "current" to JsonPrimitive("a"),
++                "error" to JsonPrimitive("spoofed"),
++                "recovery" to JsonPrimitive("retry"),
++                "hint" to JsonPrimitive("spoofed hint"),
++            ),
++        )
++        val data = env["data"]!!.jsonObject
++        assertEquals("a", data["current"]!!.jsonPrimitive.content)
++        assertEquals("tool_failed", data["error"]!!.jsonPrimitive.content)
++        assertEquals("abort", data["recovery"]!!.jsonPrimitive.content)
++        assertFalse("extra hint must not overwrite the real hint slot", "hint" in data)
++    }
++
++    @Test
++    fun `partsFor uses server-error abort by default`() {
++        val parts = ToolErrorEnvelope.partsFor(error = "tool_failed", message = "boom")
++        assertEquals(1, parts.size)
++        val text = (parts[0] as UIMessagePart.Text).text
++        val env: JsonObject = kotlinx.serialization.json.Json.parseToJsonElement(text).jsonObject
++        assertEquals(-32000, env["code"]!!.jsonPrimitive.content.toInt())
++        val data = env["data"]!!.jsonObject
++        assertEquals("tool_failed", data["error"]!!.jsonPrimitive.content)
++        assertEquals("abort", data["recovery"]!!.jsonPrimitive.content)
++    }
++
++    @Test
++    fun `partsFor honors explicit code and recovery`() {
++        val parts = ToolErrorEnvelope.partsFor(
++            error = "not_found",
++            message = "Tool x not found",
++            code = ToolErrorEnvelope.METHOD_NOT_FOUND,
++            recovery = ToolErrorEnvelope.RECOVERY_FIX_PARAM,
++            hint = "Check available tools.",
++        )
++        val text = (parts[0] as UIMessagePart.Text).text
++        val env: JsonObject = kotlinx.serialization.json.Json.parseToJsonElement(text).jsonObject
++        assertEquals(-32601, env["code"]!!.jsonPrimitive.content.toInt())
++        val data = env["data"]!!.jsonObject
++        assertEquals("not_found", data["error"]!!.jsonPrimitive.content)
++        assertEquals("fix_param", data["recovery"]!!.jsonPrimitive.content)
++        assertEquals("Check available tools.", data["hint"]!!.jsonPrimitive.content)
++    }
++
++    @Test
++    fun `partsFor carries extra through`() {
++        val parts = ToolErrorEnvelope.partsFor(
++            error = "tool_failed",
++            message = "boom",
++            extra = mapOf("exception" to JsonPrimitive("RuntimeException")),
++        )
++        val text = (parts[0] as UIMessagePart.Text).text
++        val env: JsonObject = kotlinx.serialization.json.Json.parseToJsonElement(text).jsonObject
++        assertEquals(
++            "RuntimeException",
++            env["data"]!!.jsonObject["exception"]!!.jsonPrimitive.content,
++        )
++    }
++}
+diff --git a/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt b/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt
+index 12ba7f89b..4e445e5fb 100644
+--- a/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt
++++ b/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt
+@@ -51,4 +51,33 @@ class OpenRouterModelParseTest {
+         assertTrue(Modality.IMAGE !in m.outputModalities)
+         assertTrue(ModelAbility.TOOL !in m.abilities)
+     }
++
++    @Test
++    fun `registry union adds image input for a known model whose raw response lists text only`() {
++        // gpt-4o 在注册表内置规则里是视觉输入模型；接口这次只给了 text，
++        // 并集必须把 IMAGE 补回来，输出仍只有 TEXT（内置规则不含图片输出）。
++        val json = """
++            {"id":"gpt-4o","name":"GPT-4o",
++             "architecture":{"input_modalities":["text"],"output_modalities":["text"]},
++             "supported_parameters":["tools"]}
++        """.trimIndent()
++        val m = openRouterModelFromJson(Json.parseToJsonElement(json).jsonObject)!!
++        assertTrue(Modality.IMAGE in m.inputModalities)
++        assertTrue(Modality.IMAGE !in m.outputModalities)
++    }
++
++    @Test
++    fun `brand-new model keeps raw image capability when the registry does not know it`() {
++        // 新模型刚拉下来时注册表里没有它，能力只有接口返回的 raw 值；
++        // 并集必须原样保留 raw 的 IMAGE，不能因为注册表不知道就丢掉。
++        val json = """
++            {"id":"acme/nova-image-9","name":"Nova Image 9",
++             "architecture":{"input_modalities":["image","text"],"output_modalities":["image","text"]},
++             "supported_parameters":[]}
++        """.trimIndent()
++        val m = openRouterModelFromJson(Json.parseToJsonElement(json).jsonObject)!!
++        assertTrue(Modality.IMAGE in m.inputModalities)
++        assertTrue(Modality.IMAGE in m.outputModalities)
++        assertEquals(ModelType.IMAGE, m.type)
++    }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolErrors.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolErrors.kt
+index 6d063e46f..9169ab212 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolErrors.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ToolErrors.kt
+@@ -4,12 +4,13 @@ import kotlinx.serialization.json.JsonElement
+ import kotlinx.serialization.json.JsonNull
+ import kotlinx.serialization.json.JsonObject
+ import kotlinx.serialization.json.JsonPrimitive
+-import kotlinx.serialization.json.buildJsonObject
+-import kotlinx.serialization.json.put
+ import me.rerere.ai.ui.UIMessagePart
+ 
+ /**
+- * 工具错误信封的**唯一实现**（v2，JSON-RPC 2.0 对齐）。
++ * 工具错误信封的 app 侧门面（v2，JSON-RPC 2.0 对齐）。
++ *
++ * JSON 构建由 ai 内核层的 `me.rerere.ai.agent.ToolErrorEnvelope` 实现；本对象保留
++ * 业务码 → (code, recovery) 映射表与便捷 API。
+  *
+  * 形状（对齐 JSON-RPC 2.0 §5.1 Error Object，https://www.jsonrpc.org/specification）：
+  * ```json
+@@ -275,11 +276,10 @@ object ToolErrors {
+         }
+     }
+ 
+-    private val RESERVED = setOf("error", "recovery", "hint")
+-
+     /**
+      * 显式 code 版：调用方明确知道 JSON-RPC 分类码时使用。
+      * 输出 `{"code","message","data":{"error","recovery","hint",...extra}}`。
++     * JSON 构建走 ai 内核层 `me.rerere.ai.agent.ToolErrorEnvelope`。
+      */
+     fun envelope(
+         code: Int,
+@@ -288,18 +288,14 @@ object ToolErrors {
+         recovery: String? = null,
+         hint: String? = null,
+         extra: Map<String, JsonElement> = emptyMap(),
+-    ): JsonObject = buildJsonObject {
+-        put("code", code)
+-        put("message", message)
+-        put("data", buildJsonObject {
+-            if (error != null) put("error", error)
+-            if (recovery != null) put("recovery", recovery)
+-            if (!hint.isNullOrBlank()) put("hint", hint)
+-            for ((k, v) in extra) {
+-                if (k !in RESERVED) put(k, v)
+-            }
+-        })
+-    }
++    ): JsonObject = me.rerere.ai.agent.ToolErrorEnvelope.envelope(
++        code = code,
++        message = message,
++        error = error,
++        recovery = recovery,
++        hint = hint,
++        extra = extra,
++    )
+ 
+     /**
+      * 业务码版：code/recovery 从 [categoryFor]/[recoveryFor] 推导。
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorEnvelopeParityTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorEnvelopeParityTest.kt
+new file mode 100644
+index 000000000..d82b80015
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorEnvelopeParityTest.kt
+@@ -0,0 +1,58 @@
++package me.rerere.rikkahub.data.ai.tools
++
++import kotlinx.serialization.json.JsonPrimitive
++import me.rerere.ai.agent.ToolErrorEnvelope
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * 防退化：[ToolErrors.envelope] 只是 ai 内核层 [ToolErrorEnvelope] 的委托，
++ * 两边对同一输入必须产出完全相同的 JSON（含 extra 保留键过滤）。
++ */
++class ToolErrorEnvelopeParityTest {
++
++    @Test
++    fun `ToolErrors envelope equals ToolErrorEnvelope envelope`() {
++        val args = arrayOf(
++            ToolErrorEnvelope.INVALID_PARAMS to "bad params",
++            ToolErrorEnvelope.INTERNAL_ERROR to "boom",
++        )
++        for ((code, message) in args) {
++            val viaFacade = ToolErrors.envelope(
++                code = code,
++                message = message,
++                error = "invalid_argument",
++                recovery = "fix_param",
++                hint = "fix it",
++                extra = mapOf(
++                    "current" to JsonPrimitive("a"),
++                    "error" to JsonPrimitive("spoofed"),
++                ),
++            )
++            val viaKernel = ToolErrorEnvelope.envelope(
++                code = code,
++                message = message,
++                error = "invalid_argument",
++                recovery = "fix_param",
++                hint = "fix it",
++                extra = mapOf(
++                    "current" to JsonPrimitive("a"),
++                    "error" to JsonPrimitive("spoofed"),
++                ),
++            )
++            assertEquals(viaKernel, viaFacade)
++        }
++    }
++
++    @Test
++    fun `ToolErrors envelopeFor still derives code and recovery from its maps`() {
++        val viaFacade = ToolErrors.envelopeFor(error = "timeout", message = "timed out")
++        val viaKernel = ToolErrorEnvelope.envelope(
++            code = ToolErrors.categoryFor("timeout"),
++            message = "timed out",
++            error = "timeout",
++            recovery = ToolErrors.recoveryFor("timeout"),
++        )
++        assertEquals(viaKernel, viaFacade)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorsEnvelopeGuardTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorsEnvelopeGuardTest.kt
+index 1353ce72d..0790e07ae 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorsEnvelopeGuardTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/ToolErrorsEnvelopeGuardTest.kt
+@@ -9,7 +9,7 @@ import java.io.File
+  * 防退化：工具错误输出必须走 [ToolErrors] 信封（JSON-RPC 2.0 形状），不得手写 `put("error", ...)`。
+  *
+  * 例外（非工具错误信封，不在本规则内）：
+- * - [ToolErrors] 自身（信封的唯一实现）；
++ * - [ToolErrors] 自身（信封的 app 侧门面；实现在 ai 内核层 ToolErrorEnvelope）；
+  * - 嵌套数据字段（如 batch 汇总中每项的 error、tried_hosts 数组元素）；
+  * - 诊断/状态对象（如 MCP serverView、probe 结果）；
+  * - 历史记录/运行摘要（如 workflow history）。
