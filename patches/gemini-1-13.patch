@@ -1,0 +1,135 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/gemini/GeminiAccountRepository.kt b/app/src/main/java/me/rerere/rikkahub/data/gemini/GeminiAccountRepository.kt
+index 36cb98886..acdc93470 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/gemini/GeminiAccountRepository.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/gemini/GeminiAccountRepository.kt
+@@ -579,26 +579,26 @@ internal fun classifyGeminiError(statusCode: Int?, body: String?, json: Json): G
+     val error = runCatching {
+         body?.let { json.parseToJsonElement(it).jsonObject["error"]?.jsonObject }
+     }.getOrNull()
+-    val effectiveStatus = statusCode ?: error?.get("code")?.jsonPrimitive?.intOrNull
++    val effectiveStatus = statusCode ?: (error?.get("code") as? JsonPrimitive)?.intOrNull
+     val transientStatus = effectiveStatus == 408 || effectiveStatus == 429 ||
+         (effectiveStatus != null && effectiveStatus >= 500)
+-    val rpcStatus = error?.get("status")?.jsonPrimitive?.contentOrNull
++    val rpcStatus = (error?.get("status") as? JsonPrimitive)?.contentOrNull
+     val details = (error?.get("details") as? JsonArray)?.mapNotNull { it as? JsonObject }.orEmpty()
+     var reason = if (rpcStatus?.uppercase() == "RESOURCE_EXHAUSTED") {
+-        details.firstOrNull { it["@type"]?.jsonPrimitive?.contentOrNull == GOOGLE_RPC_ERROR_INFO_TYPE }
+-            ?.get("reason")?.jsonPrimitive?.contentOrNull
++        (details.firstOrNull { (it["@type"] as? JsonPrimitive)?.contentOrNull == GOOGLE_RPC_ERROR_INFO_TYPE }
++            ?.get("reason") as? JsonPrimitive)?.contentOrNull
+     } else {
+         null
+     }
+-    val message = error?.get("message")?.jsonPrimitive?.contentOrNull
++    val message = (error?.get("message") as? JsonPrimitive)?.contentOrNull
+     if (reason == "RATE_LIMIT_EXCEEDED" && message != null &&
+         ANTIGRAVITY_MODEL_QUOTA_PATTERN.containsMatchIn(message)
+     ) {
+         reason = "QUOTA_EXHAUSTED"
+     }
+-    val retryDelayMs = details
+-        .firstOrNull { it["@type"]?.jsonPrimitive?.contentOrNull == GOOGLE_RPC_RETRY_INFO_TYPE }
+-        ?.get("retryDelay")?.jsonPrimitive?.contentOrNull
++    val retryDelayMs = (details
++        .firstOrNull { (it["@type"] as? JsonPrimitive)?.contentOrNull == GOOGLE_RPC_RETRY_INFO_TYPE }
++        ?.get("retryDelay") as? JsonPrimitive)?.contentOrNull
+         ?.let(::parseGeminiRetryDelayMs)
+     val quotaExhausted = reason == "QUOTA_EXHAUSTED" ||
+         (reason == "RATE_LIMIT_EXCEEDED" && retryDelayMs != null && retryDelayMs >= GEMINI_RETRY_DELAY_CAP_MS)
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/gemini/GeminiRetryTest.kt b/app/src/test/java/me/rerere/rikkahub/data/gemini/GeminiRetryTest.kt
+index f03bbd62f..2595e72a6 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/gemini/GeminiRetryTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/gemini/GeminiRetryTest.kt
+@@ -234,6 +234,91 @@ class GeminiRetryTest {
+         assertNull(classification.retryDelayMs)
+     }
+ 
++    @Test
++    fun `malformed code as object degrades to statusCode without throwing`() {
++        val classification = classifyGeminiError(null, """{"error":{"code":{"nested":429},"message":"rate limited"}}""", json)
++        assertNull(classification.status)
++        assertFalse(classification.retryable)
++
++        val fallbackToHttp = classifyGeminiError(503, """{"error":{"code":{"nested":400}}}""", json)
++        assertEquals(503, fallbackToHttp.status)
++        assertTrue(fallbackToHttp.retryable)
++    }
++
++    @Test
++    fun `malformed status as array degrades to classifying off statusCode without throwing`() {
++        val classification = classifyGeminiError(429, """{"error":{"code":429,"status":["RESOURCE_EXHAUSTED"]}}""", json)
++        assertEquals(429, classification.status)
++        assertNull(classification.reason)
++        assertTrue(classification.retryable)
++    }
++
++    @Test
++    fun `malformed message as object degrades without throwing`() {
++        val body = """
++            {
++              "error": {
++                "code": 429,
++                "message": {"text": "You have exhausted your capacity on this model."},
++                "status": "RESOURCE_EXHAUSTED",
++                "details": [
++                  {
++                    "@type": "type.googleapis.com/google.rpc.ErrorInfo",
++                    "reason": "RATE_LIMIT_EXCEEDED"
++                  }
++                ]
++              }
++            }
++        """.trimIndent()
++        val classification = classifyGeminiError(429, body, json)
++        assertEquals(429, classification.status)
++        assertEquals("RATE_LIMIT_EXCEEDED", classification.reason)
++        assertTrue(classification.retryable)
++    }
++
++    @Test
++    fun `malformed details with non-objects and non-primitive fields degrades without throwing`() {
++        val body = """
++            {
++              "error": {
++                "code": 429,
++                "status": "RESOURCE_EXHAUSTED",
++                "details": [
++                  "not-an-object",
++                  123,
++                  {"@type": ["not-a-primitive"], "reason": {"nested": "RATE_LIMIT_EXCEEDED"}},
++                  {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": ["ARRAY_REASON"]},
++                  {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": {"seconds": 12}}
++                ]
++              }
++            }
++        """.trimIndent()
++        val classification = classifyGeminiError(429, body, json)
++        assertEquals(429, classification.status)
++        assertEquals("RESOURCE_EXHAUSTED", classification.reason)
++        assertNull(classification.retryDelayMs)
++        assertTrue(classification.retryable)
++    }
++
++    @Test
++    fun `body as json array or json string degrades to statusCode without throwing`() {
++        val fromArray = classifyGeminiError(502, "[1, 2, 3]", json)
++        assertEquals(502, fromArray.status)
++        assertTrue(fromArray.retryable)
++
++        val fromString = classifyGeminiError(400, "\"plain json string\"", json)
++        assertEquals(400, fromString.status)
++        assertFalse(fromString.retryable)
++    }
++
++    @Test
++    fun `error field as non-object degrades to statusCode without throwing`() {
++        val classification = classifyGeminiError(503, """{"error":"something went wrong"}""", json)
++        assertEquals(503, classification.status)
++        assertNull(classification.reason)
++        assertTrue(classification.retryable)
++    }
++
+     // --- resolveGeminiRetryDelayMs -----------------------------------------------------------
+ 
+     @Test
