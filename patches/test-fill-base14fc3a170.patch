@@ -1,0 +1,3476 @@
+diff --git a/agent-tools/src/test/java/me/rerere/agenttools/ConfigToolsEmptyKeyTest.kt b/agent-tools/src/test/java/me/rerere/agenttools/ConfigToolsEmptyKeyTest.kt
+new file mode 100644
+index 000000000..8bb2c7d9d
+--- /dev/null
++++ b/agent-tools/src/test/java/me/rerere/agenttools/ConfigToolsEmptyKeyTest.kt
+@@ -0,0 +1,108 @@
++package me.rerere.agenttools
++
++import kotlinx.coroutines.runBlocking
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.json.jsonObject
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.common.log.AppLogger
++import me.rerere.workspace.WorkspaceFileEntry
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++
++/**
++ * `config_set` 空 key 拦截（`require(key.isNotBlank())`，[ConfigTools.kt][createSetTool]）。
++ *
++ * 显式传空串（或全空白串）必须被拦在写库之前；缺 key 是另一条路（`error("key is required")`），
++ * 不在本用例内。合法 key 仍可正常写入，作为对照。
++ */
++class ConfigToolsEmptyKeyTest {
++
++    private val noopSink =
++        object : AppLogger.Sink {
++            override fun d(tag: String, message: String) = Unit
++
++            override fun i(tag: String, message: String) = Unit
++
++            override fun w(tag: String, message: String) = Unit
++
++            override fun w(tag: String, message: String, tr: Throwable?) = Unit
++
++            override fun e(tag: String, message: String) = Unit
++
++            override fun e(tag: String, message: String, tr: Throwable?) = Unit
++        }
++
++    @Before
++    fun setUp() {
++        AppLogger.install(noopSink)
++    }
++
++    @After
++    fun tearDown() {
++        AppLogger.install(noopSink)
++    }
++
++    /** 基于内存 map 的 [AgentWorkspaceIO] fake。 */
++    private class MemoryIO : AgentWorkspaceIO {
++        val files = mutableMapOf<String, String>()
++
++        override suspend fun writeText(path: String, text: String, overwrite: Boolean) {
++            files[path] = text
++        }
++
++        override suspend fun readText(path: String): String =
++            files[path] ?: error("no such file: $path")
++
++        override suspend fun listFiles(path: String): List<WorkspaceFileEntry> =
++            files.keys.filter { it.startsWith(path) }.map {
++                WorkspaceFileEntry(it, it.substringAfterLast('/'), false, 0L, 0L)
++            }
++    }
++
++    private fun setTool(io: MemoryIO): me.rerere.ai.core.Tool {
++        val tools = createConfigTools(io, emptyMap())
++        return tools.first { it.name == "config_set" }
++    }
++
++    private fun execute(tool: me.rerere.ai.core.Tool, argsJson: String): List<UIMessagePart> =
++        runBlocking { tool.execute(Json.parseToJsonElement(argsJson)) }
++
++    private fun setFailsWithBlankKey(keyJson: String) {
++        val io = MemoryIO()
++        io.files["config/settings.json"] = "{}"
++        val tool = setTool(io)
++        val thrown = assertThrows(IllegalArgumentException::class.java) {
++            execute(tool, """{"key":$keyJson,"value":"\"dark\""}""")
++        }
++        assertEquals("key must not be blank", thrown.message)
++        // 拦截发生在写库之前：配置文件原样未动。
++        assertEquals("{}", io.files.getValue("config/settings.json"))
++    }
++
++    @Test
++    fun `empty key is rejected before writing`() {
++        setFailsWithBlankKey("\"\"")
++    }
++
++    @Test
++    fun `blank-only key is rejected before writing`() {
++        setFailsWithBlankKey("\"   \"")
++    }
++
++    @Test
++    fun `non-blank key still writes`() {
++        val io = MemoryIO()
++        io.files["config/settings.json"] = "{}"
++        val tool = setTool(io)
++
++        val parts = execute(tool, """{"key":"agent.theme","value":"\"dark\""}""")
++        assertEquals(1, parts.size)
++
++        val saved = Json.parseToJsonElement(io.files.getValue("config/settings.json")).jsonObject
++        assertTrue("agent.theme" in saved)
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt
+index 7ca3bc33b..cf71d7ef7 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt
+@@ -127,6 +127,7 @@ private fun createReadFileTool(
+             // 二进制内容不按 UTF-8 文本返回：乱码会被 AI 当成文本误判，改走 base64；
+             // 本地 Rootfs 与远程 SSH 共用 readRootfsBuffer，两条路径一次覆盖
+             if (bytes.isBinaryContent()) {
++                requireInlineBase64Size(bytes.size, path)
+                 return@Tool listOf(
+                     UIMessagePart.Text(
+                         buildJsonObject {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
+index 7bbc16971..3ae883429 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
+@@ -37,6 +37,17 @@ import java.nio.charset.CodingErrorAction
+  */
+ internal const val SHELL_TIMEOUT_MAX_SECONDS = 600L
+ internal const val MAX_READ_FILE_BYTES = 8L * 1024 * 1024
++internal const val MAX_BINARY_BASE64_BYTES = 256 * 1024
++
++/**
++ * Base64 内联上限判定：二进制文件超过 256KB 不直接内联进消息，
++ * 改由调用方用 shell（head/xxd/python）查看，避免撑爆上下文。
++ */
++internal fun requireInlineBase64Size(sizeBytes: Int, path: String) {
++    require(sizeBytes <= MAX_BINARY_BASE64_BYTES) {
++        "Binary file is too large to inline as base64: $path ($sizeBytes bytes, limit $MAX_BINARY_BASE64_BYTES bytes). Use workspace_shell (e.g. head/xxd/python) to inspect it."
++    }
++}
+ 
+ /**
+  * English text of the workspace tool messages, kept in sync with values/strings.xml.
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/AutoCompressDialog.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/AutoCompressDialog.kt
+index 71dc64e60..135b8c597 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/AutoCompressDialog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/AutoCompressDialog.kt
+@@ -9,8 +9,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.padding
+-import androidx.compose.foundation.relocation.BringIntoViewRequester
+-import androidx.compose.foundation.relocation.bringIntoViewRequester
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.AlertDialog
+@@ -25,32 +23,15 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+-import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalResources
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+-import kotlinx.coroutines.launch
+ import me.rerere.rikkahub.R
+ 
+-/**
+- * 聚焦时把字段滚进可视范围（键盘弹出后不被遮挡）。
+- */
+-@Composable
+-private fun rememberBringIntoViewModifier(): Modifier {
+-    val requester = remember { BringIntoViewRequester() }
+-    val scope = rememberCoroutineScope()
+-    return Modifier
+-        .bringIntoViewRequester(requester)
+-        .onFocusChanged { state ->
+-            if (state.isFocused) scope.launch { requester.bringIntoView() }
+-        }
+-}
+-
+ /**
+  * 自动压缩设置弹窗。
+  *
+@@ -142,7 +123,7 @@ fun AutoCompressDialog(
+                             },
+                             label = { Text(stringResource(R.string.setting_model_page_auto_compress_base)) },
+                             supportingText = { Text(stringResource(R.string.setting_model_page_auto_compress_m_unit)) },
+-                            modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                            modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                             singleLine = true,
+                         )
+ 
+@@ -154,7 +135,7 @@ fun AutoCompressDialog(
+                                 }
+                             },
+                             label = { Text(stringResource(R.string.setting_model_page_auto_compress_threshold)) },
+-                            modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                            modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                             singleLine = true,
+                         )
+                     }
+@@ -184,7 +165,7 @@ fun AutoCompressDialog(
+                             },
+                             label = { Text(stringResource(R.string.setting_model_page_auto_compress_token_limit)) },
+                             supportingText = { Text(stringResource(R.string.setting_model_page_auto_compress_m_unit)) },
+-                            modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                            modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                             singleLine = true,
+                         )
+                     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/ConfirmDialogState.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/ConfirmDialogState.kt
+new file mode 100644
+index 000000000..550c4d849
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/ConfirmDialogState.kt
+@@ -0,0 +1,41 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++
++/**
++ * 确认弹窗共享状态机：只持有「待确认的目标」，不渲染对话框。
++ *
++ * 渲染层仍用已有的 `RikkaConfirmDialog` / `RikkaDeleteConfirmDialog`（纯展示层组件），
++ * 页面用 `remember` 持有本类实例，确认/取消后由页面执行副作用。
++ * 各页原来散落的 `pendingDelete: T?` / `pendingRevoke: String?` / `pendingXxx: Boolean`
++ * 一律改调本类，确认/取消的置空逻辑不再每页手写一遍。
++ *
++ * `pending` 用 snapshot state 持有：`request()` / `confirm()` / `dismiss()` 必须触发重组
++ * 对话框才弹得出、才关得掉，纯 var 持有者做不到这一点；JVM 单测仍可直接读写。
++ */
++class ConfirmDialogState<T> {
++    var pending: T? by mutableStateOf(null)
++        private set
++
++    val isShowing: Boolean get() = pending != null
++
++    fun request(target: T) {
++        pending = target
++    }
++
++    /** 取出待确认目标并清空；未在确认中时返回 null。 */
++    fun confirm(): T? {
++        val target = pending
++        pending = null
++        return target
++    }
++
++    fun dismiss() {
++        pending = null
++    }
++}
++
++/** 无载荷的布尔型确认（`pendingDelete: Boolean` 一类）：`request()` 不带参数。 */
++fun ConfirmDialogState<Unit>.request() = request(Unit)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/DraftState.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/DraftState.kt
+new file mode 100644
+index 000000000..5aaa9341d
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/DraftState.kt
+@@ -0,0 +1,57 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++
++/**
++ * 草稿 + 取消回滚共享状态机：持有「已保存值」与「编辑中草稿」两份状态。
++ *
++ * 典型用法（设置弹窗）：打开弹窗时 `load(已保存值)`，字段编辑走 `edit { it.copy(...) }`，
++ * 保存时 `save()` 拿返回值写库，取消时 `discard()` 丢弃草稿——各页原来手写的
++ * `loadXxxDrafts()` / `saveXxx()` / 取消重载三件套不再每页重复。
++ * `T` 应为不可变数据（data class / 不可变 List），`isDirty` 靠结构相等判定。
++ *
++ * `saved` / `draft` 用 snapshot state 持有：编辑必须触发重组，纯 var 持有者做不到；
++ * JVM 单测仍可直接读写。
++ */
++class DraftState<T>(initialSaved: T) {
++    var saved: T by mutableStateOf(initialSaved)
++        private set
++
++    var draft: T by mutableStateOf(initialSaved)
++        private set
++
++    /** 草稿与已保存值不一致即脏（取消时可丢弃、保存时可写库）。 */
++    val isDirty: Boolean get() = draft != saved
++
++    /** 从外部已保存值重载（设置流更新 / 弹窗打开时调用）：草稿与已保存值同步。 */
++    fun load(saved: T) {
++        this.saved = saved
++        draft = saved
++    }
++
++    /** 替换整份草稿。 */
++    fun edit(value: T) {
++        draft = value
++    }
++
++    /** 按变换替换草稿（字段编辑时常用 `edit { it.copy(xxx = newValue) }`）。 */
++    fun edit(transform: (T) -> T) {
++        draft = transform(draft)
++    }
++
++    /** 丢弃草稿，回到已保存值。 */
++    fun discard() {
++        draft = saved
++    }
++
++    /**
++     * 提交草稿为已保存值并返回它（页面拿返回值写库）。
++     * 写库后设置流回推新值，页面再 `load()` 同步一次，无害。
++     */
++    fun save(): T {
++        saved = draft
++        return saved
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/NetworkAccessField.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/NetworkAccessField.kt
+index 0b274f3f3..2ae1d75e6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/NetworkAccessField.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/NetworkAccessField.kt
+@@ -58,7 +58,7 @@ fun NetworkAccessField(
+             singleLine = true,
+             enabled = enabled,
+             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+-            modifier = Modifier.fillMaxWidth(),
++            modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+         )
+ 
+         val entries = parseCidrEntries(value)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingEmptyState.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingEmptyState.kt
+new file mode 100644
+index 000000000..e33ee22f7
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingEmptyState.kt
+@@ -0,0 +1,59 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import androidx.annotation.StringRes
++import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.ai.UsageRange
++
++/**
++ * 设置页共享空态 / 计数状态。
++ *
++ * 各页原来内联写的「空时置灰 / 空时给提示 / 计数为 null 时显示计算中」收拢于此，
++ * 同一映射不再两处各写一遍。
++ */
++
++/** 文件清理抽屉「删除」按钮启用条件：有可清理项才可点。 */
++internal fun cleanDeleteButtonEnabled(count: Int): Boolean = count > 0
++
++/** SSH 主机编辑弹窗密钥选择区两组入口的启用与提示可见性。 */
++internal data class SshKeyChoiceAvailability(
++    val templateEnabled: Boolean,
++    val templateHintVisible: Boolean,
++    val vaultPickEnabled: Boolean,
++    val vaultHintVisible: Boolean,
++)
++
++/**
++ * SSH 主机编辑弹窗密钥选择区：「从模板新建」与「从凭证库选择」。
++ * 两组入口始终显示，空库时置灰并在下方给提示，否则用户根本不知道有这功能。
++ */
++internal fun sshKeyChoiceAvailability(
++    hasTemplates: Boolean,
++    hasKeys: Boolean,
++): SshKeyChoiceAvailability = SshKeyChoiceAvailability(
++    templateEnabled = hasTemplates,
++    templateHintVisible = !hasTemplates,
++    vaultPickEnabled = hasKeys,
++    vaultHintVisible = !hasKeys,
++)
++
++/**
++ * 用量统计范围的文案资源：页面空态文案与范围 Chip 选项列表共用同一映射。
++ * 枚举声明顺序（TODAY、LAST_7_DAYS、LAST_30_DAYS、ALL_TIME）即 Chip 顺序。
++ */
++@StringRes
++internal fun usageRangeLabelRes(range: UsageRange): Int = when (range) {
++    UsageRange.TODAY -> R.string.usage_stats_range_today
++    UsageRange.LAST_7_DAYS -> R.string.usage_stats_range_7d
++    UsageRange.LAST_30_DAYS -> R.string.usage_stats_range_30d
++    UsageRange.ALL_TIME -> R.string.usage_stats_range_all
++}
++
++/** 异步计数状态：`null` = 计算中。 */
++internal sealed interface CountState {
++    data object Loading : CountState
++    data class Ready(val count: Int) : CountState
++}
++
++/** 凭证库计数（`null` = 计算中）转异步计数状态。 */
++internal fun Int?.toCountState(): CountState =
++    if (this == null) CountState.Loading else CountState.Ready(this)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingTextField.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingTextField.kt
+new file mode 100644
+index 000000000..7c4bb84a7
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingTextField.kt
+@@ -0,0 +1,86 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import androidx.compose.foundation.ExperimentalFoundationApi
++import androidx.compose.foundation.layout.imePadding
++import androidx.compose.foundation.relocation.BringIntoViewRequester
++import androidx.compose.foundation.relocation.bringIntoViewRequester
++import androidx.compose.foundation.text.KeyboardActions
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.focus.onFocusChanged
++import androidx.compose.ui.text.input.VisualTransformation
++import kotlinx.coroutines.launch
++
++/**
++ * 聚焦时把字段滚进可视范围：键盘弹出后获焦字段不被遮挡。
++ *
++ * 与键盘批的容器级 [imePadding] 互补：`imePadding` 只在键盘可见时给容器底部加内边距、
++ * 让页面「可以被拉上去」，本身不触发滚动；本修饰符在获焦时主动 `bringIntoView()`，
++ * 才是自动顶起。`imePadding` 仍由页面 / 弹窗容器自己加，不在字段上重复加。
++ *
++ * 本文件之前，`AutoCompressDialog` 与 `SshKeyPairDialog` 各有一份同款私有实现，
++ * 已收拢到这里；其余同款实现（如 `CompressContextDialog`、`BackupEncryptionSection`）
++ * 不在设置页内，不在此处收拢。
++ */
++@OptIn(ExperimentalFoundationApi::class)
++@Composable
++fun Modifier.bringIntoViewOnFocus(): Modifier {
++    val requester = remember { BringIntoViewRequester() }
++    val scope = rememberCoroutineScope()
++    return this
++        .bringIntoViewRequester(requester)
++        .onFocusChanged { state ->
++            if (state.isFocused) scope.launch { requester.bringIntoView() }
++        }
++}
++
++/**
++ * 设置页共享输入框：与 `OutlinedTextField` 同形签名，可直接改名迁移。
++ *
++ * 内建 [bringIntoViewOnFocus]（获焦自动顶起）；容器级 `imePadding` 仍由页面 / 弹窗自己加。
++ * 键盘遮挡批只加了容器内边距、获焦不会自动顶起，本组件补上后半段。
++ */
++@Composable
++fun SettingTextField(
++    value: String,
++    onValueChange: (String) -> Unit,
++    modifier: Modifier = Modifier,
++    enabled: Boolean = true,
++    readOnly: Boolean = false,
++    label: @Composable (() -> Unit)? = null,
++    placeholder: @Composable (() -> Unit)? = null,
++    leadingIcon: @Composable (() -> Unit)? = null,
++    trailingIcon: @Composable (() -> Unit)? = null,
++    supportingText: @Composable (() -> Unit)? = null,
++    isError: Boolean = false,
++    visualTransformation: VisualTransformation = VisualTransformation.None,
++    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
++    keyboardActions: KeyboardActions = KeyboardActions.Default,
++    singleLine: Boolean = false,
++    maxLines: Int = if (singleLine) 1 else Int.MAX_VALUE,
++    minLines: Int = 1,
++) {
++    OutlinedTextField(
++        value = value,
++        onValueChange = onValueChange,
++        modifier = modifier.bringIntoViewOnFocus(),
++        enabled = enabled,
++        readOnly = readOnly,
++        label = label,
++        placeholder = placeholder,
++        leadingIcon = leadingIcon,
++        trailingIcon = trailingIcon,
++        supportingText = supportingText,
++        isError = isError,
++        visualTransformation = visualTransformation,
++        keyboardOptions = keyboardOptions,
++        keyboardActions = keyboardActions,
++        singleLine = singleLine,
++        maxLines = maxLines,
++        minLines = minLines,
++    )
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingValidation.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingValidation.kt
+new file mode 100644
+index 000000000..a0263f934
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SettingValidation.kt
+@@ -0,0 +1,35 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import me.rerere.rikkahub.data.network.toProxyOrNull
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++
++/**
++ * 设置页共享校验函数。
++ *
++ * 各设置页原来散落的页面级校验纯函数收拢于此；新页面级校验函数也必须写进本文件，
++ * 不许写进页面文件（门禁 16-setting-validation 兜底）。
++ * 校验口径以各页原有行为为准，收拢只搬位置、不改语义。
++ */
++
++/** Web 桥端口校验：能解析为整数且在 1–65535 内（与 SSH 主机页同口径）。非法输入标红、不写库，连接按钮禁点。 */
++internal fun webBridgePortValid(text: String): Boolean {
++    val port = text.toIntOrNull() ?: return false
++    return port in 1..65535
++}
++
++/**
++ * 代理草稿可测试判定：能解析出有效代理地址才允许发起测试。
++ * 页内测试按钮与弹窗内测试按钮共用同一口径。
++ */
++internal fun canTestProxyUrl(draftUrl: String): Boolean = draftUrl.toProxyOrNull() != null
++
++/**
++ * DoH URL 有效性：必须是可解析的 https URL 且带 host。
++ * 只驱动 DNS 弹窗 DoH 字段的 isError（空值表示走默认、不标红）；测试按钮本身不拦截，
++ * 无效 URL 走测试请求失败弹 Toast 的原有路径——与 AppDnsResolver 经 OkHttp 使用该 URL 的
++ * 实际消费口径一致。
++ */
++internal fun dohUrlValid(url: String): Boolean {
++    val parsed = url.toHttpUrlOrNull() ?: return false
++    return parsed.scheme == "https" && parsed.host.isNotBlank()
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SshKeyPairDialog.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SshKeyPairDialog.kt
+index b7b92c895..d70f794dd 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SshKeyPairDialog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/setting/SshKeyPairDialog.kt
+@@ -8,8 +8,6 @@ import androidx.compose.foundation.layout.heightIn
+ import androidx.compose.foundation.layout.imePadding
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.rememberScrollState
+-import androidx.compose.foundation.relocation.BringIntoViewRequester
+-import androidx.compose.foundation.relocation.bringIntoViewRequester
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.MaterialTheme
+@@ -25,7 +23,6 @@ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.Modifier
+-import androidx.compose.ui.focus.onFocusChanged
+ import androidx.compose.ui.platform.LocalClipboardManager
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.unit.dp
+@@ -38,20 +35,6 @@ import me.rerere.rikkahub.data.vault.VaultKeyGenerator
+ import me.rerere.rikkahub.data.vault.VaultKeyType
+ import org.koin.compose.koinInject
+ 
+-/**
+- * 聚焦时把字段滚进可视范围（键盘弹出后不被遮挡）。
+- */
+-@Composable
+-private fun rememberBringIntoViewModifier(): Modifier {
+-    val requester = remember { BringIntoViewRequester() }
+-    val scope = rememberCoroutineScope()
+-    return Modifier
+-        .bringIntoViewRequester(requester)
+-        .onFocusChanged { state ->
+-            if (state.isFocused) scope.launch { requester.bringIntoView() }
+-        }
+-}
+-
+ /**
+  * 生成 SSH 密钥对并存入凭证库的通用对话框。
+  *
+@@ -110,21 +93,21 @@ fun SshKeyPairDialog(
+                         onValueChange = { name = it },
+                         label = { Text(stringResource(R.string.ssh_key_name_label)) },
+                         singleLine = true,
+-                        modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                        modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                     )
+                     OutlinedTextField(
+                         value = group,
+                         onValueChange = { group = it },
+                         label = { Text(stringResource(R.string.ssh_key_group_label)) },
+                         singleLine = true,
+-                        modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                        modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                     )
+                     OutlinedTextField(
+                         value = description,
+                         onValueChange = { description = it },
+                         label = { Text(stringResource(R.string.ssh_key_desc_label)) },
+                         singleLine = true,
+-                        modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                        modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                     )
+                     // 算法选择（三选一，FlowRow 换行防止按钮溢出屏幕）
+                     Text(stringResource(R.string.ssh_key_type_label), style = MaterialTheme.typography.labelMedium)
+@@ -164,7 +147,7 @@ fun SshKeyPairDialog(
+                             onValueChange = { uid = it },
+                             label = { Text(stringResource(identityLabel)) },
+                             singleLine = true,
+-                            modifier = Modifier.fillMaxWidth().then(rememberBringIntoViewModifier()),
++                            modifier = Modifier.fillMaxWidth().bringIntoViewOnFocus(),
+                         )
+                     }
+                     if (error != null) {
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/Input.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/Input.kt
+index cd9921079..e418ce23f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/Input.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/Input.kt
+@@ -15,6 +15,7 @@ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.text.input.KeyboardType
+ import me.rerere.rikkahub.data.log.AppLog
++import me.rerere.rikkahub.ui.components.setting.bringIntoViewOnFocus
+ 
+ private const val TAG = "Input"
+ 
+@@ -28,7 +29,7 @@ fun <T : Number> OutlinedNumberInput(
+ ) {
+     var textFieldValue by remember(value) { mutableStateOf(value.toString()) }
+     OutlinedTextField(
+-        modifier = modifier,
++        modifier = modifier.bringIntoViewOnFocus(),
+         value = textFieldValue,
+         onValueChange = { newValue ->
+             textFieldValue = newValue
+@@ -68,7 +69,7 @@ fun <T : Number> NumberInput(
+ ) {
+     var textFieldValue by remember(value) { mutableStateOf(value.toString()) }
+     TextField(
+-        modifier = modifier,
++        modifier = modifier.bringIntoViewOnFocus(),
+         value = textFieldValue,
+         onValueChange = { newValue ->
+             textFieldValue = newValue
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt
+index 4d16b50a1..a74d5ca03 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt
+@@ -28,6 +28,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.db.entity.VaultCredentialEntity
+ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+ import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
++import me.rerere.rikkahub.ui.components.setting.bringIntoViewOnFocus
+ import org.koin.compose.koinInject
+ 
+ /** 引用前缀：与运行时解析层（provider 密钥解析）保持一致。 */
+@@ -178,7 +179,7 @@ fun SecretRefField(
+                 }
+             }
+         },
+-        modifier = modifier.fillMaxWidth(),
++        modifier = modifier.fillMaxWidth().bringIntoViewOnFocus(),
+     )
+ 
+     if (showPicker) {
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingFilesPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingFilesPage.kt
+index a901df9c8..4a994e564 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingFilesPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingFilesPage.kt
+@@ -71,6 +71,9 @@ import me.rerere.rikkahub.data.db.entity.ManagedFileEntity
+ import me.rerere.rikkahub.data.files.FileFolders
+ import me.rerere.rikkahub.data.files.FilesManager
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.ConfirmDialogState
++import me.rerere.rikkahub.ui.components.setting.request
++import me.rerere.rikkahub.ui.components.setting.cleanDeleteButtonEnabled
+ import me.rerere.rikkahub.ui.context.LocalToaster
+ import me.rerere.rikkahub.ui.theme.CustomColors
+ import me.rerere.rikkahub.utils.fileSizeToString
+@@ -156,7 +159,7 @@ fun SettingFilesPage(filesManager: FilesManager = koinInject()) {
+     var showCleanSheet by remember { mutableStateOf(false) }
+     var selectedCleanRange by remember { mutableStateOf(CleanRange.DAYS_7) }
+     var pendingCleanPreview by remember { mutableStateOf<CleanPreview?>(null) }
+-    var pendingCleanAllConfirm by remember { mutableStateOf(false) }
++    val pendingCleanAllConfirm = remember { ConfirmDialogState<Unit>() }
+ 
+     // 清理真正执行：与预览同口径（见 cleanPreview），ALL 走 deleteAll。
+     fun doClean() {
+@@ -280,7 +283,7 @@ fun SettingFilesPage(filesManager: FilesManager = koinInject()) {
+                     onClick = {
+                         pendingCleanPreview = null
+                         if (selectedCleanRange == CleanRange.ALL) {
+-                            pendingCleanAllConfirm = true
++                            pendingCleanAllConfirm.request()
+                         } else {
+                             doClean()
+                         }
+@@ -297,15 +300,15 @@ fun SettingFilesPage(filesManager: FilesManager = koinInject()) {
+         )
+     }
+ 
+-    if (pendingCleanAllConfirm) {
++    if (pendingCleanAllConfirm.isShowing) {
+         AlertDialog(
+-            onDismissRequest = { pendingCleanAllConfirm = false },
++            onDismissRequest = { pendingCleanAllConfirm.dismiss() },
+             title = { Text(stringResource(R.string.setting_files_page_clean_title)) },
+             text = { Text(stringResource(R.string.setting_files_page_clean_confirmation)) },
+             confirmButton = {
+                 TextButton(
+                     onClick = {
+-                        pendingCleanAllConfirm = false
++                        pendingCleanAllConfirm.confirm()
+                         doClean()
+                     },
+                 ) {
+@@ -313,7 +316,7 @@ fun SettingFilesPage(filesManager: FilesManager = koinInject()) {
+                 }
+             },
+             dismissButton = {
+-                TextButton(onClick = { pendingCleanAllConfirm = false }) {
++                TextButton(onClick = { pendingCleanAllConfirm.dismiss() }) {
+                     Text(stringResource(R.string.setting_files_page_cancel_action))
+                 }
+             },
+@@ -538,7 +541,7 @@ private fun CleanFilesSheet(
+         )
+         TextButton(
+             onClick = onClean,
+-            enabled = preview.count > 0,
++            enabled = cleanDeleteButtonEnabled(preview.count),
+             modifier = Modifier
+                 .fillMaxWidth()
+                 .padding(top = 8.dp),
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt
+index ecbde7b7d..8240b024b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt
+@@ -13,7 +13,6 @@ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.FilterChip
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.RadioButton
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+@@ -35,6 +34,7 @@ import me.rerere.rikkahub.data.ai.tools.LocalToolCategory
+ import me.rerere.rikkahub.data.ai.tools.LocalToolOption
+ import me.rerere.rikkahub.data.vault.CredentialType
+ import me.rerere.rikkahub.ui.components.setting.NetworkAccessField
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
+ 
+@@ -68,8 +68,8 @@ internal fun LocalMcpProfileModal(
+                         .verticalScroll(rememberScrollState())
+                         .imePadding(),
+             ) {
+-                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(stringResource(R.string.mcp_page_name_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+-                OutlinedTextField(value = port, onValueChange = { port = it }, label = { Text(stringResource(R.string.mcp_page_port_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
++                SettingTextField(value = name, onValueChange = { name = it }, label = { Text(stringResource(R.string.mcp_page_name_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
++                SettingTextField(value = port, onValueChange = { port = it }, label = { Text(stringResource(R.string.mcp_page_port_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                 Text(stringResource(R.string.mcp_profile_listen_scope), style = MaterialTheme.typography.labelLarge)
+                 listOf(
+                     "loopback" to stringResource(R.string.net_scope_loopback),
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkDnsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkDnsPage.kt
+index 989e03b3a..5d32f83f6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkDnsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkDnsPage.kt
+@@ -54,6 +54,8 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.datastore.NetworkSetting
+ import me.rerere.rikkahub.data.network.AppDnsResolver
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.DraftState
++import me.rerere.rikkahub.ui.components.setting.dohUrlValid
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.context.LocalToaster
+@@ -62,18 +64,35 @@ import me.rerere.rikkahub.utils.plus
+ import me.rerere.workspace.ShellDnsConfig
+ import org.koin.androidx.compose.koinViewModel
+ 
++/** DNS 弹窗草稿：模式 + 各模式地址 + 回退 / IPv6 开关 + 测试域名（打开弹窗时从已保存值同步初始化，取消即丢弃）。 */
++internal data class DnsDraft(
++    val mode: String = NetworkSetting.DNS_MODE_SYSTEM,
++    val dohUrl: String = NetworkSetting.DEFAULT_DOH_URL,
++    val dotHost: String = NetworkSetting.DEFAULT_DOT_HOST,
++    val customServers: String = NetworkSetting.DEFAULT_BOOTSTRAP_SERVERS,
++    val fallbackToSystem: Boolean = true,
++    val enableIpv6: Boolean = false,
++    val testDomain: String = NetworkSetting.DEFAULT_DNS_TEST_DOMAIN,
++) {
++    companion object {
++        fun from(net: NetworkSetting) = DnsDraft(
++            mode = net.dnsMode,
++            dohUrl = net.dohUrl,
++            dotHost = net.dotHost,
++            customServers = net.customDnsServers,
++            fallbackToSystem = net.dnsFallbackToSystem,
++            enableIpv6 = net.dnsEnableIpv6,
++            testDomain = net.dnsTestDomain,
++        )
++    }
++}
++
+ @Composable
+ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+     val settings by vm.settings.collectAsStateWithLifecycle()
+     val net = settings.networkSetting
+     var dnsDialogVisible by remember { mutableStateOf(false) }
+-    var dnsModeDraft by remember { mutableStateOf(NetworkSetting.DNS_MODE_SYSTEM) }
+-    var dohUrlDraft by remember { mutableStateOf(NetworkSetting.DEFAULT_DOH_URL) }
+-    var dotHostDraft by remember { mutableStateOf(NetworkSetting.DEFAULT_DOT_HOST) }
+-    var customDnsDraft by remember { mutableStateOf(NetworkSetting.DEFAULT_BOOTSTRAP_SERVERS) }
+-    var dnsFallbackDraft by remember { mutableStateOf(true) }
+-    var dnsIpv6Draft by remember { mutableStateOf(false) }
+-    var dnsTestDomain by remember(net.dnsTestDomain) { mutableStateOf(net.dnsTestDomain) }
++    val dnsDraft = remember { DraftState(DnsDraft.from(net)) }
+     var dnsTesting by remember { mutableStateOf(false) }
+ 
+     val savedShellDnsMode = ShellDnsConfig.normalizeMode(settings.shellDnsMode)
+@@ -86,28 +105,23 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+     val toaster = LocalToaster.current
+ 
+     fun loadDnsDrafts() {
+-        dnsModeDraft = net.dnsMode
+-        dohUrlDraft = net.dohUrl
+-        dotHostDraft = net.dotHost
+-        customDnsDraft = net.customDnsServers
+-        dnsFallbackDraft = net.dnsFallbackToSystem
+-        dnsIpv6Draft = net.dnsEnableIpv6
+-        dnsTestDomain = net.dnsTestDomain
++        dnsDraft.load(DnsDraft.from(net))
+     }
+ 
+     fun saveDnsConfig() {
+         AppDnsResolver.invalidateCache()
++        val saved = dnsDraft.save()
+         vm.updateSettings { current ->
+             current.copy(
+                 networkSetting = buildDnsTestSetting(
+                     base = current.networkSetting,
+-                    mode = dnsModeDraft,
+-                    dohUrl = dohUrlDraft,
+-                    dotHost = dotHostDraft,
+-                    customServers = customDnsDraft,
+-                    fallbackToSystem = dnsFallbackDraft,
+-                    enableIpv6 = dnsIpv6Draft,
+-                    testDomain = dnsTestDomain,
++                    mode = saved.mode,
++                    dohUrl = saved.dohUrl,
++                    dotHost = saved.dotHost,
++                    customServers = saved.customServers,
++                    fallbackToSystem = saved.fallbackToSystem,
++                    enableIpv6 = saved.enableIpv6,
++                    testDomain = saved.testDomain,
+                 ),
+             )
+         }
+@@ -176,11 +190,11 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+     }
+ 
+     if (dnsDialogVisible) {
+-        val customServersInvalid = customDnsDraft.isNotBlank() &&
+-            AppDnsResolver.parseServerList(customDnsDraft).isEmpty()
++        val customServersInvalid = dnsDraft.draft.customServers.isNotBlank() &&
++            AppDnsResolver.parseServerList(dnsDraft.draft.customServers).isEmpty()
+         AlertDialog(
+             onDismissRequest = {
+-                loadDnsDrafts()
++                dnsDraft.discard()
+                 dnsDialogVisible = false
+             },
+             modifier = Modifier.imePadding(),
+@@ -208,14 +222,14 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                             NetworkSetting.DNS_MODE_CUSTOM to R.string.setting_page_preferences_network_dns_mode_custom,
+                         ).forEach { (modeKey, labelRes) ->
+                             FilterChip(
+-                                selected = dnsModeDraft == modeKey,
+-                                onClick = { dnsModeDraft = modeKey },
++                                selected = dnsDraft.draft.mode == modeKey,
++                                onClick = { dnsDraft.edit { it.copy(mode = modeKey) } },
+                                 label = { Text(stringResource(labelRes)) },
+                             )
+                         }
+                     }
+ 
+-                    if (dnsModeDraft != NetworkSetting.DNS_MODE_SYSTEM) {
++                    if (dnsDraft.draft.mode != NetworkSetting.DNS_MODE_SYSTEM) {
+                         Text(
+                             text = stringResource(R.string.setting_page_preferences_network_dns_presets),
+                             style = MaterialTheme.typography.labelMedium,
+@@ -226,17 +240,21 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                         ) {
+                             AppDnsResolver.PRESETS.forEach { preset ->
+-                                val selected = when (dnsModeDraft) {
+-                                    NetworkSetting.DNS_MODE_DOH -> dohUrlDraft.trim() == preset.dohUrl
+-                                    NetworkSetting.DNS_MODE_DOT -> dotHostDraft.trim() == preset.dotHost
+-                                    else -> customDnsDraft.trim() == preset.bootstrapIps
++                                val selected = when (dnsDraft.draft.mode) {
++                                    NetworkSetting.DNS_MODE_DOH -> dnsDraft.draft.dohUrl.trim() == preset.dohUrl
++                                    NetworkSetting.DNS_MODE_DOT -> dnsDraft.draft.dotHost.trim() == preset.dotHost
++                                    else -> dnsDraft.draft.customServers.trim() == preset.bootstrapIps
+                                 }
+                                 FilterChip(
+                                     selected = selected,
+                                     onClick = {
+-                                        dohUrlDraft = preset.dohUrl
+-                                        dotHostDraft = preset.dotHost
+-                                        customDnsDraft = preset.bootstrapIps
++                                        dnsDraft.edit {
++                                            it.copy(
++                                                dohUrl = preset.dohUrl,
++                                                dotHost = preset.dotHost,
++                                                customServers = preset.bootstrapIps,
++                                            )
++                                        }
+                                     },
+                                     label = { Text(preset.label) },
+                                 )
+@@ -244,24 +262,25 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                         }
+                     }
+ 
+-                    if (dnsModeDraft == NetworkSetting.DNS_MODE_DOH) {
++                    if (dnsDraft.draft.mode == NetworkSetting.DNS_MODE_DOH) {
+                         OutlinedTextField(
+-                            value = dohUrlDraft,
+-                            onValueChange = { dohUrlDraft = it },
++                            value = dnsDraft.draft.dohUrl,
++                            onValueChange = { newValue -> dnsDraft.edit { it.copy(dohUrl = newValue) } },
+                             modifier = Modifier.fillMaxWidth(),
+                             label = {
+                                 Text(stringResource(R.string.setting_page_preferences_network_dns_doh_url))
+                             },
+                             placeholder = { Text(NetworkSetting.DEFAULT_DOH_URL) },
++                            isError = dnsDraft.draft.dohUrl.isNotBlank() && !dohUrlValid(dnsDraft.draft.dohUrl),
+                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                             singleLine = true,
+                         )
+                     }
+ 
+-                    if (dnsModeDraft == NetworkSetting.DNS_MODE_DOT) {
++                    if (dnsDraft.draft.mode == NetworkSetting.DNS_MODE_DOT) {
+                         OutlinedTextField(
+-                            value = dotHostDraft,
+-                            onValueChange = { dotHostDraft = it },
++                            value = dnsDraft.draft.dotHost,
++                            onValueChange = { newValue -> dnsDraft.edit { it.copy(dotHost = newValue) } },
+                             modifier = Modifier.fillMaxWidth(),
+                             label = {
+                                 Text(stringResource(R.string.setting_page_preferences_network_dns_dot_host))
+@@ -272,10 +291,10 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                         )
+                     }
+ 
+-                    if (dnsModeDraft != NetworkSetting.DNS_MODE_SYSTEM) {
++                    if (dnsDraft.draft.mode != NetworkSetting.DNS_MODE_SYSTEM) {
+                         OutlinedTextField(
+-                            value = customDnsDraft,
+-                            onValueChange = { customDnsDraft = it },
++                            value = dnsDraft.draft.customServers,
++                            onValueChange = { newValue -> dnsDraft.edit { it.copy(customServers = newValue) } },
+                             modifier = Modifier.fillMaxWidth(),
+                             label = {
+                                 Text(stringResource(R.string.setting_page_preferences_network_dns_custom_servers))
+@@ -308,8 +327,8 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                                 modifier = Modifier.weight(1f),
+                             )
+                             Switch(
+-                                checked = dnsFallbackDraft,
+-                                onCheckedChange = { dnsFallbackDraft = it },
++                                checked = dnsDraft.draft.fallbackToSystem,
++                                onCheckedChange = { newValue -> dnsDraft.edit { it.copy(fallbackToSystem = newValue) } },
+                             )
+                         }
+ 
+@@ -324,15 +343,15 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                                 modifier = Modifier.weight(1f),
+                             )
+                             Switch(
+-                                checked = dnsIpv6Draft,
+-                                onCheckedChange = { dnsIpv6Draft = it },
++                                checked = dnsDraft.draft.enableIpv6,
++                                onCheckedChange = { newValue -> dnsDraft.edit { it.copy(enableIpv6 = newValue) } },
+                             )
+                         }
+                     }
+ 
+                     OutlinedTextField(
+-                        value = dnsTestDomain,
+-                        onValueChange = { dnsTestDomain = it },
++                        value = dnsDraft.draft.testDomain,
++                        onValueChange = { newValue -> dnsDraft.edit { it.copy(testDomain = newValue) } },
+                         modifier = Modifier.fillMaxWidth(),
+                         label = {
+                             Text(stringResource(R.string.setting_page_preferences_network_dns_test_domain))
+@@ -351,13 +370,13 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                                 testDns(
+                                     buildDnsTestSetting(
+                                         base = net,
+-                                        mode = dnsModeDraft,
+-                                        dohUrl = dohUrlDraft,
+-                                        dotHost = dotHostDraft,
+-                                        customServers = customDnsDraft,
+-                                        fallbackToSystem = dnsFallbackDraft,
+-                                        enableIpv6 = dnsIpv6Draft,
+-                                        testDomain = dnsTestDomain,
++                                        mode = dnsDraft.draft.mode,
++                                        dohUrl = dnsDraft.draft.dohUrl,
++                                        dotHost = dnsDraft.draft.dotHost,
++                                        customServers = dnsDraft.draft.customServers,
++                                        fallbackToSystem = dnsDraft.draft.fallbackToSystem,
++                                        enableIpv6 = dnsDraft.draft.enableIpv6,
++                                        testDomain = dnsDraft.draft.testDomain,
+                                     ),
+                                 )
+                             },
+@@ -389,7 +408,7 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+             dismissButton = {
+                 TextButton(
+                     onClick = {
+-                        loadDnsDrafts()
++                        dnsDraft.discard()
+                         dnsDialogVisible = false
+                     },
+                 ) {
+@@ -472,7 +491,7 @@ fun SettingNetworkDnsPage(vm: SettingVM = koinViewModel()) {
+                             Text(stringResource(R.string.setting_provider_page_test_connection))
+                         },
+                         supportingContent = {
+-                            Text(dnsTestDomain.ifBlank { NetworkSetting.DEFAULT_DNS_TEST_DOMAIN })
++                            Text(net.dnsTestDomain.ifBlank { NetworkSetting.DEFAULT_DNS_TEST_DOMAIN })
+                         },
+                         trailingContent = {
+                             TextButton(
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkHostOverridesPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkHostOverridesPage.kt
+index 60d7e3730..e35e9ee55 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkHostOverridesPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkHostOverridesPage.kt
+@@ -43,6 +43,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.datastore.HostAddressOverride
+ import me.rerere.rikkahub.data.network.parseFixedAddress
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.DraftState
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.theme.CustomColors
+@@ -54,7 +55,7 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+     val settings by vm.settings.collectAsStateWithLifecycle()
+     val net = settings.networkSetting
+     var hostOverrideDialogVisible by remember { mutableStateOf(false) }
+-    var hostOverrideDrafts by remember { mutableStateOf(emptyList<HostAddressOverride>()) }
++    val hostOverrideDrafts = remember { DraftState(emptyList<HostAddressOverride>()) }
+     var hostOverrideHostDraft by remember { mutableStateOf("") }
+     var hostOverrideAddressDraft by remember { mutableStateOf("") }
+     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+@@ -72,7 +73,10 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+             hostOverrideHostDraft.isNotBlank() &&
+                 parseFixedAddress(hostOverrideAddressDraft) != null
+         AlertDialog(
+-            onDismissRequest = { hostOverrideDialogVisible = false },
++            onDismissRequest = {
++                hostOverrideDrafts.discard()
++                hostOverrideDialogVisible = false
++            },
+             modifier = Modifier.imePadding(),
+             title = {
+                 Text(stringResource(R.string.setting_page_preferences_network_host_overrides))
+@@ -82,14 +86,14 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+                     modifier = Modifier.verticalScroll(rememberScrollState()),
+                     verticalArrangement = Arrangement.spacedBy(8.dp),
+                 ) {
+-                    if (hostOverrideDrafts.isEmpty()) {
++                    if (hostOverrideDrafts.draft.isEmpty()) {
+                         Text(
+                             stringResource(
+                                 R.string.setting_page_preferences_network_host_overrides_empty,
+                             )
+                         )
+                     }
+-                    hostOverrideDrafts.forEachIndexed { index, entry ->
++                    hostOverrideDrafts.draft.forEachIndexed { index, entry ->
+                         Row(
+                             modifier = Modifier.fillMaxWidth(),
+                             verticalAlignment = Alignment.CenterVertically,
+@@ -101,16 +105,17 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+                             Switch(
+                                 checked = entry.enabled,
+                                 onCheckedChange = { checked ->
+-                                    hostOverrideDrafts =
+-                                        hostOverrideDrafts.mapIndexed { i, item ->
++                                    hostOverrideDrafts.edit { current ->
++                                        current.mapIndexed { i, item ->
+                                             if (i == index) item.copy(enabled = checked) else item
+                                         }
++                                    }
+                                 },
+                             )
+                             IconButton(
+                                 onClick = {
+-                                    hostOverrideDrafts = hostOverrideDrafts.filterIndexed { i, _ ->
+-                                        i != index
++                                    hostOverrideDrafts.edit { current ->
++                                        current.filterIndexed { i, _ -> i != index }
+                                     }
+                                 },
+                             ) {
+@@ -161,10 +166,12 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+                     )
+                     TextButton(
+                         onClick = {
+-                            hostOverrideDrafts = hostOverrideDrafts + HostAddressOverride(
+-                                host = hostOverrideHostDraft.trim(),
+-                                address = hostOverrideAddressDraft.trim(),
+-                            )
++                            hostOverrideDrafts.edit { current ->
++                                current + HostAddressOverride(
++                                    host = hostOverrideHostDraft.trim(),
++                                    address = hostOverrideAddressDraft.trim(),
++                                )
++                            }
+                             hostOverrideHostDraft = ""
+                             hostOverrideAddressDraft = ""
+                         },
+@@ -182,7 +189,7 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+             confirmButton = {
+                 TextButton(
+                     onClick = {
+-                        saveHostAddressOverrides(resolveHostOverridesToSave(hostOverrideDrafts))
++                        saveHostAddressOverrides(resolveHostOverridesToSave(hostOverrideDrafts.save()))
+                         hostOverrideDialogVisible = false
+                     },
+                 ) {
+@@ -190,7 +197,12 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+                 }
+             },
+             dismissButton = {
+-                TextButton(onClick = { hostOverrideDialogVisible = false }) {
++                TextButton(
++                    onClick = {
++                        hostOverrideDrafts.discard()
++                        hostOverrideDialogVisible = false
++                    },
++                ) {
+                     Text(stringResource(R.string.common_cancel))
+                 }
+             },
+@@ -226,7 +238,7 @@ fun SettingNetworkHostOverridesPage(vm: SettingVM = koinViewModel()) {
+                 ) {
+                     item(
+                         onClick = {
+-                            hostOverrideDrafts = vm.settings.value.networkSetting.hostAddressOverrides
++                            hostOverrideDrafts.load(net.hostAddressOverrides)
+                             hostOverrideHostDraft = ""
+                             hostOverrideAddressDraft = ""
+                             hostOverrideDialogVisible = true
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyPage.kt
+index d36210363..281956aec 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyPage.kt
+@@ -45,8 +45,11 @@ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.ArrowRight01
+ import me.rerere.hugeicons.stroke.Router
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.datastore.NetworkSetting
+ import me.rerere.rikkahub.data.network.toProxyOrNull
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.DraftState
++import me.rerere.rikkahub.ui.components.setting.canTestProxyUrl
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
+@@ -62,6 +65,17 @@ import java.util.concurrent.TimeUnit
+ 
+ private const val PROXY_TEST_URL = "https://www.google.com/generate_204"
+ 
++/** 代理弹窗草稿：URL + 认证（打开弹窗时从已保存值同步初始化，取消即丢弃）。 */
++internal data class ProxyDraft(
++    val url: String = "",
++    val username: String = "",
++    val password: String = "",
++) {
++    companion object {
++        fun from(net: NetworkSetting) = ProxyDraft(net.proxyUrl, net.proxyUsername, net.proxyPassword)
++    }
++}
++
+ @Composable
+ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+     val httpClient = koinInject<OkHttpClient>()
+@@ -76,12 +90,10 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+     var proxyPassword by remember(net.proxyPassword) {
+         mutableStateOf(net.proxyPassword)
+     }
+-    var proxyUrlDraft by remember { mutableStateOf("") }
+-    var proxyUsernameDraft by remember { mutableStateOf("") }
+-    var proxyPasswordDraft by remember { mutableStateOf("") }
++    val proxyDraft = remember { DraftState(ProxyDraft.from(net)) }
+     var proxyPasswordVisible by remember { mutableStateOf(false) }
+     var proxyDialogVisible by remember { mutableStateOf(false) }
+-    val proxyUrlInvalid = proxyUrlDraft.isNotBlank() && proxyUrlDraft.toProxyOrNull() == null
++    val proxyUrlInvalid = proxyDraft.draft.url.isNotBlank() && !canTestProxyUrl(proxyDraft.draft.url)
+     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+     val scope = rememberCoroutineScope()
+     val resources = LocalResources.current
+@@ -89,28 +101,25 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+     var proxyTesting by remember { mutableStateOf(false) }
+ 
+     fun loadProxyDrafts() {
+-        proxyUrlDraft = proxyUrl
+-        proxyUsernameDraft = proxyUsername
+-        proxyPasswordDraft = proxyPassword
++        proxyDraft.load(ProxyDraft(proxyUrl, proxyUsername, proxyPassword))
+         proxyPasswordVisible = false
+     }
+ 
+     fun saveProxy() {
++        val saved = proxyDraft.save()
+         vm.updateSettings { current ->
+             current.copy(
+                 networkSetting = current.networkSetting.copy(
+-                    proxyUrl = proxyUrlDraft,
+-                    proxyUsername = proxyUsernameDraft,
+-                    proxyPassword = proxyPasswordDraft,
++                    proxyUrl = saved.url,
++                    proxyUsername = saved.username,
++                    proxyPassword = saved.password,
+                 ),
+             )
+         }
+     }
+ 
+     fun resetProxy() {
+-        proxyUrlDraft = ""
+-        proxyUsernameDraft = ""
+-        proxyPasswordDraft = ""
++        proxyDraft.edit(ProxyDraft())
+     }
+ 
+     fun testProxy(urlToTest: String = proxyUrl) {
+@@ -159,7 +168,7 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+     if (proxyDialogVisible) {
+         AlertDialog(
+             onDismissRequest = {
+-                loadProxyDrafts()
++                proxyDraft.discard()
+                 proxyDialogVisible = false
+             },
+             modifier = Modifier.imePadding(),
+@@ -172,8 +181,8 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+                     verticalArrangement = Arrangement.spacedBy(8.dp),
+                 ) {
+                     OutlinedTextField(
+-                        value = proxyUrlDraft,
+-                        onValueChange = { proxyUrlDraft = it },
++                        value = proxyDraft.draft.url,
++                        onValueChange = { newValue -> proxyDraft.edit { it.copy(url = newValue) } },
+                         modifier = Modifier.fillMaxWidth(),
+                         label = {
+                             Text(stringResource(R.string.setting_page_preferences_network_proxy))
+@@ -195,15 +204,15 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+                         singleLine = true,
+                     )
+                     OutlinedTextField(
+-                        value = proxyUsernameDraft,
+-                        onValueChange = { proxyUsernameDraft = it },
++                        value = proxyDraft.draft.username,
++                        onValueChange = { newValue -> proxyDraft.edit { it.copy(username = newValue) } },
+                         modifier = Modifier.fillMaxWidth(),
+                         label = { Text(stringResource(R.string.backup_page_username)) },
+                         singleLine = true,
+                     )
+                     SecretRefField(
+-                        value = proxyPasswordDraft,
+-                        onValueChange = { proxyPasswordDraft = it },
++                        value = proxyDraft.draft.password,
++                        onValueChange = { newValue -> proxyDraft.edit { it.copy(password = newValue) } },
+                         label = stringResource(R.string.backup_page_password),
+                         nameHint = "PROXY_PASSWORD",
+                         singleLine = true,
+@@ -214,8 +223,8 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+                         verticalAlignment = Alignment.CenterVertically,
+                     ) {
+                         TextButton(
+-                            onClick = { testProxy(proxyUrlDraft) },
+-                            enabled = canTestProxyUrl(proxyUrlDraft) && !proxyTesting,
++                            onClick = { testProxy(proxyDraft.draft.url) },
++                            enabled = canTestProxyUrl(proxyDraft.draft.url) && !proxyTesting,
+                         ) {
+                             if (proxyTesting) {
+                                 CircularProgressIndicator(
+@@ -228,9 +237,9 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+                         }
+                         TextButton(
+                             onClick = ::resetProxy,
+-                            enabled = proxyUrlDraft.isNotEmpty() ||
+-                                proxyUsernameDraft.isNotEmpty() ||
+-                                proxyPasswordDraft.isNotEmpty(),
++                            enabled = proxyDraft.draft.url.isNotEmpty() ||
++                                proxyDraft.draft.username.isNotEmpty() ||
++                                proxyDraft.draft.password.isNotEmpty(),
+                         ) {
+                             Text(stringResource(R.string.setting_model_page_reset_to_default))
+                         }
+@@ -251,7 +260,7 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+             dismissButton = {
+                 TextButton(
+                     onClick = {
+-                        loadProxyDrafts()
++                        proxyDraft.discard()
+                         proxyDialogVisible = false
+                     },
+                 ) {
+@@ -342,9 +351,3 @@ fun SettingNetworkProxyPage(vm: SettingVM = koinViewModel()) {
+         }
+     }
+ }
+-
+-/**
+- * 代理草稿是否可测试：能解析出有效代理地址才允许发起测试。
+- * 页内测试按钮与弹窗内测试按钮共用同一口径。
+- */
+-internal fun canTestProxyUrl(draftUrl: String): Boolean = draftUrl.toProxyOrNull() != null
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
+index 5a6e5330f..306a11f01 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
+@@ -31,7 +31,6 @@ import androidx.compose.material3.LinearWavyProgressIndicator
+ import androidx.compose.material3.ListItemDefaults
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.ModalBottomSheet
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.SheetValue
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+@@ -75,6 +74,7 @@ import me.rerere.rikkahub.ui.components.ui.ConnectedMultiChoiceButtons
+ import me.rerere.rikkahub.ui.components.ui.PagerTab
+ import me.rerere.rikkahub.ui.components.ui.PagerTabs
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.hooks.useEditState
+ import me.rerere.rikkahub.ui.pages.assistant.detail.CustomBodies
+ import me.rerere.rikkahub.ui.pages.assistant.detail.CustomHeaders
+@@ -137,7 +137,7 @@ internal fun ModelSettingsForm(
+                                 .padding(vertical = 16.dp)
+                                 .verticalScroll(rememberScrollState()),
+                     ) {
+-                        OutlinedTextField(
++                        SettingTextField(
+                             value = model.modelId,
+                             onValueChange = {
+                                 if (!isEdit) {
+@@ -160,7 +160,7 @@ internal fun ModelSettingsForm(
+                             },
+                         )
+ 
+-                        OutlinedTextField(
++                        SettingTextField(
+                             value = model.displayName,
+                             onValueChange = {
+                                 onModelChange(model.copy(displayName = it))
+@@ -656,7 +656,7 @@ internal fun ModelPicker(
+                     }
+                     }
+                 }
+-                OutlinedTextField(
++                SettingTextField(
+                     value = filterText,
+                     onValueChange = {
+                         filterText = it
+@@ -795,7 +795,7 @@ private fun ModelContextWindowEditor(
+             Text(stringResource(R.string.setting_provider_page_context_window_unknown))
+         }
+     }
+-    OutlinedTextField(
++    SettingTextField(
+         value = customValue,
+         onValueChange = { raw ->
+             customValue = raw.filter(Char::isDigit)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchDetailPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchDetailPage.kt
+index 745d27565..5fdd1f19c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchDetailPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchDetailPage.kt
+@@ -43,6 +43,8 @@ import me.rerere.hugeicons.stroke.Delete01
+ import me.rerere.hugeicons.stroke.Play
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.ConfirmDialogState
++import me.rerere.rikkahub.ui.components.setting.request
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.FormItem
+ import me.rerere.rikkahub.ui.components.ui.RikkaDeleteConfirmDialog
+@@ -71,7 +73,7 @@ fun SettingSearchDetailPage(
+     val service = settings.searchServices.find { it.id == serviceId } ?: return
+     val serviceIndex = settings.searchServices.indexOf(service)
+     var options by remember(service) { mutableStateOf(service) }
+-    var pendingDelete by remember { mutableStateOf(false) }
++    val pendingDelete = remember { ConfirmDialogState<Unit>() }
+ 
+     fun save(updated: SearchServiceOptions) {
+         options = updated
+@@ -94,7 +96,7 @@ fun SettingSearchDetailPage(
+                 actions = {
+                     if (settings.searchServices.size > 1) {
+                         IconButton(
+-                            onClick = { pendingDelete = true },
++                            onClick = { pendingDelete.request() },
+                         ) {
+                             Icon(
+                                 imageVector = HugeIcons.Delete01,
+@@ -143,11 +145,11 @@ fun SettingSearchDetailPage(
+     }
+ 
+     RikkaDeleteConfirmDialog(
+-        show = pendingDelete,
++        show = pendingDelete.isShowing,
+         title = stringResource(R.string.setting_page_search_delete_provider),
+         message = stringResource(R.string.common_delete_confirm_message, options.displayName),
+         onConfirm = {
+-            pendingDelete = false
++            pendingDelete.confirm()
+             vm.updateSettings { current ->
+                 if (current.searchServices.size > 1) {
+                     current.copy(searchServices = current.searchServices.filterNot { it.id == serviceId })
+@@ -155,7 +157,7 @@ fun SettingSearchDetailPage(
+             }
+             nav.popBackStack()
+         },
+-        onDismiss = { pendingDelete = false },
++        onDismiss = { pendingDelete.dismiss() },
+     )
+ }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchPage.kt
+index faff2f171..a4cc33f6e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSearchPage.kt
+@@ -50,6 +50,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.data.log.AppLog
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.ConfirmDialogState
+ import me.rerere.rikkahub.ui.components.ui.AutoAIIcon
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.RikkaDeleteConfirmDialog
+@@ -77,7 +78,7 @@ fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
+     val scope = rememberCoroutineScope()
+     val nav = LocalNavController.current
+     var showAddDialog by remember { mutableStateOf(false) }
+-    var pendingDelete by remember { mutableStateOf<SearchServiceOptions?>(null) }
++    val pendingDelete = remember { ConfirmDialogState<SearchServiceOptions>() }
+ 
+     Scaffold(
+         topBar = {
+@@ -137,7 +138,7 @@ fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
+                         onEdit = {
+                             nav.navigate(Screen.SettingSearchDetail(service.id.toString()))
+                         },
+-                        onDelete = { pendingDelete = service },
++                        onDelete = { pendingDelete.request(service) },
+                         canDelete = settings.searchServices.size > 1,
+                         modifier =
+                             Modifier
+@@ -188,19 +189,18 @@ fun SettingSearchPage(vm: SettingVM = koinViewModel()) {
+     }
+ 
+     RikkaDeleteConfirmDialog(
+-        show = pendingDelete != null,
++        show = pendingDelete.isShowing,
+         title = stringResource(R.string.setting_page_search_delete_provider),
+-        message = stringResource(R.string.common_delete_confirm_message, pendingDelete?.displayName.orEmpty()),
++        message = stringResource(R.string.common_delete_confirm_message, pendingDelete.pending?.displayName.orEmpty()),
+         onConfirm = {
+-            val target = pendingDelete
+-            pendingDelete = null
++            val target = pendingDelete.confirm()
+             if (target != null && settings.searchServices.size > 1) {
+                 vm.updateSettings { current ->
+                     current.copy(searchServices = current.searchServices.filterNot { it.id == target.id })
+                 }
+             }
+         },
+-        onDismiss = { pendingDelete = null },
++        onDismiss = { pendingDelete.dismiss() },
+     )
+ }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt
+index 3787103e7..96265d0c5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt
+@@ -17,7 +17,6 @@ import androidx.compose.material3.ButtonDefaults
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedButton
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.SegmentedButton
+ import androidx.compose.material3.SegmentedButtonDefaults
+ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+@@ -47,6 +46,8 @@ import me.rerere.rikkahub.data.datastore.SshPlatform
+ import me.rerere.rikkahub.data.db.entity.SshHostEntity
+ import me.rerere.rikkahub.data.vault.CredentialType
+ import me.rerere.rikkahub.ui.components.setting.SshKeyPairDialog
++import me.rerere.rikkahub.ui.components.setting.sshKeyChoiceAvailability
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
+ import me.rerere.rikkahub.ui.components.vault.VaultCredentialPickerDialog
+ 
+@@ -84,6 +85,7 @@ internal fun SshHostEditDialog(
+     LaunchedEffect(Unit) { vaultEntries = vaultRepo.getAll() }
+     val serverTemplates = vaultEntries.filter { it.grp == "server" }
+     val keyCandidates = vaultEntries.filter { it.grp == "SSH" }
++    val keyChoice = sshKeyChoiceAvailability(serverTemplates.isNotEmpty(), keyCandidates.isNotEmpty())
+ 
+     AlertDialog(
+         onDismissRequest = onDismiss,
+@@ -93,7 +95,7 @@ internal fun SshHostEditDialog(
+                 modifier = Modifier.verticalScroll(rememberScrollState()).imePadding(),
+                 verticalArrangement = Arrangement.spacedBy(10.dp),
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = name,
+                     onValueChange = { name = it },
+                     label = { Text(stringResource(R.string.setting_ssh_host_name)) },
+@@ -108,7 +110,7 @@ internal fun SshHostEditDialog(
+                     modifier = Modifier.fillMaxWidth(),
+                     horizontalArrangement = Arrangement.spacedBy(8.dp),
+                 ) {
+-                    OutlinedTextField(
++                    SettingTextField(
+                         value = host,
+                         onValueChange = { host = it },
+                         label = { Text(stringResource(R.string.setting_ssh_host_addr)) },
+@@ -119,7 +121,7 @@ internal fun SshHostEditDialog(
+                         },
+                         modifier = Modifier.weight(0.60f),
+                     )
+-                    OutlinedTextField(
++                    SettingTextField(
+                         value = port,
+                         onValueChange = { port = it.filter { ch -> ch.isDigit() } },
+                         label = { Text(stringResource(R.string.setting_ssh_host_port)) },
+@@ -132,7 +134,7 @@ internal fun SshHostEditDialog(
+                         modifier = Modifier.weight(0.40f),
+                     )
+                 }
+-                OutlinedTextField(
++                SettingTextField(
+                     value = user,
+                     onValueChange = { user = it },
+                     label = { Text(stringResource(R.string.setting_ssh_host_user)) },
+@@ -211,12 +213,12 @@ internal fun SshHostEditDialog(
+                 // “从模板新建”始终显示：空库时置灰并注明原因，否则用户根本不知道有模板功能。
+                 OutlinedButton(
+                     onClick = { showTemplatePicker = true },
+-                    enabled = serverTemplates.isNotEmpty(),
++                    enabled = keyChoice.templateEnabled,
+                     modifier = Modifier.fillMaxWidth(),
+                 ) {
+                     Text(stringResource(R.string.setting_ssh_from_template))
+                 }
+-                if (serverTemplates.isEmpty()) {
++                if (keyChoice.templateHintVisible) {
+                     Text(
+                         text = stringResource(R.string.setting_ssh_no_saved_template_hint),
+                         style = MaterialTheme.typography.bodySmall,
+@@ -271,7 +273,7 @@ internal fun SshHostEditDialog(
+                 ) {
+                     OutlinedButton(
+                         onClick = { showVaultPicker = true },
+-                        enabled = keyCandidates.isNotEmpty(),
++                        enabled = keyChoice.vaultPickEnabled,
+                         modifier = Modifier.weight(1f),
+                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                     ) {
+@@ -305,7 +307,7 @@ internal fun SshHostEditDialog(
+                         )
+                     }
+                 }
+-                if (keyCandidates.isEmpty()) {
++                if (keyChoice.vaultHintVisible) {
+                     Text(
+                         text = stringResource(R.string.setting_ssh_no_saved_key_hint),
+                         style = MaterialTheme.typography.bodySmall,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSubAgentsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSubAgentsPage.kt
+index 93b8b0263..a22c04b0e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSubAgentsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSubAgentsPage.kt
+@@ -28,7 +28,6 @@ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.ModalBottomSheet
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.SheetValue
+ import androidx.compose.material3.Switch
+@@ -78,6 +77,7 @@ import me.rerere.rikkahub.ui.components.ui.FormItem
+ import me.rerere.rikkahub.ui.components.ui.Tag
+ import me.rerere.rikkahub.ui.components.ui.TagType
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.hooks.useEditState
+ import me.rerere.rikkahub.ui.theme.CustomColors
+ import me.rerere.rikkahub.utils.plus
+@@ -441,7 +441,7 @@ private fun SubAgentProfileEditSheet(
+                     .verticalScroll(rememberScrollState()),
+                 verticalArrangement = Arrangement.spacedBy(16.dp),
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = profile.name,
+                     onValueChange = { onEdit(profile.copy(name = it)) },
+                     label = { Text(stringResource(R.string.setting_sub_agents_page_name)) },
+@@ -453,7 +453,7 @@ private fun SubAgentProfileEditSheet(
+                     modifier = Modifier.fillMaxWidth(),
+                 )
+ 
+-                OutlinedTextField(
++                SettingTextField(
+                     value = profile.description,
+                     onValueChange = { onEdit(profile.copy(description = it)) },
+                     label = { Text(stringResource(R.string.setting_sub_agents_page_description)) },
+@@ -518,7 +518,7 @@ private fun SubAgentProfileEditSheet(
+                     description = { Text(stringResource(R.string.setting_sub_agents_page_tools_desc)) },
+                     content = {
+                         Column(modifier = Modifier.fillMaxWidth()) {
+-                            OutlinedTextField(
++                            SettingTextField(
+                                 value = profile.toolScope?.joinToString(", ") ?: "",
+                                 onValueChange = { raw ->
+                                     val parsed = raw.split(',', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+@@ -552,7 +552,7 @@ private fun SubAgentProfileEditSheet(
+                     },
+                 )
+ 
+-                OutlinedTextField(
++                SettingTextField(
+                     value = profile.systemPrompt,
+                     onValueChange = { onEdit(profile.copy(systemPrompt = it)) },
+                     label = { Text(stringResource(R.string.setting_sub_agents_page_system_prompt)) },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingThemePage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingThemePage.kt
+index a262e739a..ead233018 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingThemePage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingThemePage.kt
+@@ -34,7 +34,6 @@ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.ListItem
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.ModalBottomSheet
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.SheetValue
+ import androidx.compose.material3.Text
+@@ -75,6 +74,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.context.LocalToaster
+ import me.rerere.rikkahub.ui.pages.setting.components.PresetThemeButtonGroup
+ import me.rerere.rikkahub.ui.theme.CustomColors
+@@ -425,7 +425,7 @@ private fun CustomThemeEditSheet(
+                         .verticalScroll(rememberScrollState()),
+                 verticalArrangement = Arrangement.spacedBy(16.dp),
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = currentTheme.name,
+                     onValueChange = { currentTheme = currentTheme.copy(name = it) },
+                     label = { Text(stringResource(R.string.setting_theme_page_theme_name)) },
+@@ -517,7 +517,7 @@ private fun ImportThemeDialog(
+                 modifier = Modifier.verticalScroll(rememberScrollState()).imePadding(),
+                 verticalArrangement = Arrangement.spacedBy(8.dp),
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = jsonText,
+                     onValueChange = {
+                         jsonText = it
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolApprovalsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolApprovalsPage.kt
+index a9207433a..b0ebc5cf0 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolApprovalsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolApprovalsPage.kt
+@@ -45,6 +45,8 @@ import me.rerere.rikkahub.data.preferences.ToolApprovalPreferences
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.service.LocalMcpServerService
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.ConfirmDialogState
++import me.rerere.rikkahub.ui.components.setting.request
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.RikkaConfirmDialog
+ import me.rerere.rikkahub.ui.theme.CustomColors
+@@ -77,8 +79,8 @@ fun SettingToolApprovalsPage() {
+     val scope = rememberCoroutineScope()
+ 
+     var pendingYoloEnable by remember { mutableStateOf(false) }
+-    var pendingRevoke by remember { mutableStateOf<String?>(null) }
+-    var pendingRevokeAll by remember { mutableStateOf(false) }
++    val pendingRevoke = remember { ConfirmDialogState<String>() }
++    val pendingRevokeAll = remember { ConfirmDialogState<Unit>() }
+     if (pendingYoloEnable) {
+         AlertDialog(
+             onDismissRequest = { pendingYoloEnable = false },
+@@ -111,32 +113,31 @@ fun SettingToolApprovalsPage() {
+     }
+ 
+     RikkaConfirmDialog(
+-        show = pendingRevoke != null,
++        show = pendingRevoke.isShowing,
+         title = stringResource(R.string.setting_page_tool_approvals_revoke_confirm_title),
+         confirmText = stringResource(R.string.setting_page_tool_approvals_revoke),
+         dismissText = stringResource(R.string.common_cancel),
+         onConfirm = {
+-            val target = pendingRevoke
+-            pendingRevoke = null
++            val target = pendingRevoke.confirm()
+             if (target != null) {
+                 scope.launch { prefs.revoke(target) }
+             }
+         },
+-        onDismiss = { pendingRevoke = null },
++        onDismiss = { pendingRevoke.dismiss() },
+     ) {
+-        Text(stringResource(R.string.setting_page_tool_approvals_revoke_confirm_message, pendingRevoke.orEmpty()))
++        Text(stringResource(R.string.setting_page_tool_approvals_revoke_confirm_message, pendingRevoke.pending.orEmpty()))
+     }
+ 
+     RikkaConfirmDialog(
+-        show = pendingRevokeAll,
++        show = pendingRevokeAll.isShowing,
+         title = stringResource(R.string.setting_page_tool_approvals_revoke_all_confirm_title),
+         confirmText = stringResource(R.string.setting_page_tool_approvals_revoke_all),
+         dismissText = stringResource(R.string.common_cancel),
+         onConfirm = {
+-            pendingRevokeAll = false
++            pendingRevokeAll.confirm()
+             scope.launch { prefs.revokeAll() }
+         },
+-        onDismiss = { pendingRevokeAll = false },
++        onDismiss = { pendingRevokeAll.dismiss() },
+     ) {
+         Text(stringResource(R.string.setting_page_tool_approvals_revoke_all_confirm_message, granted.size))
+     }
+@@ -324,7 +325,7 @@ fun SettingToolApprovalsPage() {
+                             item(
+                                 headlineContent = { Text(toolName) },
+                                 trailingContent = {
+-                                    IconButton(onClick = { pendingRevoke = toolName }) {
++                                    IconButton(onClick = { pendingRevoke.request(toolName) }) {
+                                         Icon(
+                                             imageVector = HugeIcons.Cancel01,
+                                             contentDescription =
+@@ -340,7 +341,7 @@ fun SettingToolApprovalsPage() {
+                 }
+                 item {
+                     TextButton(
+-                        onClick = { pendingRevokeAll = true },
++                        onClick = { pendingRevokeAll.request() },
+                         modifier = Modifier.padding(horizontal = 16.dp),
+                     ) {
+                         Text(stringResource(R.string.setting_page_tool_approvals_revoke_all))
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolsPage.kt
+index 18ce96c72..c3ef43e48 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingToolsPage.kt
+@@ -18,7 +18,6 @@ import androidx.compose.material3.FilledTonalButton
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Switch
+ import androidx.compose.material3.Text
+@@ -47,6 +46,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.setting.ToolOutputDialog
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.CardGroupValue
+@@ -186,7 +186,7 @@ fun SettingToolsPage(
+                         horizontalArrangement = Arrangement.spacedBy(12.dp),
+                         verticalAlignment = Alignment.CenterVertically,
+                     ) {
+-                        OutlinedTextField(
++                        SettingTextField(
+                             value = budgetDraft,
+                             onValueChange = { input ->
+                                 budgetDraft = input.filter { it.isDigit() }.take(3)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingUsageStatsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingUsageStatsPage.kt
+index 229cc913f..cb1fac440 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingUsageStatsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingUsageStatsPage.kt
+@@ -47,6 +47,7 @@ import me.rerere.rikkahub.ui.components.charts.ChartSeries
+ import me.rerere.rikkahub.ui.components.charts.ChartSpec
+ import me.rerere.rikkahub.ui.components.charts.ChartStyle
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.usageRangeLabelRes
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.CardGroupValue
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
+@@ -91,13 +92,7 @@ fun SettingUsageStatsPage() {
+         containerColor = CustomColors.topBarColors.containerColor,
+     ) { innerPadding ->
+         val rows = remember(stats) { stats.byProviderModel.entries.sortedByDescending { it.value.runs } }
+-        val rangeLabelRes =
+-            when (range) {
+-                UsageRange.TODAY -> R.string.usage_stats_range_today
+-                UsageRange.LAST_7_DAYS -> R.string.usage_stats_range_7d
+-                UsageRange.LAST_30_DAYS -> R.string.usage_stats_range_30d
+-                UsageRange.ALL_TIME -> R.string.usage_stats_range_all
+-            }
++        val rangeLabelRes = usageRangeLabelRes(range)
+         // 空态只替换内容区：范围 Chip 始终渲染，否则某范围没数据时连切范围的入口都没了。
+         LazyColumn(
+             modifier = Modifier.fillMaxSize(),
+@@ -165,13 +160,7 @@ private fun UsageRangeChips(
+     onRangeChange: (UsageRange) -> Unit,
+     modifier: Modifier = Modifier,
+ ) {
+-    val options =
+-        listOf(
+-            UsageRange.TODAY to R.string.usage_stats_range_today,
+-            UsageRange.LAST_7_DAYS to R.string.usage_stats_range_7d,
+-            UsageRange.LAST_30_DAYS to R.string.usage_stats_range_30d,
+-            UsageRange.ALL_TIME to R.string.usage_stats_range_all,
+-        )
++    val options = UsageRange.entries.map { it to usageRangeLabelRes(it) }
+     Row(
+         modifier = modifier.fillMaxWidth(),
+         horizontalArrangement = Arrangement.spacedBy(8.dp),
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePage.kt
+index 79548fb22..3fc05e204 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePage.kt
+@@ -51,6 +51,7 @@ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+ import me.rerere.rikkahub.data.vault.SshKeyGenerator
+ import me.rerere.rikkahub.data.vault.VAULT_REF_PREFIX
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.webBridgePortValid
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.switchItem
+@@ -62,12 +63,6 @@ import org.koin.compose.koinInject
+ 
+ private const val WEB_BRIDGE_KEY_NAME = "WEB_BRIDGE_SSH_KEY"
+ 
+-/** 端口号是否合法：能解析为整数且在 1–65535 内（与 SSH 主机页同口径）。 */
+-internal fun webBridgePortValid(text: String): Boolean {
+-    val port = text.toIntOrNull() ?: return false
+-    return port in 1..65535
+-}
+-
+ /**
+  * 只把全局 Web 桥字段同步进各后端供应商自己的副本，不动各自的开关。
+  * 字段编辑后也要同步：以前只在拨动开关时同步，改完主机/端口直接重启 App，
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebServerPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebServerPage.kt
+index 9db6b9c7a..ac8b1eef5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebServerPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingWebServerPage.kt
+@@ -66,6 +66,8 @@ import me.rerere.rikkahub.ui.theme.CustomColors
+ import me.rerere.rikkahub.utils.plus
+ import me.rerere.rikkahub.web.WebServerManager
+ import org.koin.compose.koinInject
++import me.rerere.rikkahub.ui.components.setting.ConfirmDialogState
++import me.rerere.rikkahub.ui.components.setting.request
+ import me.rerere.rikkahub.ui.components.setting.NetworkAccessField
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
+ import me.rerere.rikkahub.data.vault.CredentialType
+@@ -97,7 +99,7 @@ fun SettingWebServerPage() {
+     var accessPasswordText by remember(settings.webServerAccessPassword) {
+         mutableStateOf(settings.webServerAccessPassword)
+     }
+-    var pendingPasswordClear by remember { mutableStateOf(false) }
++    val pendingPasswordClear = remember { ConfirmDialogState<Unit>() }
+ 
+     val permissionState =
+         rememberPermissionState(
+@@ -338,7 +340,7 @@ fun SettingWebServerPage() {
+                                     accessPasswordText = value
+                                     if (passwordClearNeedsConfirm(value, settings.webServerJwtEnabled)) {
+                                         // 清空密码会联动关掉身份验证：先弹确认，不再悄悄关。
+-                                        pendingPasswordClear = true
++                                        pendingPasswordClear.request()
+                                     } else {
+                                         scope.launch {
+                                             settingsStore.update {
+@@ -430,18 +432,18 @@ fun SettingWebServerPage() {
+     }
+ 
+     RikkaConfirmDialog(
+-        show = pendingPasswordClear,
++        show = pendingPasswordClear.isShowing,
+         title = stringResource(R.string.setting_page_web_server_clear_password_title),
+         confirmText = stringResource(R.string.setting_page_web_server_clear_password_confirm),
+         dismissText = stringResource(R.string.common_cancel),
+         onConfirm = {
+-            pendingPasswordClear = false
++            pendingPasswordClear.confirm()
+             scope.launch {
+                 settingsStore.update { it.copy(webServerAccessPassword = "", webServerJwtEnabled = false) }
+             }
+         },
+         onDismiss = {
+-            pendingPasswordClear = false
++            pendingPasswordClear.dismiss()
+             // 取消则恢复已保存的密码，输入框回到清空前的样子。
+             accessPasswordText = settings.webServerAccessPassword
+         },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPage.kt
+index ad3342c22..291ec6b34 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPage.kt
+@@ -20,7 +20,6 @@ import androidx.compose.material3.Button
+ import androidx.compose.material3.ExperimentalMaterial3Api
+ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+@@ -63,6 +62,9 @@ import me.rerere.rikkahub.data.vault.VaultImportOutcome
+ import me.rerere.rikkahub.data.vault.VaultPreferences
+ import me.rerere.rikkahub.data.vault.VaultSessionManager
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.setting.CountState
++import me.rerere.rikkahub.ui.components.setting.toCountState
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.switchItem
+@@ -396,14 +398,12 @@ fun VaultPage() {
+                                 )
+                             },
+                             headlineContent = {
+-                                val count = credentialCount
+-                                Text(
+-                                    if (count == null) {
+-                                        stringResource(R.string.calculating)
+-                                    } else {
+-                                        stringResource(R.string.vault_credential_count, count)
+-                                    },
+-                                )
++                                when (val countState = credentialCount.toCountState()) {
++                                    CountState.Loading -> Text(stringResource(R.string.calculating))
++                                    is CountState.Ready -> Text(
++                                        stringResource(R.string.vault_credential_count, countState.count),
++                                    )
++                                }
+                             },
+                             supportingContent = {
+                                 Text(stringResource(R.string.vault_page_intro))
+@@ -471,7 +471,7 @@ fun VaultPage() {
+                                     modifier = Modifier.verticalScroll(rememberScrollState()).imePadding(),
+                                     verticalArrangement = Arrangement.spacedBy(8.dp),
+                                 ) {
+-                                    OutlinedTextField(
++                                    SettingTextField(
+                                         value = pinInput,
+                                         onValueChange = { pinInput = it },
+                                         label = { Text(stringResource(R.string.vault_pin_hint)) },
+@@ -485,7 +485,7 @@ fun VaultPage() {
+                                             style = MaterialTheme.typography.bodySmall,
+                                         )
+                                     }
+-                                    OutlinedTextField(
++                                    SettingTextField(
+                                         value = pinInput2,
+                                         onValueChange = { pinInput2 = it },
+                                         label = { Text(stringResource(R.string.vault_pin_confirm_hint)) },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditAndBackup.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditAndBackup.kt
+index 30e70cf94..443855899 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditAndBackup.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditAndBackup.kt
+@@ -19,7 +19,6 @@ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedButton
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.rememberCoroutineScope
+@@ -49,6 +48,7 @@ import me.rerere.rikkahub.data.vault.VaultPreferences
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.Select
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.context.LocalNavController
+ import org.koin.compose.koinInject
+ 
+@@ -303,7 +303,7 @@ internal fun VaultAuditAndBackupSection(
+                 headlineContent = { Text(stringResource(R.string.vault_import_title)) },
+                 supportingContent = { Text(stringResource(R.string.vault_import_desc)) },
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = importPassword,
+                     onValueChange = onImportPasswordChange,
+                     label = { Text(stringResource(R.string.vault_export_password_label)) },
+@@ -353,7 +353,7 @@ internal fun VaultAuditAndBackupSection(
+                     }
+                 }
+                 if (exportFormat == VaultFormats.FORMAT_VAULT) {
+-                    OutlinedTextField(
++                    SettingTextField(
+                         value = exportPassword,
+                         onValueChange = onExportPasswordChange,
+                         label = { Text(stringResource(R.string.vault_export_password_label)) },
+@@ -397,7 +397,7 @@ internal fun VaultAuditAndBackupSection(
+                 headlineContent = { Text(stringResource(R.string.vault_backup_title)) },
+                 supportingContent = { Text(stringResource(R.string.vault_backup_desc)) },
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = backupPassword,
+                     onValueChange = onBackupPasswordChange,
+                     label = { Text(stringResource(R.string.vault_backup_password_label)) },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageSession.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageSession.kt
+index de193d213..e05cfafad 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageSession.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultPageSession.kt
+@@ -13,7 +13,6 @@ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedButton
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
+@@ -47,6 +46,7 @@ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ 
+ private const val CLIPBOARD_LABEL = "vault-session"
+ 
+@@ -124,7 +124,7 @@ internal fun VaultSessionSection(
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                 )
+-                OutlinedTextField(
++                SettingTextField(
+                     value = allowedNamesInput,
+                     onValueChange = { allowedNamesInput = it },
+                     label = { Text(stringResource(R.string.vault_session_allowed_names)) },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/backend/BackendServicePage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/backend/BackendServicePage.kt
+index 0cc78f812..f1c2b9fde 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/backend/BackendServicePage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/backend/BackendServicePage.kt
+@@ -12,7 +12,6 @@ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+@@ -38,6 +37,7 @@ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.Select
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.theme.CustomColors
+ import org.koin.compose.koinInject
+ 
+@@ -239,10 +239,10 @@ private fun BackendEditDialog(
+                 modifier = Modifier.verticalScroll(rememberScrollState()).imePadding(),
+                 verticalArrangement = Arrangement.spacedBy(8.dp),
+             ) {
+-                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text(stringResource(R.string.backend_service_name_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = showErrors && name.isBlank(), supportingText = { if (showErrors && name.isBlank()) Text(stringResource(R.string.backend_service_name_required)) })
+-                OutlinedTextField(value = type, onValueChange = { type = it }, label = { Text(stringResource(R.string.backend_service_type_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+-                OutlinedTextField(value = endpoint, onValueChange = { endpoint = it }, label = { Text(stringResource(R.string.backend_service_endpoint_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = showErrors && endpoint.isBlank(), supportingText = { if (showErrors && endpoint.isBlank()) Text(stringResource(R.string.backend_service_endpoint_required)) })
+-                OutlinedTextField(value = authRef, onValueChange = { authRef = it }, label = { Text(stringResource(R.string.backend_service_auth_ref_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
++                SettingTextField(value = name, onValueChange = { name = it }, label = { Text(stringResource(R.string.backend_service_name_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = showErrors && name.isBlank(), supportingText = { if (showErrors && name.isBlank()) Text(stringResource(R.string.backend_service_name_required)) })
++                SettingTextField(value = type, onValueChange = { type = it }, label = { Text(stringResource(R.string.backend_service_type_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
++                SettingTextField(value = endpoint, onValueChange = { endpoint = it }, label = { Text(stringResource(R.string.backend_service_endpoint_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth(), isError = showErrors && endpoint.isBlank(), supportingText = { if (showErrors && endpoint.isBlank()) Text(stringResource(R.string.backend_service_endpoint_required)) })
++                SettingTextField(value = authRef, onValueChange = { authRef = it }, label = { Text(stringResource(R.string.backend_service_auth_ref_label)) }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                 // 凭证库下拉快捷选择：点击填入 authRef
+                 if (credentialNames.isNotEmpty()) {
+                     Select(
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ASRProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ASRProviderConfigure.kt
+index 84e84ae26..65b38479d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ASRProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ASRProviderConfigure.kt
+@@ -5,7 +5,6 @@ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Modifier
+@@ -16,6 +15,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.ui.components.ui.FormItem
+ import me.rerere.rikkahub.ui.components.ui.OutlinedNumberInput
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ 
+ @Composable
+ fun ASRProviderConfigure(
+@@ -31,7 +31,7 @@ fun ASRProviderConfigure(
+             label = { Text(stringResource(R.string.setting_asr_configure_provider_type)) },
+             description = { Text(stringResource(R.string.setting_asr_configure_provider_type_desc)) },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value =
+                     when (setting) {
+                         is ASRProviderSetting.OpenAIRealtime -> "OpenAI Realtime"
+@@ -50,7 +50,7 @@ fun ASRProviderConfigure(
+             label = { Text(stringResource(R.string.setting_asr_configure_name)) },
+             description = { Text(stringResource(R.string.setting_asr_configure_name_desc)) },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.name,
+                 onValueChange = { onValueChange(setting.copyProvider(name = it)) },
+                 modifier = Modifier.fillMaxWidth(),
+@@ -91,7 +91,7 @@ private fun OpenAIRealtimeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_websocket_url)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_openai_websocket_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.websocketUrl,
+             onValueChange = { onValueChange(setting.copy(websocketUrl = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -103,7 +103,7 @@ private fun OpenAIRealtimeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_model)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_model_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { onValueChange(setting.copy(model = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -115,7 +115,7 @@ private fun OpenAIRealtimeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_language)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_language_iso_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.language,
+             onValueChange = { onValueChange(setting.copy(language = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -127,7 +127,7 @@ private fun OpenAIRealtimeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_prompt)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_prompt_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.prompt,
+             onValueChange = { onValueChange(setting.copy(prompt = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -208,7 +208,7 @@ private fun DashScopeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_websocket_url)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_dashscope_websocket_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.websocketUrl,
+             onValueChange = { onValueChange(setting.copy(websocketUrl = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -220,7 +220,7 @@ private fun DashScopeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_model)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_model_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { onValueChange(setting.copy(model = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -232,7 +232,7 @@ private fun DashScopeASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_language)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_language_iso_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.language,
+             onValueChange = { onValueChange(setting.copy(language = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -296,7 +296,7 @@ private fun VolcengineASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_websocket_url)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_volcengine_websocket_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.websocketUrl,
+             onValueChange = { onValueChange(setting.copy(websocketUrl = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -308,7 +308,7 @@ private fun VolcengineASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_resource_id)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_resource_id_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.resourceId,
+             onValueChange = { onValueChange(setting.copy(resourceId = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -320,7 +320,7 @@ private fun VolcengineASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_language)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_language_code_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.language,
+             onValueChange = { onValueChange(setting.copy(language = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -352,7 +352,7 @@ private fun MiMoASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_base_url)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_mimo_base_url_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { onValueChange(setting.copy(baseUrl = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -364,7 +364,7 @@ private fun MiMoASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_model)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_mimo_model_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { onValueChange(setting.copy(model = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -376,7 +376,7 @@ private fun MiMoASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_language)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_mimo_language_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.language,
+             onValueChange = { onValueChange(setting.copy(language = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -440,7 +440,7 @@ private fun StepASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_base_url)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_step_base_url_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { onValueChange(setting.copy(baseUrl = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -452,7 +452,7 @@ private fun StepASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_model)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_step_model_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { onValueChange(setting.copy(model = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -464,7 +464,7 @@ private fun StepASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_language)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_step_language_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.language,
+             onValueChange = { onValueChange(setting.copy(language = it)) },
+             modifier = Modifier.fillMaxWidth(),
+@@ -528,7 +528,7 @@ private fun StepASRConfiguration(
+         label = { Text(stringResource(R.string.setting_asr_configure_step_hotwords)) },
+         description = { Text(stringResource(R.string.setting_asr_configure_step_hotwords_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             // 用逗号分隔展示, 输入时按逗号 split 回 List
+             value = setting.hotwords.joinToString(","),
+             onValueChange = { text ->
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
+index f067a12ff..4484a9b1c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
+@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.text.TextAutoSize
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.SegmentedButton
+ import androidx.compose.material3.SegmentedButtonDefaults
+ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+@@ -36,6 +35,7 @@ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
+ import me.rerere.rikkahub.ui.components.ui.switchItem
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.context.LocalToaster
+ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ 
+@@ -401,7 +401,7 @@ private fun ProviderConfigureOpenAI(
+         formItem(
+             headlineContent = { Text(stringResource(R.string.setting_provider_page_name)) },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = provider.name,
+                 onValueChange = { onEdit(provider.copy(name = it)) },
+                 modifier = Modifier.fillMaxWidth(),
+@@ -419,7 +419,7 @@ private fun ProviderConfigureOpenAI(
+         formItem(
+             headlineContent = { Text(stringResource(R.string.setting_provider_page_api_base_url)) },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = provider.baseUrl,
+                 onValueChange = { onEdit(provider.copy(baseUrl = it.trim())) },
+                 modifier = Modifier.fillMaxWidth(),
+@@ -433,7 +433,7 @@ private fun ProviderConfigureOpenAI(
+         formItem(
+             headlineContent = { Text(stringResource(R.string.setting_provider_page_api_path)) },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = if (provider.useResponseApi) provider.responsesPath else provider.chatCompletionsPath,
+                 onValueChange = {
+                     onEdit(
+@@ -526,20 +526,20 @@ private fun OpenRouterRoutingSection(
+             }
+         }
+         formItem {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = listToText(routing.order),
+                 onValueChange = { onChange(routing.copy(order = textToList(it))) },
+                 label = { Text(stringResource(R.string.openrouter_routing_provider_order_label)) },
+                 placeholder = { Text(stringResource(R.string.openrouter_routing_order_placeholder)) },
+                 modifier = Modifier.fillMaxWidth(),
+             )
+-            OutlinedTextField(
++            SettingTextField(
+                 value = listToText(routing.only),
+                 onValueChange = { onChange(routing.copy(only = textToList(it))) },
+                 label = { Text(stringResource(R.string.openrouter_routing_only_label)) },
+                 modifier = Modifier.fillMaxWidth(),
+             )
+-            OutlinedTextField(
++            SettingTextField(
+                 value = listToText(routing.ignore),
+                 onValueChange = { onChange(routing.copy(ignore = textToList(it))) },
+                 label = { Text(stringResource(R.string.openrouter_routing_ignore_label)) },
+@@ -572,7 +572,7 @@ private fun OpenRouterRoutingSection(
+             var promptPriceText by remember { mutableStateOf(routing.maxPricePrompt?.toString() ?: "") }
+             var completionPriceText by remember { mutableStateOf(routing.maxPriceCompletion?.toString() ?: "") }
+             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value = promptPriceText,
+                     onValueChange = {
+                         promptPriceText = it
+@@ -592,7 +592,7 @@ private fun OpenRouterRoutingSection(
+                     },
+                     modifier = Modifier.weight(1f),
+                 )
+-                OutlinedTextField(
++                SettingTextField(
+                     value = completionPriceText,
+                     onValueChange = {
+                         completionPriceText = it
+@@ -613,7 +613,7 @@ private fun OpenRouterRoutingSection(
+                     modifier = Modifier.weight(1f),
+                 )
+             }
+-            OutlinedTextField(
++            SettingTextField(
+                 value = listToText(routing.quantizations),
+                 onValueChange = { onChange(routing.copy(quantizations = textToList(it))) },
+                 label = { Text(stringResource(R.string.openrouter_routing_quantizations_label)) },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigure.kt
+index cd1055061..fb4b05219 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigure.kt
+@@ -10,7 +10,6 @@ import androidx.compose.material3.ExposedDropdownMenu
+ import androidx.compose.material3.ExposedDropdownMenuAnchorType
+ import androidx.compose.material3.ExposedDropdownMenuBox
+ import androidx.compose.material3.ExposedDropdownMenuDefaults
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+@@ -25,6 +24,7 @@ import me.rerere.rikkahub.ui.components.ui.FormItem
+ import me.rerere.rikkahub.ui.components.ui.SelectTextField
+ import me.rerere.rikkahub.ui.components.ui.OutlinedNumberInput
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.tts.provider.TTSProviderSetting
+ 
+ @Composable
+@@ -49,7 +49,7 @@ fun TTSProviderConfigure(
+                 expanded = expanded,
+                 onExpandedChange = { expanded = !expanded },
+             ) {
+-                OutlinedTextField(
++                SettingTextField(
+                     value =
+                         when (setting) {
+                             is TTSProviderSetting.OpenAI -> "OpenAI"
+@@ -205,7 +205,7 @@ fun TTSProviderConfigure(
+             label = { Text(stringResource(R.string.setting_tts_page_name)) },
+             description = { Text(stringResource(R.string.setting_tts_page_name_description)) },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.name,
+                 onValueChange = { newName ->
+                     onValueChange(setting.copyProvider(name = newName))
+@@ -258,7 +258,7 @@ private fun OpenAITTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -273,7 +273,7 @@ private fun OpenAITTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_model)) },
+         description = { Text(stringResource(R.string.setting_tts_page_model_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { newModel ->
+                 onValueChange(setting.copy(model = newModel))
+@@ -295,7 +295,7 @@ private fun OpenAITTSConfiguration(
+             expanded = voiceExpanded,
+             onExpandedChange = { voiceExpanded = !voiceExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.voice,
+                 onValueChange = { newVoice ->
+                     onValueChange(setting.copy(voice = newVoice))
+@@ -352,7 +352,7 @@ private fun MiMoTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -367,7 +367,7 @@ private fun MiMoTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_model)) },
+         description = { Text(stringResource(R.string.setting_tts_page_model_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { newModel ->
+                 onValueChange(setting.copy(model = newModel))
+@@ -433,7 +433,7 @@ private fun MiniMaxTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -448,7 +448,7 @@ private fun MiniMaxTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_model)) },
+         description = { Text(stringResource(R.string.setting_tts_page_model_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { newModel ->
+                 onValueChange(setting.copy(model = newModel))
+@@ -483,7 +483,7 @@ private fun MiniMaxTTSConfiguration(
+             expanded = voiceIdExpanded,
+             onExpandedChange = { voiceIdExpanded = !voiceIdExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.voiceId,
+                 onValueChange = { newVoiceId ->
+                     onValueChange(setting.copy(voiceId = newVoiceId))
+@@ -556,7 +556,7 @@ private fun GeminiTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -571,7 +571,7 @@ private fun GeminiTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_model)) },
+         description = { Text(stringResource(R.string.setting_tts_page_model_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { newModel ->
+                 onValueChange(setting.copy(model = newModel))
+@@ -586,7 +586,7 @@ private fun GeminiTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_voice_name)) },
+         description = { Text(stringResource(R.string.setting_tts_page_voice_name_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.voiceName,
+             onValueChange = { newVoiceName ->
+                 onValueChange(setting.copy(voiceName = newVoiceName))
+@@ -662,7 +662,7 @@ private fun QwenTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -723,7 +723,7 @@ private fun QwenTTSConfiguration(
+             expanded = voiceExpanded,
+             onExpandedChange = { voiceExpanded = !voiceExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.voice,
+                 onValueChange = { newVoice ->
+                     onValueChange(setting.copy(voice = newVoice))
+@@ -815,7 +815,7 @@ private fun GroqTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -830,7 +830,7 @@ private fun GroqTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_model)) },
+         description = { Text(stringResource(R.string.setting_tts_page_model_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.model,
+             onValueChange = { newModel ->
+                 onValueChange(setting.copy(model = newModel))
+@@ -852,7 +852,7 @@ private fun GroqTTSConfiguration(
+             expanded = voiceExpanded,
+             onExpandedChange = { voiceExpanded = !voiceExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.voice,
+                 onValueChange = { newVoice ->
+                     onValueChange(setting.copy(voice = newVoice))
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigureExt.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigureExt.kt
+index 9802d9b10..5d684ba8b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigureExt.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/TTSProviderConfigureExt.kt
+@@ -6,7 +6,6 @@ import androidx.compose.material3.ExposedDropdownMenu
+ import androidx.compose.material3.ExposedDropdownMenuAnchorType
+ import androidx.compose.material3.ExposedDropdownMenuBox
+ import androidx.compose.material3.ExposedDropdownMenuDefaults
+-import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+@@ -19,6 +18,7 @@ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.ui.components.ui.FormItem
+ import me.rerere.rikkahub.ui.components.ui.OutlinedNumberInput
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
++import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.tts.provider.TTSProviderSetting
+ 
+ 
+@@ -47,7 +47,7 @@ internal fun XAITTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -76,7 +76,7 @@ internal fun XAITTSConfiguration(
+             expanded = voiceExpanded,
+             onExpandedChange = { voiceExpanded = !voiceExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.voiceId,
+                 onValueChange = { newVoiceId ->
+                     onValueChange(setting.copy(voiceId = newVoiceId))
+@@ -138,7 +138,7 @@ internal fun XAITTSConfiguration(
+             expanded = languageExpanded,
+             onExpandedChange = { languageExpanded = !languageExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.language,
+                 onValueChange = { newLanguage ->
+                     onValueChange(setting.copy(language = newLanguage))
+@@ -194,7 +194,7 @@ internal fun ElevenLabsTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -221,7 +221,7 @@ internal fun ElevenLabsTTSConfiguration(
+             expanded = modelExpanded,
+             onExpandedChange = { modelExpanded = !modelExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.model,
+                 onValueChange = { newModel ->
+                     onValueChange(setting.copy(model = newModel))
+@@ -256,7 +256,7 @@ internal fun ElevenLabsTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_voice)) },
+         description = { Text(stringResource(R.string.setting_tts_page_voice_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.voiceId,
+             onValueChange = { newVoiceId ->
+                 onValueChange(setting.copy(voiceId = newVoiceId))
+@@ -322,7 +322,7 @@ internal fun FishAudioTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -350,7 +350,7 @@ internal fun FishAudioTTSConfiguration(
+             expanded = modelExpanded,
+             onExpandedChange = { modelExpanded = !modelExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.model,
+                 onValueChange = { newModel ->
+                     onValueChange(setting.copy(model = newModel))
+@@ -385,7 +385,7 @@ internal fun FishAudioTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_voice_id)) },
+         description = { Text(stringResource(R.string.setting_tts_page_voice_id_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.referenceId,
+             onValueChange = { newReferenceId ->
+                 onValueChange(setting.copy(referenceId = newReferenceId))
+@@ -451,7 +451,7 @@ internal fun StepTTSConfiguration(
+         label = { Text(stringResource(R.string.setting_tts_page_base_url)) },
+         description = { Text(stringResource(R.string.setting_tts_page_base_url_description)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { newBaseUrl ->
+                 onValueChange(setting.copy(baseUrl = newBaseUrl))
+@@ -479,7 +479,7 @@ internal fun StepTTSConfiguration(
+             expanded = modelExpanded,
+             onExpandedChange = { modelExpanded = !modelExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.model,
+                 onValueChange = { newModel ->
+                     onValueChange(setting.copy(model = newModel))
+@@ -556,7 +556,7 @@ internal fun StepTTSConfiguration(
+             expanded = voiceExpanded,
+             onExpandedChange = { voiceExpanded = !voiceExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.voice,
+                 onValueChange = { newVoice ->
+                     onValueChange(setting.copy(voice = newVoice))
+@@ -598,7 +598,7 @@ internal fun StepTTSConfiguration(
+             expanded = formatExpanded,
+             onExpandedChange = { formatExpanded = !formatExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.responseFormat,
+                 onValueChange = { newFormat ->
+                     onValueChange(setting.copy(responseFormat = newFormat))
+@@ -674,7 +674,7 @@ internal fun StepTTSConfiguration(
+             expanded = sampleRateExpanded,
+             onExpandedChange = { sampleRateExpanded = !sampleRateExpanded },
+         ) {
+-            OutlinedTextField(
++            SettingTextField(
+                 value = setting.sampleRate.toString(),
+                 onValueChange = {},
+                 readOnly = true,
+@@ -708,7 +708,7 @@ internal fun StepTTSConfiguration(
+         label = { Text(stringResource(R.string.tts_instruction)) },
+         description = { Text(stringResource(R.string.tts_global_instruction_desc)) },
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.instruction,
+             onValueChange = { newInstruction ->
+                 // 服务端上限 200 字符, 客户端做一层保护
+@@ -742,7 +742,7 @@ internal fun VolcengineTTSConfiguration(
+         )
+     }
+     FormItem(label = { Text(stringResource(R.string.setting_tts_page_base_url)) }) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.baseUrl,
+             onValueChange = { onValueChange(setting.copy(baseUrl = it)) },
+             placeholder = { Text("https://openspeech.bytedance.com") },
+@@ -754,7 +754,7 @@ internal fun VolcengineTTSConfiguration(
+         label = { Text(stringResource(R.string.tts_volcengine_resource_id)) },
+         description = { Text(stringResource(R.string.tts_volcengine_resource_id_desc)) }
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.resourceId,
+             onValueChange = { onValueChange(setting.copy(resourceId = it)) },
+             singleLine = true,
+@@ -765,7 +765,7 @@ internal fun VolcengineTTSConfiguration(
+         label = { Text(stringResource(R.string.tts_volcengine_speaker)) },
+         description = { Text(stringResource(R.string.tts_volcengine_speaker_desc)) }
+     ) {
+-        OutlinedTextField(
++        SettingTextField(
+             value = setting.speaker,
+             onValueChange = { onValueChange(setting.copy(speaker = it)) },
+             singleLine = true,
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/GenerationFailureDiagnosisTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/GenerationFailureDiagnosisTest.kt
+new file mode 100644
+index 000000000..720d37abd
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/GenerationFailureDiagnosisTest.kt
+@@ -0,0 +1,91 @@
++package me.rerere.rikkahub.data.ai
++
++import android.app.Application
++import org.robolectric.RuntimeEnvironment
++import java.net.SocketTimeoutException
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++/**
++ * 失败诊断文案映射（[diagnoseFailure]）：失败种类 → 资源化标签。
++ *
++ * 分类本身（[classifyFailureKind]）已有 [FailureKindClassificationTest] 覆盖 12 例；
++ * 这里只测「种类 → 文案」这一层：每种失败拿到的标签必须是对应种类的资源串，
++ * 错配会让模型面板错误卡片给出误导性提示。`raw` 取首条非空异常消息（见 [retryFailureReason]）。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class GenerationFailureDiagnosisTest {
++
++    private val context: Application by lazy {
++        RuntimeEnvironment.getApplication()
++    }
++
++    private fun diagnose(failure: Throwable) = diagnoseFailure(context, failure)
++
++    @Test
++    fun `auth failure maps to the auth label`() {
++        val diag = diagnose(RuntimeException("401 Unauthorized: invalid api key"))
++        assertEquals(FailureKind.AUTH, diag.kind)
++        assertEquals("Key invalid or expired (check your API key)", diag.label)
++    }
++
++    @Test
++    fun `quota failure maps to the quota label`() {
++        val diag = diagnose(RuntimeException("402 Payment Required: insufficient balance"))
++        assertEquals(FailureKind.QUOTA, diag.kind)
++        assertEquals("Insufficient balance or quota (top up and retry)", diag.label)
++    }
++
++    @Test
++    fun `rate limit failure maps to the rate limit label`() {
++        val diag = diagnose(RuntimeException("429 Too Many Requests: rate limit reached"))
++        assertEquals(FailureKind.RATE_LIMIT, diag.kind)
++        assertEquals("Too many requests (rate limited, retry shortly)", diag.label)
++    }
++
++    @Test
++    fun `timeout failure maps to the network label`() {
++        val diag = diagnose(SocketTimeoutException("Read timed out"))
++        assertEquals(FailureKind.NETWORK, diag.kind)
++        assertEquals("Network down or endpoint unreachable", diag.label)
++    }
++
++    @Test
++    fun `content safety failure maps to the content safety label`() {
++        val diag = diagnose(RuntimeException("400 Output blocked by content filtering policy"))
++        assertEquals(FailureKind.CONTENT_SAFETY, diag.kind)
++        assertEquals("Blocked by content safety check (try rephrasing)", diag.label)
++    }
++
++    @Test
++    fun `tool pairing failure maps to the tool pairing label`() {
++        val diag = diagnose(
++            RuntimeException(
++                "An assistant message with 'tool_calls' must be followed by tool messages " +
++                    "responding to each 'tool_call_id'. (insufficient tool messages)",
++            ),
++        )
++        assertEquals(FailureKind.TOOL_PAIRING, diag.kind)
++        assertEquals(
++            "Tool call without its result (repaired automatically; start a new chat if it persists)",
++            diag.label,
++        )
++    }
++
++    @Test
++    fun `unrecognized failure maps to the unknown label`() {
++        val diag = diagnose(RuntimeException("something completely unexpected happened"))
++        assertEquals(FailureKind.UNKNOWN, diag.kind)
++        assertEquals("Unrecognized error (see the raw server message below)", diag.label)
++    }
++
++    @Test
++    fun `raw keeps the first non-blank failure message`() {
++        val diag = diagnose(RuntimeException("429 Too Many Requests: rate limit reached"))
++        assertEquals("429 Too Many Requests: rate limit reached", diag.raw)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsBase64LimitTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsBase64LimitTest.kt
+new file mode 100644
+index 000000000..18905faa5
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsBase64LimitTest.kt
+@@ -0,0 +1,41 @@
++package me.rerere.rikkahub.data.ai.tools
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertThrows
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Base64 内联上限判定（[requireInlineBase64Size]）：二进制文件超过 256KB 不直接内联进消息，
++ * 改由调用方用 shell（head/xxd/python）查看，避免撑爆上下文。
++ * 守卫在新基线里缺失，随基建统一批补回（与旧栈行为一致）；执行路径（需真实文件读取）
++ * 不在这里测。
++ */
++class WorkspaceToolsBase64LimitTest {
++
++    @Test
++    fun `exactly at limit passes`() {
++        requireInlineBase64Size(MAX_BINARY_BASE64_BYTES, "/tmp/a.bin")
++    }
++
++    @Test
++    fun `below limit passes`() {
++        requireInlineBase64Size(0, "/tmp/a.bin")
++        requireInlineBase64Size(1024, "/tmp/a.bin")
++    }
++
++    @Test
++    fun `one byte over limit throws with size and limit in message`() {
++        val ex = assertThrows(IllegalArgumentException::class.java) {
++            requireInlineBase64Size(MAX_BINARY_BASE64_BYTES + 1, "/tmp/a.bin")
++        }
++        assertTrue(ex.message!!.contains("${MAX_BINARY_BASE64_BYTES + 1}"))
++        assertTrue(ex.message!!.contains("$MAX_BINARY_BASE64_BYTES"))
++        assertTrue(ex.message!!.contains("/tmp/a.bin"))
++    }
++
++    @Test
++    fun `limit constant is 256KB`() {
++        assertEquals(256 * 1024, MAX_BINARY_BASE64_BYTES)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/preferences/ToolApprovalPreferencesTest.kt b/app/src/test/java/me/rerere/rikkahub/data/preferences/ToolApprovalPreferencesTest.kt
+new file mode 100644
+index 000000000..a46bce315
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/preferences/ToolApprovalPreferencesTest.kt
+@@ -0,0 +1,79 @@
++package me.rerere.rikkahub.data.preferences
++
++import android.app.Application
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.annotation.Config
++
++/**
++ * 工具授权持久化（[ToolApprovalPreferences]）：授权 / 撤销 / 全部撤销。
++ *
++ * 前缀规则本身（[isWorkspaceToolName]、[migrateWorkspaceToolsFrom]）已有
++ * [ToolApprovalPreferencesWorkspaceFilterTest] 覆盖纯函数部分；这里测落盘行为：
++ * DataStore delegate 在顶层（`tool_approval.preferences_pb`），Robolectric 下可直接构造。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class ToolApprovalPreferencesTest {
++
++    private val context: Application by lazy {
++        RuntimeEnvironment.getApplication()
++    }
++
++    private val prefs: ToolApprovalPreferences by lazy { ToolApprovalPreferences(context) }
++
++    @Before
++    fun setUp() = runBlocking {
++        prefs.revokeAll()
++        prefs.setYolo(false)
++    }
++
++    @Test
++    fun `grant then revoke removes only that tool`() = runBlocking {
++        prefs.grantAlways("read_file")
++        prefs.grantAlways("open_url")
++        assertEquals(setOf("read_file", "open_url"), prefs.current())
++
++        prefs.revoke("read_file")
++        assertEquals(setOf("open_url"), prefs.current())
++    }
++
++    @Test
++    fun `revokeAll clears every grant`() = runBlocking {
++        prefs.grantAlways("read_file")
++        prefs.grantAlways("open_url")
++
++        prefs.revokeAll()
++        assertTrue(prefs.current().isEmpty())
++    }
++
++    @Test
++    fun `workspace tool grant is refused`() = runBlocking {
++        prefs.grantAlways("workspace_shell")
++        assertTrue(prefs.current().isEmpty())
++    }
++
++    @Test
++    fun `revoking an unknown tool is a no-op`() = runBlocking {
++        prefs.grantAlways("read_file")
++
++        prefs.revoke("open_url")
++        assertEquals(setOf("read_file"), prefs.current())
++    }
++
++    @Test
++    fun `yolo flag defaults false and persists`() = runBlocking {
++        assertFalse(prefs.currentYolo())
++        prefs.setYolo(true)
++        assertTrue(prefs.currentYolo())
++        prefs.setYolo(false)
++        assertFalse(prefs.currentYolo())
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/components/setting/ConfirmDialogStateTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/setting/ConfirmDialogStateTest.kt
+new file mode 100644
+index 000000000..530419313
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/components/setting/ConfirmDialogStateTest.kt
+@@ -0,0 +1,68 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * 确认弹窗共享状态机（[ConfirmDialogState]）：只持有「待确认的目标」，不渲染对话框。
++ * 各页原来散落的 `pendingDelete: T?` / `pendingRevoke: String?` / `pendingXxx: Boolean`
++ * 改调本类后，一套参数化用例覆盖 5 处（搜索删除、撤销授权、文件清理 ALL、清空密码等）。
++ */
++class ConfirmDialogStateTest {
++
++    @Test
++    fun `initial state is not showing`() {
++        val state = ConfirmDialogState<String>()
++        assertFalse(state.isShowing)
++        assertNull(state.pending)
++        assertNull(state.confirm())
++    }
++
++    @Test
++    fun `request sets pending and shows`() {
++        val state = ConfirmDialogState<String>()
++        state.request("tool-a")
++        assertTrue(state.isShowing)
++        assertEquals("tool-a", state.pending)
++    }
++
++    @Test
++    fun `confirm returns target and clears`() {
++        val state = ConfirmDialogState<String>()
++        state.request("tool-a")
++        assertEquals("tool-a", state.confirm())
++        assertFalse(state.isShowing)
++        assertNull(state.pending)
++        assertNull(state.confirm())
++    }
++
++    @Test
++    fun `dismiss clears without returning target`() {
++        val state = ConfirmDialogState<String>()
++        state.request("tool-a")
++        state.dismiss()
++        assertFalse(state.isShowing)
++        assertNull(state.pending)
++        assertNull(state.confirm())
++    }
++
++    @Test
++    fun `re-request overwrites pending target`() {
++        val state = ConfirmDialogState<String>()
++        state.request("tool-a")
++        state.request("tool-b")
++        assertEquals("tool-b", state.confirm())
++    }
++
++    @Test
++    fun `unit request shows boolean confirm`() {
++        val state = ConfirmDialogState<Unit>()
++        state.request()
++        assertTrue(state.isShowing)
++        assertEquals(Unit, state.confirm())
++        assertFalse(state.isShowing)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/components/setting/DraftStateTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/setting/DraftStateTest.kt
+new file mode 100644
+index 000000000..45c7ed1c9
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/components/setting/DraftStateTest.kt
+@@ -0,0 +1,99 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * 草稿 + 取消回滚共享状态机（[DraftState]）：持有「已保存值」与「编辑中草稿」两份状态。
++ * 各页原来手写的 loadXxxDrafts / saveXxx / 取消重载三件套改调本类后，一套参数化用例
++ * 覆盖 5 处（主机覆写取消、DNS 弹窗取消与测试分离、代理弹窗取消与测试分离等）。
++ */
++class DraftStateTest {
++
++    @Test
++    fun `initial saved equals draft and is clean`() {
++        val state = DraftState("saved")
++        assertEquals("saved", state.saved)
++        assertEquals("saved", state.draft)
++        assertFalse(state.isDirty)
++    }
++
++    @Test
++    fun `edit marks dirty without touching saved`() {
++        val state = DraftState("saved")
++        state.edit("draft")
++        assertTrue(state.isDirty)
++        assertEquals("saved", state.saved)
++        assertEquals("draft", state.draft)
++    }
++
++    @Test
++    fun `edit transform applies to draft only`() {
++        val state = DraftState(listOf("a"))
++        state.edit { it + "b" }
++        assertEquals(listOf("a", "b"), state.draft)
++        assertEquals(listOf("a"), state.saved)
++        assertTrue(state.isDirty)
++    }
++
++    @Test
++    fun `discard rolls draft back to saved`() {
++        val state = DraftState("saved")
++        state.edit("draft")
++        state.discard()
++        assertEquals("saved", state.draft)
++        assertEquals("saved", state.saved)
++        assertFalse(state.isDirty)
++    }
++
++    @Test
++    fun `save commits draft and returns it`() {
++        val state = DraftState("saved")
++        state.edit("draft")
++        assertEquals("draft", state.save())
++        assertEquals("draft", state.saved)
++        assertEquals("draft", state.draft)
++        assertFalse(state.isDirty)
++    }
++
++    @Test
++    fun `load replaces both saved and draft`() {
++        val state = DraftState("old")
++        state.edit("dirty")
++        state.load("new")
++        assertEquals("new", state.saved)
++        assertEquals("new", state.draft)
++        assertFalse(state.isDirty)
++    }
++
++    @Test
++    fun `discard after save keeps saved value`() {
++        val state = DraftState("v1")
++        state.edit("v2")
++        state.save()
++        state.edit("v3")
++        state.discard()
++        assertEquals("v2", state.draft)
++        assertEquals("v2", state.saved)
++    }
++
++    @Test
++    fun `save when clean returns saved and stays clean`() {
++        val state = DraftState("v1")
++        assertEquals("v1", state.save())
++        assertEquals("v1", state.saved)
++        assertEquals("v1", state.draft)
++        assertFalse(state.isDirty)
++    }
++
++    @Test
++    fun `edit to the same value is not dirty`() {
++        val state = DraftState("v1")
++        state.edit("v1")
++        assertFalse(state.isDirty)
++        state.edit { it }
++        assertFalse(state.isDirty)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/components/setting/SettingValidationTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/setting/SettingValidationTest.kt
+new file mode 100644
+index 000000000..f908d253e
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/components/setting/SettingValidationTest.kt
+@@ -0,0 +1,151 @@
++package me.rerere.rikkahub.ui.components.setting
++
++import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.ai.UsageRange
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * 设置页共享校验函数（[webBridgePortValid]、[canTestProxyUrl]、[dohUrlValid]）与
++ * 空态 / 计数状态（[cleanDeleteButtonEnabled]、[sshKeyChoiceAvailability]、
++ * [usageRangeLabelRes]、[Int.toCountState]）。
++ * 各设置页原来散落的页面级校验纯函数收拢于此；新页面级校验函数也必须写进共享模块，
++ * 不许写进页面文件（门禁 16-setting-validation 兜底）。
++ */
++class SettingValidationTest {
++
++    // ---- webBridgePortValid ----
++
++    @Test
++    fun `port boundaries pass`() {
++        assertTrue(webBridgePortValid("1"))
++        assertTrue(webBridgePortValid("22"))
++        assertTrue(webBridgePortValid("65535"))
++    }
++
++    @Test
++    fun `port out of range fails`() {
++        assertFalse(webBridgePortValid("0"))
++        assertFalse(webBridgePortValid("65536"))
++        assertFalse(webBridgePortValid("99999"))
++        assertFalse(webBridgePortValid("-1"))
++    }
++
++    @Test
++    fun `port non-numeric fails`() {
++        assertFalse(webBridgePortValid(""))
++        assertFalse(webBridgePortValid("abc"))
++        assertFalse(webBridgePortValid("22.5"))
++        assertFalse(webBridgePortValid(" 22"))
++    }
++
++    // ---- canTestProxyUrl ----
++
++    @Test
++    fun `parseable proxy urls are testable`() {
++        assertTrue(canTestProxyUrl("http://127.0.0.1:7890"))
++        assertTrue(canTestProxyUrl("127.0.0.1:7890"))
++        assertTrue(canTestProxyUrl("socks5://127.0.0.1:1080"))
++    }
++
++    @Test
++    fun `blank or unparseable proxy urls are not testable`() {
++        assertFalse(canTestProxyUrl(""))
++        assertFalse(canTestProxyUrl("   "))
++        assertFalse(canTestProxyUrl("not a url"))
++    }
++
++    @Test
++    fun `proxy urls with user info or path are not testable`() {
++        assertFalse(canTestProxyUrl("http://user:pass@127.0.0.1:7890"))
++        assertFalse(canTestProxyUrl("http://127.0.0.1:7890/path"))
++        assertFalse(canTestProxyUrl("127.0.0.1:99999"))
++    }
++
++    @Test
++    fun `proxy urls with trailing slash or https scheme are testable`() {
++        assertTrue(canTestProxyUrl("127.0.0.1:7890/"))
++        assertTrue(canTestProxyUrl("https://proxy.example.com:443"))
++    }
++
++    // ---- dohUrlValid ----
++
++    @Test
++    fun `https doh url with host is valid`() {
++        assertTrue(dohUrlValid("https://dns.example.com/dns-query"))
++        assertTrue(dohUrlValid("https://8.8.8.8/dns-query"))
++    }
++
++    @Test
++    fun `non-https or hostless doh urls are invalid`() {
++        assertFalse(dohUrlValid("http://dns.example.com/dns-query"))
++        assertFalse(dohUrlValid("https://"))
++        assertFalse(dohUrlValid(""))
++        assertFalse(dohUrlValid("not a url"))
++        assertFalse(dohUrlValid("dns.example.com/dns-query"))
++    }
++
++    @Test
++    fun `doh url scheme is case-insensitive and ports are allowed`() {
++        assertTrue(dohUrlValid("HTTPS://dns.example.com/dns-query"))
++        assertTrue(dohUrlValid("https://dns.example.com:8443/dns-query"))
++        assertTrue(dohUrlValid("https://dns.example.com/dns-query?x=1"))
++    }
++
++    // ---- cleanDeleteButtonEnabled ----
++
++    @Test
++    fun `clean delete button enabled only when count is positive`() {
++        assertFalse(cleanDeleteButtonEnabled(0))
++        assertTrue(cleanDeleteButtonEnabled(1))
++        assertTrue(cleanDeleteButtonEnabled(42))
++    }
++
++    // ---- sshKeyChoiceAvailability ----
++
++    @Test
++    fun `key choice availability follows both libraries`() {
++        val both = sshKeyChoiceAvailability(hasTemplates = true, hasKeys = true)
++        assertTrue(both.templateEnabled)
++        assertFalse(both.templateHintVisible)
++        assertTrue(both.vaultPickEnabled)
++        assertFalse(both.vaultHintVisible)
++
++        val neither = sshKeyChoiceAvailability(hasTemplates = false, hasKeys = false)
++        assertFalse(neither.templateEnabled)
++        assertTrue(neither.templateHintVisible)
++        assertFalse(neither.vaultPickEnabled)
++        assertTrue(neither.vaultHintVisible)
++
++        val templatesOnly = sshKeyChoiceAvailability(hasTemplates = true, hasKeys = false)
++        assertTrue(templatesOnly.templateEnabled)
++        assertFalse(templatesOnly.vaultPickEnabled)
++        assertTrue(templatesOnly.vaultHintVisible)
++
++        val keysOnly = sshKeyChoiceAvailability(hasTemplates = false, hasKeys = true)
++        assertFalse(keysOnly.templateEnabled)
++        assertTrue(keysOnly.templateHintVisible)
++        assertTrue(keysOnly.vaultPickEnabled)
++    }
++
++    // ---- usageRangeLabelRes ----
++
++    @Test
++    fun `usage range maps to its label resource`() {
++        assertEquals(R.string.usage_stats_range_today, usageRangeLabelRes(UsageRange.TODAY))
++        assertEquals(R.string.usage_stats_range_7d, usageRangeLabelRes(UsageRange.LAST_7_DAYS))
++        assertEquals(R.string.usage_stats_range_30d, usageRangeLabelRes(UsageRange.LAST_30_DAYS))
++        assertEquals(R.string.usage_stats_range_all, usageRangeLabelRes(UsageRange.ALL_TIME))
++    }
++
++    // ---- Int?.toCountState ----
++
++    @Test
++    fun `null count is loading and numbers are ready`() {
++        assertEquals(CountState.Loading, (null as Int?).toCountState())
++        assertEquals(CountState.Ready(0), (0 as Int?).toCountState())
++        assertEquals(CountState.Ready(7), (7 as Int?).toCountState())
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyTest.kt
+index f3db37d36..e0f0c1f15 100644
+--- a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkProxyTest.kt
+@@ -1,5 +1,6 @@
+ package me.rerere.rikkahub.ui.pages.setting
+ 
++import me.rerere.rikkahub.ui.components.setting.canTestProxyUrl
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePortTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePortTest.kt
+index 80c96334b..761cdf1ca 100644
+--- a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePortTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingWebBridgePortTest.kt
+@@ -1,5 +1,6 @@
+ package me.rerere.rikkahub.ui.pages.setting
+ 
++import me.rerere.rikkahub.ui.components.setting.webBridgePortValid
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
+ import org.junit.Test
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditCountSuffixTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditCountSuffixTest.kt
+new file mode 100644
+index 000000000..9f4d33b6b
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/VaultPageAuditCountSuffixTest.kt
+@@ -0,0 +1,28 @@
++package me.rerere.rikkahub.ui.pages.setting
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * 凭证库审计条目计数后缀（[auditCountSuffix]）：同一调用点多次出现时只在文案后追加 ` ×N`。
++ * 渲染本身仍需真机；这里只钉「0/1 不显示、>1 显示次数」的映射。
++ */
++class VaultPageAuditCountSuffixTest {
++
++    @Test
++    fun `zero and one show no suffix`() {
++        assertEquals("", auditCountSuffix(0))
++        assertEquals("", auditCountSuffix(1))
++    }
++
++    @Test
++    fun `more than one shows the count`() {
++        assertEquals(" ×2", auditCountSuffix(2))
++        assertEquals(" ×10", auditCountSuffix(10))
++    }
++
++    @Test
++    fun `negative count shows no suffix`() {
++        assertEquals("", auditCountSuffix(-1))
++    }
++}
+diff --git a/search/src/test/java/me/rerere/search/SearchServiceHttpClientTest.kt b/search/src/test/java/me/rerere/search/SearchServiceHttpClientTest.kt
+new file mode 100644
+index 000000000..aaa83d731
+--- /dev/null
++++ b/search/src/test/java/me/rerere/search/SearchServiceHttpClientTest.kt
+@@ -0,0 +1,24 @@
++package me.rerere.search
++
++import me.rerere.common.android.SafeRequestLoggingInterceptor
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * 搜索请求挂最小请求日志拦截器（[SearchService.httpClient] 兜底 client）。
++ *
++ * 只记 host + 状态码 + 耗时，不记 path/query/headers/body（搜索 URL 含查询词，
++ * `:common` 层无脱敏能力）。`init()` 换上 DI client 后走 `:app` 的完整拦截器，
++ * 本用例只钉兜底 client 这一路。
++ */
++class SearchServiceHttpClientTest {
++
++    @Test
++    fun `fallback client carries the safe request logging interceptor`() {
++        assertTrue(
++            "expected SafeRequestLoggingInterceptor on SearchService.httpClient, " +
++                "got: ${SearchService.httpClient.interceptors.map { it.javaClass.name }}",
++            SearchService.httpClient.interceptors.any { it is SafeRequestLoggingInterceptor },
++        )
++    }
++}
+diff --git a/workspace/src/test/java/me/rerere/workspace/WorkspaceFileSystemDotFileConflictTest.kt b/workspace/src/test/java/me/rerere/workspace/WorkspaceFileSystemDotFileConflictTest.kt
+new file mode 100644
+index 000000000..265a32e29
+--- /dev/null
++++ b/workspace/src/test/java/me/rerere/workspace/WorkspaceFileSystemDotFileConflictTest.kt
+@@ -0,0 +1,78 @@
++package me.rerere.workspace
++
++import org.junit.Assert.assertEquals
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.TemporaryFolder
++import java.io.ByteArrayInputStream
++
++/**
++ * 点文件导入冲突改名（[WorkspaceFileSystem.importBytes] 经私有 [WorkspaceFileSystem.resolveConflict]）。
++ *
++ * 点文件（如 `.gitignore`）的 `nameWithoutExtension` 为空，若直接套 `"$stem ($n)$ext"` 会产出
++ * 首字符是空格的名字；此时把整个文件名当 stem 用。远端 SFTP 执行本身仍需真机，
++ * 这里只覆盖本地冲突改名的纯文件行为。
++ */
++class WorkspaceFileSystemDotFileConflictTest {
++    @get:Rule
++    val tempFolder = TemporaryFolder()
++
++    private val fs = WorkspaceFileSystem()
++
++    private fun importText(root: java.io.File, path: String, text: String): WorkspaceFileEntry =
++        fs.importBytes(root, path, ByteArrayInputStream(text.toByteArray()))
++
++    @Test
++    fun `second gitignore import is renamed with whole name as stem`() {
++        val root = tempFolder.newFolder("workspace")
++        importText(root, ".gitignore", "node_modules\n")
++        val second = importText(root, ".gitignore", "*.log\n")
++
++        assertEquals(".gitignore (1)", second.name)
++        assertEquals(".gitignore (1)", second.path)
++        assertEquals("node_modules\n", java.io.File(root, ".gitignore").readText())
++        assertEquals("*.log\n", java.io.File(root, ".gitignore (1)").readText())
++    }
++
++    @Test
++    fun `second env import is renamed with whole name as stem`() {
++        val root = tempFolder.newFolder("workspace")
++        importText(root, ".env", "A=1\n")
++        val second = importText(root, ".env", "B=2\n")
++
++        assertEquals(".env (1)", second.name)
++        assertEquals(".env (1)", second.path)
++    }
++
++    @Test
++    fun `third gitignore import increments the suffix`() {
++        val root = tempFolder.newFolder("workspace")
++        importText(root, ".gitignore", "first\n")
++        importText(root, ".gitignore", "second\n")
++        val third = importText(root, ".gitignore", "third\n")
++
++        assertEquals(".gitignore (2)", third.name)
++        assertEquals(".gitignore (2)", third.path)
++    }
++
++    @Test
++    fun `dotfile with extension keeps the extension after the suffix`() {
++        val root = tempFolder.newFolder("workspace")
++        importText(root, ".config.json", "{}\n")
++        val second = importText(root, ".config.json", "{\"a\":1}\n")
++
++        // `.config.json` 的 nameWithoutExtension 是 `.config`（非空），不走点文件分支。
++        assertEquals(".config (1).json", second.name)
++        assertEquals(".config (1).json", second.path)
++    }
++
++    @Test
++    fun `ordinary file still splits stem and extension`() {
++        val root = tempFolder.newFolder("workspace")
++        importText(root, "notes.txt", "first\n")
++        val second = importText(root, "notes.txt", "second\n")
++
++        assertEquals("notes (1).txt", second.name)
++        assertEquals("notes (1).txt", second.path)
++    }
++}
