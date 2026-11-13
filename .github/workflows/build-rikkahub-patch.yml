@@ -59,11 +59,24 @@ jobs:
       PATCH_PATH: ${{ github.event.inputs.patch_path }}
       GRADLE_TASKS: ${{ github.event.inputs.gradle_tasks || ':app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest' }}
     steps:
+      - name: 解析 base 为完整 SHA
+        id: resolve-base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          # actions/checkout 把短 SHA 当分支名处理（refs/heads/<短 SHA>），
+          # fetch 不到就挂；先调 API 解析成完整 SHA 再 checkout。
+          FULL_SHA=$(gh api "repos/xiwangone/rikkahub-agents/commits/${BASE_SHA}" --jq '.sha')
+          if [ -z "$FULL_SHA" ]; then echo "base $BASE_SHA 解析失败"; exit 1; fi
+          echo "sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "base: $BASE_SHA -> $FULL_SHA"
+
       - name: 取 rikkahub-agents（base，工作区根目录）
         uses: actions/checkout@v4
         with:
           repository: xiwangone/rikkahub-agents
-          ref: ${{ env.BASE_SHA }}
+          ref: ${{ steps.resolve-base.outputs.sha }}
           fetch-depth: 1
           submodules: true
 
