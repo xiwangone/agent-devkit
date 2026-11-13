@@ -1,0 +1,1219 @@
+diff --git a/app/src/main/assets/chroot/chroot-run.sh b/app/src/main/assets/chroot/chroot-run.sh
+index cc8a9b84f..9bb097586 100755
+--- a/app/src/main/assets/chroot/chroot-run.sh
++++ b/app/src/main/assets/chroot/chroot-run.sh
+@@ -89,7 +89,10 @@ do_unmount_quiet() {
+         ( umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true ) &
+     done
+     wait
+-    rm -rf "$ROOTFS"/.chroot-mounted "$ROOTFS"/.chroot-fixed "$ROOTFS"/.chroot-lock 2>/dev/null || true
++    # 只删挂载标记：.chroot-fixed 是 do_fixes 已完成的标记，删掉会让下次重跑修复
++    #（只影响速度）；.chroot-lock 全脚本只在删除处出现、从未被创建或检查，是死标记，
++    # 已随本行一并去掉。显式全量拆卸（do_unmount）仍清全部 .chroot-*，不受影响。
++    rm -rf "$ROOTFS"/.chroot-mounted 2>/dev/null || true
+ }
+ 
+ do_unmount() {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/TermuxCliCommandExecutor.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/TermuxCliCommandExecutor.kt
+index 123d18d0c..7084ee8c2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/TermuxCliCommandExecutor.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/TermuxCliCommandExecutor.kt
+@@ -66,13 +66,13 @@ class TermuxCliCommandExecutor(
+         // 本路径无全局默认来源）；execOneShot 只收已包装好的命令，故平台在此处用于包装，轮换开关直接透传。
+         val resolvedWindows = RemotePlatform.resolveWindows(
+             RemotePlatform.platformFromStored(host.platform),
+-            probePreferredWindows(context, host.host, host.port),
++            probePreferredWindows(context, host.host, host.port, host.user),
+             null,
+         )
+         val effectiveCommand = withUtf8ConsoleEncoding(command, resolvedWindows)
+         val payload =
+             runCancellableSshOp(SSH_TIMEOUT_MS) { sessionRef ->
+-                execOneShot(context, host.host, host.port, host.user, auth, effectiveCommand, SSH_TIMEOUT_MS.toInt(), sessionRef, allowHostKeyRotation = host.allowHostKeyRotation, platformWindows = resolvedWindows)
++                execOneShot(context, host.host, host.port, host.user, auth, effectiveCommand, SSH_TIMEOUT_MS.toInt(), sessionRef, allowHostKeyRotation = host.allowHostKeyRotation)
+             }
+         val stdout = payload["stdout"]?.jsonPrimitive?.contentOrNull?.trim()
+         if (!stdout.isNullOrBlank()) return stdout
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RemotePlatform.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RemotePlatform.kt
+index 93a3dd0c6..7d5a93f3a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RemotePlatform.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RemotePlatform.kt
+@@ -21,8 +21,19 @@ internal object RemotePlatform {
+     /** 服务端版本串里的 Windows 标识（大小写无关）。 */
+     private const val WINDOWS_MARKER = "for_windows"
+ 
+-    /** 缓存键：同一主机大小写/首尾空白差异不应产生两条记录。 */
+-    fun cacheKey(host: String, port: Int): String = "${host.trim().lowercase()}:$port"
++    /**
++     * 缓存键：同一主机大小写/首尾空白差异不应产生两条记录。
++     *
++     * 探针缓存的键含登录用户名（同一主机的 shell/工具因用户而异）；[user] 为空时退回
++     * 旧 host:port 键——平台缓存（banner 结论与登录用户无关）与旧数据迁移读取用它。
++     * 两处键格式不再相同是有意的：探针结果因用户而异，banner 结论不因用户而异；
++     * 平台缓存仍按 host:port 存取。
++     */
++    fun cacheKey(host: String, port: Int, user: String? = null): String {
++        val base = "${host.trim().lowercase()}:$port"
++        val u = user?.trim()?.lowercase().orEmpty()
++        return if (u.isEmpty()) base else "$base:$u"
++    }
+ 
+     /** 由服务端版本串判定是否 Windows 远端；无法判定返回 `null`（调用方回退）。 */
+     fun isWindowsServer(serverVersion: String?): Boolean? {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStore.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStore.kt
+index 018fd1077..3e8b99d9c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStore.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStore.kt
+@@ -14,13 +14,26 @@ import me.rerere.rikkahub.utils.JsonInstant
+ import me.rerere.workspace.ssh.SshHostProbeResult
+ 
+ /**
+- * 首次连接主机探针结果缓存，与 [RemotePlatformStore] 同一个 DataStore 模式、
+- * 同一个 host:port 键（[RemotePlatform.cacheKey]）：app SSH 探出来的结果，
+- * 远程工作区能直接用，反之亦然；两者读写同一份缓存，不各写一份。
++ * 首次连接主机探针结果缓存，与 [RemotePlatformStore] 同一个 DataStore 模式：
++ * app SSH 探出来的结果，远程工作区能直接用，反之亦然；两者读写同一份缓存，不各写一份。
++ *
++ * 键：探针缓存的键含登录用户名（[RemotePlatform.cacheKey]，host:port:user；同一主机的
++ * shell/工具因用户而异）。平台缓存（banner 结论与登录用户无关）仍用 host:port 键，
++ * 两处键格式不再相同是有意的，见 [RemotePlatform.cacheKey]。
++ * 读时先查 user 键、再回退旧 host:port 键（老版本写下的条目仍可读；写只走 user 键）。
++ *
++ * 过期：成功结果用 [SshHostProbeResult.probedAtMs] 判过期，TTL [POSITIVE_TTL_MS]（30 天；
++ * 主机重装会换系统摘要，30 天是“缓存仍有用”与“摘要不过时太久”的折中）。过期视作未命中重探。
++ *
++ * 否定缓存：探针失败（路由器/交换机/ForceCommand/受限 shell 拿不到 END 标记等）也写一条
++ * 带时间戳的否定记录，TTL [NEGATIVE_TTL_MS]（24 小时；失败多为远端限制而非瞬时网络，
++ * 24 小时内自动入口不再重探，手动入口仍可重跑）。成功解析会覆盖掉同一键的否定记录。
++ * 否定记录与成功结果分开存（不借用 SshHostProbeResult 的 platform 字段做标记，
++ * 避免消费者把失败标记误读成平台结论）。
+  *
+  * 保留最近 100 条防无界增长（与 RemotePlatformStore 同口径）。
+  * 探针缓存与平台缓存是两份数据：平台缓存（banner 结论）由 execOneShot 每次建连回填；
+- * 探针缓存只在首次连接（无缓存时）跑探针后写入，或测试连接时手动刷新覆盖。
++ * 探针缓存只在显式入口（测试连接）或 AUTO 模式的进工作区自动补一次时写入。
+  * 平台决议读探针缓存优先（探针是真实执行，比 banner 字符串更可靠），见
+  * [probePreferredWindows]。
+  *
+@@ -32,12 +45,21 @@ private val Context.hostProbeDataStore: DataStore<Preferences> by preferencesDat
+ 
+ class SshHostProbeStore(private val context: Context) {
+     private val probesKey = stringPreferencesKey("probes")
++    private val failuresKey = stringPreferencesKey("probe_failures")
+ 
+-    suspend fun get(host: String, port: Int): SshHostProbeResult? =
+-        readAll()[RemotePlatform.cacheKey(host, port)]
++    /** 成功结果：user 键优先，旧 host:port 键回退；过期视作未命中。 */
++    suspend fun get(host: String, port: Int, user: String? = null): SshHostProbeResult? {
++        val map = readAll()
++        val now = System.currentTimeMillis()
++        for (key in probeKeys(host, port, user)) {
++            val result = map[key] ?: continue
++            if (isFresh(result, now)) return result
++        }
++        return null
++    }
+ 
+-    suspend fun put(host: String, port: Int, result: SshHostProbeResult) {
+-        val key = RemotePlatform.cacheKey(host, port)
++    suspend fun put(host: String, port: Int, result: SshHostProbeResult, user: String? = null) {
++        val key = RemotePlatform.cacheKey(host, port, user)
+         context.hostProbeDataStore.edit { prefs ->
+             val map = readAll().toMutableMap()
+             map.remove(key)
+@@ -48,22 +70,78 @@ class SshHostProbeStore(private val context: Context) {
+                 MapSerializer(String.serializer(), SshHostProbeResult.serializer()),
+                 trimmed,
+             )
++            // 成功解析覆盖同一键的否定记录（下次不再因旧失败跳过）。
++            val failures = readFailures().toMutableMap()
++            if (failures.remove(key) != null) {
++                prefs[failuresKey] = JsonInstant.encodeToString(
++                    MapSerializer(String.serializer(), Long.serializer()),
++                    failures,
++                )
++            }
++        }
++    }
++
++    /** 探针失败也记一条带时间戳的否定记录（24h 内自动入口不再重探，手动入口不受影响）。 */
++    suspend fun putFailure(
++        host: String,
++        port: Int,
++        user: String? = null,
++        failedAtMs: Long = System.currentTimeMillis(),
++    ) {
++        val key = RemotePlatform.cacheKey(host, port, user)
++        context.hostProbeDataStore.edit { prefs ->
++            val failures = readFailures().toMutableMap()
++            failures.remove(key)
++            failures[key] = failedAtMs
++            val now = System.currentTimeMillis()
++            val trimmed = failures.entries
++                .filter { now - it.value <= NEGATIVE_TTL_MS }
++                .toList().takeLast(KEEP)
++                .associate { it.key to it.value }
++            prefs[failuresKey] = JsonInstant.encodeToString(
++                MapSerializer(String.serializer(), Long.serializer()),
++                trimmed,
++            )
+         }
+     }
+ 
+-    /** 清掉某台主机的探针缓存（供“重新探测”入口调用；测试连接每次重跑会直接覆盖，无需先清）。 */
+-    suspend fun clear(host: String, port: Int) {
+-        val key = RemotePlatform.cacheKey(host, port)
++    /** 否定缓存是否命中（TTL 内才算命中；过期视作未命中）。 */
++    suspend fun isNegativeCached(host: String, port: Int, user: String? = null): Boolean {
++        val failedAt = readFailures()[RemotePlatform.cacheKey(host, port, user)] ?: return false
++        return System.currentTimeMillis() - failedAt <= NEGATIVE_TTL_MS
++    }
++
++    /** 清掉指定主机的探针缓存（测试连接每次重跑会直接覆盖，无需先清）。同时清掉否定记录，下次不再跳过。 */
++    suspend fun clear(host: String, port: Int, user: String? = null) {
++        val keys = probeKeys(host, port, user)
+         context.hostProbeDataStore.edit { prefs ->
+             val map = readAll().toMutableMap()
+-            map.remove(key)
++            keys.forEach { map.remove(it) }
+             prefs[probesKey] = JsonInstant.encodeToString(
+                 MapSerializer(String.serializer(), SshHostProbeResult.serializer()),
+                 map,
+             )
++            val failures = readFailures().toMutableMap()
++            var changed = false
++            keys.forEach { if (failures.remove(it) != null) changed = true }
++            if (changed) {
++                prefs[failuresKey] = JsonInstant.encodeToString(
++                    MapSerializer(String.serializer(), Long.serializer()),
++                    failures,
++                )
++            }
+         }
+     }
+ 
++    private fun probeKeys(host: String, port: Int, user: String?): List<String> {
++        val keyed = RemotePlatform.cacheKey(host, port, user)
++        val legacy = RemotePlatform.cacheKey(host, port)
++        return if (keyed == legacy) listOf(legacy) else listOf(keyed, legacy)
++    }
++
++    private fun isFresh(result: SshHostProbeResult, nowMs: Long): Boolean =
++        result.probedAtMs > 0 && nowMs - result.probedAtMs <= POSITIVE_TTL_MS
++
+     private suspend fun readAll(): Map<String, SshHostProbeResult> {
+         val raw = context.hostProbeDataStore.data.map { it[probesKey] }.first() ?: return emptyMap()
+         return runCatching {
+@@ -74,8 +152,22 @@ class SshHostProbeStore(private val context: Context) {
+         }.getOrDefault(emptyMap())
+     }
+ 
++    private suspend fun readFailures(): Map<String, Long> {
++        val raw = context.hostProbeDataStore.data.map { it[failuresKey] }.first() ?: return emptyMap()
++        return runCatching {
++            JsonInstant.decodeFromString(
++                MapSerializer(String.serializer(), Long.serializer()),
++                raw,
++            )
++        }.getOrDefault(emptyMap())
++    }
++
+     companion object {
+         private const val KEEP = 100
++        /** 成功结果 TTL：30 天（主机重装会换系统摘要，30 天是缓存收益与摘要时效的折中）。 */
++        internal const val POSITIVE_TTL_MS = 30L * 24 * 60 * 60 * 1000
++        /** 否定记录 TTL：24 小时（失败多为远端限制而非瞬时网络，24 小时内不再自动重探）。 */
++        internal const val NEGATIVE_TTL_MS = 24L * 60 * 60 * 1000
+     }
+ }
+ 
+@@ -83,6 +175,6 @@ class SshHostProbeStore(private val context: Context) {
+  * 平台决议的缓存读数统一入口（两边共用）：探针结果优先于 banner 缓存。
+  * 探针跑出来的平台是真实执行的结果，不一致时以探针为准；无探针结果时回退 banner 缓存。
+  */
+-internal suspend fun probePreferredWindows(context: Context, host: String, port: Int): Boolean? =
+-    SshHostProbeStore(context).get(host, port)?.isWindows
++internal suspend fun probePreferredWindows(context: Context, host: String, port: Int, user: String? = null): Boolean? =
++    SshHostProbeStore(context).get(host, port, user)?.isWindows
+         ?: RemotePlatformStore(context).get(host, port)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostsTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostsTool.kt
+index 8aad26d8d..f3d7b4fae 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostsTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshHostsTool.kt
+@@ -526,7 +526,7 @@ fun sshExecSavedTool(
+         // 注意：env 前置用主 host 的平台（fallback 候选各有自己的平台，但 env 语句在循环外只拼一次）。
+         if (env.isNotEmpty() && !background) {
+             val mainExplicit = RemotePlatform.explicitOrStored(explicitPlatform, RemotePlatform.platformFromStored(h.platform))
+-            val mainCached = probePreferredWindows(context, h.host, h.port)
++            val mainCached = probePreferredWindows(context, h.host, h.port, h.user)
+             val mainWindows = RemotePlatform.resolveWindows(mainExplicit, mainCached, globalDefault)
+             val envStyle = p["env_style"]?.jsonPrimitive?.contentOrNull
+             val envWindows = when {
+@@ -598,12 +598,12 @@ fun sshExecSavedTool(
+             // 命令包装按候选各自取值：主 host 的平台/缓存不能套到 fallback host 身上
+             // （旧实现在循环外用主 host 缓存一次性算好 effectiveCommand）。
+             val candExplicit = RemotePlatform.explicitOrStored(explicitPlatform, RemotePlatform.platformFromStored(cand.platform))
+-            val candCached = probePreferredWindows(context, cand.host, cand.port)
++            val candCached = probePreferredWindows(context, cand.host, cand.port, cand.user)
+             val candWindows = RemotePlatform.resolveWindows(candExplicit, candCached, globalDefault)
+             val (detachedCmd, candBgLogPath) = if (background) wrapDetachedCommandSmart(finalCommand, windows = candWindows) else (withUtf8ConsoleEncoding(finalCommand, candWindows) to null)
+             val effectiveCommand = detachedCmd
+             val payload = runCancellableSshOp(timeoutSec * 1000L) { sessionRef ->
+-                execOneShot(context, cand.host, cand.port, cand.user, candAuth, effectiveCommand, timeoutSec * 1000, sessionRef, stdin, jump = jumpSpec, extraOptions = cand.sshOptions, allowHostKeyRotation = cand.allowHostKeyRotation, platformWindows = candWindows)
++                execOneShot(context, cand.host, cand.port, cand.user, candAuth, effectiveCommand, timeoutSec * 1000, sessionRef, stdin, jump = jumpSpec, extraOptions = cand.sshOptions, allowHostKeyRotation = cand.allowHostKeyRotation)
+             }
+             tried.add(cand.name to classifySshPayload(payload))
+             val err = payload["error"]?.jsonPrimitive?.contentOrNull
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt
+index e5a9b6640..e5310854c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt
+@@ -28,8 +28,6 @@ import kotlinx.serialization.json.put
+ import me.rerere.ai.core.InputSchema
+ import me.rerere.ai.core.Tool
+ import me.rerere.ai.ui.UIMessagePart
+-import me.rerere.workspace.WorkspaceCommandResult
+-import me.rerere.workspace.ssh.SshHostProbe
+ import java.io.ByteArrayInputStream
+ import java.io.File
+ import java.io.FileOutputStream
+@@ -221,7 +219,7 @@ fun sshExecTool(context: Context, settingsStore: SettingsStore? = null): Tool =
+         // 平台判定：显式参数 > 落盘缓存（探针结论优先于 banner 结论）> 全局默认设置；
+         // 都未命中再退回命令特征
+         val explicitPlatform = p["platform"]?.jsonPrimitive?.contentOrNull?.let { SshPlatform.fromPreference(it) }
+-        val knownPlatform = probePreferredWindows(context, host, port)
++        val knownPlatform = probePreferredWindows(context, host, port, user)
+         val globalDefault = settingsStore?.settingsFlow?.value?.defaultSshPlatform
+         val resolvedWindows = RemotePlatform.resolveWindows(explicitPlatform, knownPlatform, globalDefault)
+         val (detachedCmd, bgLogPath) = if (background) wrapDetachedCommandSmart(command, windows = resolvedWindows) else (withUtf8ConsoleEncoding(command, resolvedWindows) to null)
+@@ -247,7 +245,7 @@ fun sshExecTool(context: Context, settingsStore: SettingsStore? = null): Tool =
+         val effectiveCommand =
+             if (envPrefix.isEmpty()) detachedCmd else joinCommandBatch(envPrefix + listOf(detachedCmd))
+         val payload = runCancellableSshOp(timeoutSec * 1000L) { sessionRef ->
+-            execOneShot(context, host, port, user, auth, effectiveCommand, timeoutSec * 1000, sessionRef, stdin, platformWindows = resolvedWindows)
++            execOneShot(context, host, port, user, auth, effectiveCommand, timeoutSec * 1000, sessionRef, stdin)
+         }
+         val finalPayload = if (bgLogPath != null) {
+             payload.toString() + "\n[bg_log_path] $bgLogPath"
+@@ -311,11 +309,6 @@ internal suspend fun execOneShot(
+      * 默认关——关时保持原有行为（结构化 host_key_changed 信封，不自动清 key）。
+      */
+     allowHostKeyRotation: Boolean = false,
+-    /**
+-     * 调用方已决议的平台（true=Windows、false=POSIX、null=未决议）：供首次连接探针
+-     * 选脚本用；null 时探针走 AUTO（POSIX 先、拿不到信号再试 Windows）。
+-     */
+-    platformWindows: Boolean? = null,
+ ): JsonObject {
+     // Stage 1 (suspend): low-level reachability probe in parallel across every transport.
+     // JSch's connect timeout fires at the END of the SSH handshake, so when the network is
+@@ -377,9 +370,10 @@ internal suspend fun execOneShot(
+             }
+             try {
+                 val result = runOnSession(session, command, timeoutMs, stdin)
+-                // 首次连接主机探针：缓存未命中时才跑，跑完落盘供后续命令/工作区复用；
+-                // 放在用户命令之后，不延迟本次命令；失败不影响本次返回。
+-                runCatching { maybeProbeHost(context, host, port, platformWindows, session) }
++                // 主机探针不在这里跑：探针最坏 30s，会吃掉调用方超时预算、丢弃已成功的
++                // 命令输出（副作用已发生、模型重试会重复执行）。探针只走显式入口
++                // （测试连接）或 AUTO 模式的进工作区自动补一次（独立协程 + 自有会话 +
++                // 预算，不占调用方超时，见 WorkspaceRepositoryHelpers）。
+                 result
+             } catch (e: Throwable) {
+                 ToolErrors.envelopeFor(error = "tool_failed", message = "exec failed: ${e.message ?: "unknown"}")
+@@ -399,48 +393,6 @@ internal suspend fun execOneShot(
+     }
+ }
+ 
+-/**
+- * 首次连接主机探针（app SSH 侧触发点，与远程工作区后端共用 [SshHostProbe]）。
+- * 缓存命中直接返回；未命中时在当前会话上跑一次探针，写回探针缓存与平台缓存
+- * （探针结论优先于 banner，见 [probePreferredWindows]）。
+- * runOnSession 不按平台自动包 pwsh，故 execWrapsWindows=false，Windows 探针走
+- * [SshHostProbe.windowsProbeCommand] 的预编码形式。调用方用 runCatching 包住，
+- * 探针的任何失败都不影响本次连接与本次返回。
+- */
+-private fun maybeProbeHost(
+-    context: Context,
+-    host: String,
+-    port: Int,
+-    platformWindows: Boolean?,
+-    session: Session,
+-) {
+-    val store = SshHostProbeStore(context)
+-    val cached = kotlinx.coroutines.runBlocking { store.get(host, port) }
+-    if (cached != null) return
+-    val platform = when (platformWindows) {
+-        true -> "WINDOWS"
+-        false -> "LINUX"
+-        null -> "AUTO"
+-    }
+-    val result = SshHostProbe.runProbe(
+-        exec = { script, timeout ->
+-            val obj = runOnSession(session, script, timeout.toInt())
+-            WorkspaceCommandResult(
+-                exitCode = obj["exit_code"]?.jsonPrimitive?.intOrNull ?: -1,
+-                stdout = obj["stdout"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+-                stderr = obj["stderr"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+-            )
+-        },
+-        platform = platform,
+-        execWrapsWindows = false,
+-    ) ?: return
+-    AppLog.i(TAG_SSH, "host probe for $host:$port: ${result.summary()}")
+-    kotlinx.coroutines.runBlocking {
+-        store.put(host, port, result)
+-        RemotePlatformStore(context).put(host, port, result.isWindows)
+-    }
+-}
+-
+ private data class SshConnectionResources(
+     val session: com.jcraft.jsch.Session,
+     val tunnel: JumpTunnelProxy?,
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
+index 06e9f0745..6ff03fef8 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
+@@ -248,6 +248,9 @@ class SettingsStore(
+         // 默认 SSH 目标系统类型
+         val DEFAULT_SSH_PLATFORM = stringPreferencesKey("default_ssh_platform")
+ 
++        // SSH 主机探针触发模式
++        val SSH_HOST_PROBE = stringPreferencesKey("ssh_host_probe")
++
+         // 提示词注入
+         val MODE_INJECTIONS = stringPreferencesKey("mode_injections")
+         val LOREBOOKS = stringPreferencesKey("lorebooks")
+@@ -457,6 +460,7 @@ subAgents = preferences[SUB_AGENTS]?.let { raw ->
+                 webServerLocalhostOnly = preferences[WEB_SERVER_LOCALHOST_ONLY] == true,
+                 aiLogLevel = AiLogLevel.fromPreference(preferences[AI_LOG_LEVEL]),
+                 defaultSshPlatform = SshPlatform.fromPreference(preferences[DEFAULT_SSH_PLATFORM]),
++                sshHostProbe = SshHostProbeMode.fromPreference(preferences[SSH_HOST_PROBE]),
+                 backupReminderConfig = decodePrefOrDefault(preferences[BACKUP_REMINDER_CONFIG], BackupReminderConfig()),
+                 backupEncryptionEnabled = preferences[BACKUP_ENCRYPTION_ENABLED] ?: false,
+                 backupEncryptionPasswordEnc = preferences[BACKUP_ENCRYPTION_PASSWORD_ENC] ?: "",
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStoreCodec.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStoreCodec.kt
+index 310a5d775..1aae53bf2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStoreCodec.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStoreCodec.kt
+@@ -74,6 +74,7 @@ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SELECT_ASSISTAN
+ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SELECT_MODEL
+ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SETTING_SHORTCUT_IDS
+ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SPONSOR_ALERT_DISMISSED_AT
++import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SSH_HOST_PROBE
+ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SUB_AGENTS
+ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SUB_AGENT_DEFAULT_WORKSPACE
+ import me.rerere.rikkahub.data.datastore.SettingsStore.Companion.SUB_AGENT_FOREGROUND_RECEIPT
+@@ -505,6 +506,7 @@ internal suspend fun persistSettingsTo(
+         preferences[WEB_SERVER_LOCALHOST_ONLY] = settings.webServerLocalhostOnly
+         preferences[AI_LOG_LEVEL] = settings.aiLogLevel.preferenceName
+         preferences[DEFAULT_SSH_PLATFORM] = settings.defaultSshPlatform.preferenceName
++        preferences[SSH_HOST_PROBE] = settings.sshHostProbe.preferenceName
+         preferences.putJsonIfChanged(
+             BACKUP_REMINDER_CONFIG,
+             previous,
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+index c93689735..221a55a0c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+@@ -219,6 +219,8 @@ data class Settings(
+     val aiLogLevel: AiLogLevel = AiLogLevel.INFO,
+     /** 默认 SSH 目标系统类型（新建主机未指定时使用；AUTO = 自动探测） */
+     val defaultSshPlatform: SshPlatform = SshPlatform.AUTO,
++    /** SSH 主机探针触发模式（默认仅手动：只走显式入口；自动才会在进工作区时补一次） */
++    val sshHostProbe: SshHostProbeMode = SshHostProbeMode.MANUAL_ONLY,
+     val backupReminderConfig: BackupReminderConfig = BackupReminderConfig(),
+     /** 备份包整包口令加密总开关（WebDAV/S3/本地全通道生效；默认关=明文兼容旧包）。 */
+     val backupEncryptionEnabled: Boolean = false,
+@@ -288,6 +290,24 @@ enum class SshPlatform(val preferenceName: String) {
+     }
+ }
+ 
++/**
++ * SSH 主机探针触发模式（设置项 `ssh_host_probe`，默认仅手动）：
++ * - AUTO：首次连接可自动探（进工作区自动补一次，走独立协程 + 自有会话 + 预算，不占调用方超时）；
++ * - MANUAL_ONLY：只走显式入口（测试连接、工作区页按钮）；
++ * - OFF：永不探测。
++ */
++@Serializable
++enum class SshHostProbeMode(val preferenceName: String) {
++    AUTO("AUTO"),
++    MANUAL_ONLY("MANUAL_ONLY"),
++    OFF("OFF");
++
++    companion object {
++        fun fromPreference(value: String?): SshHostProbeMode =
++            entries.firstOrNull { it.preferenceName == value } ?: MANUAL_ONLY
++    }
++}
++
+ @Serializable
+ enum class ChatFontFamily {
+     @SerialName("default")
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/repository/WorkspaceRepositoryHelpers.kt b/app/src/main/java/me/rerere/rikkahub/data/repository/WorkspaceRepositoryHelpers.kt
+index d2f3cc826..6b0dfbbf8 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/repository/WorkspaceRepositoryHelpers.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/repository/WorkspaceRepositoryHelpers.kt
+@@ -2,8 +2,11 @@ package me.rerere.rikkahub.data.repository
+ 
+ import android.content.Context
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.flow.map
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.runInterruptible
+ import kotlinx.coroutines.withContext
+ import me.rerere.rikkahub.data.ai.tools.local.HostAuthResolution
+@@ -12,6 +15,7 @@ import me.rerere.rikkahub.data.ai.tools.local.RemotePlatformStore
+ import me.rerere.rikkahub.data.ai.tools.local.SshHostProbeStore
+ import me.rerere.rikkahub.data.ai.tools.local.probePreferredWindows
+ import me.rerere.rikkahub.data.ai.tools.local.resolveHostAuthDetailed
++import me.rerere.rikkahub.data.datastore.SshHostProbeMode
+ import me.rerere.rikkahub.data.datastore.SshPlatform
+ import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
+ import me.rerere.rikkahub.data.model.SshWorkspaceDraft
+@@ -37,6 +41,7 @@ import me.rerere.workspace.ssh.SshHostProbe
+ import me.rerere.workspace.ssh.SshJumpHostConfig
+ import me.rerere.workspace.ssh.SshProbeResult
+ import me.rerere.workspace.ssh.SshWorkspaceBackend
++import me.rerere.workspace.ssh.probeBudgetMs
+ import org.koin.java.KoinJavaComponent.getKoin
+ import java.io.ByteArrayOutputStream
+ import java.io.IOException
+@@ -51,7 +56,9 @@ import me.rerere.rikkahub.data.log.AppLog
+ internal suspend fun WorkspaceRepository.probeSshImpl(id: String?, draft: SshWorkspaceDraft): SshProbeResult {
+         val previous = id?.let { dao.getById(it)?.sshSettings() }
+         val config = withContext(Dispatchers.IO) { toConnectionConfig(draft.toSettings(previous), audit = false) }
+-        val result = runInterruptible(Dispatchers.IO) { sshPool.probe(config) }
++        // 设置为关闭时不跑探针（hostProbe 保持 null，不写缓存）；其余两档都走显式入口跑一次。
++        val includeHostProbe = settingsStore.settingsFlow.value.sshHostProbe != SshHostProbeMode.OFF
++        val result = runInterruptible(Dispatchers.IO) { sshPool.probe(config, includeHostProbe) }
+         // 测试连接每次重跑探针（手动刷新入口）：探针结果写回探针缓存（app SSH 与
+         // 工作区共用同一份），平台结论同时写回平台缓存（探针优先于 banner）。
+         // 探针失败只记 null，不影响本次测试连接结果；写缓存失败同样不影响。
+@@ -60,7 +67,7 @@ internal suspend fun WorkspaceRepository.probeSshImpl(id: String?, draft: SshWor
+             val context = runCatching { getKoin().get<Context>() }.getOrNull()
+             if (context != null) {
+                 try {
+-                    SshHostProbeStore(context).put(config.host, config.port, hostProbe)
++                    SshHostProbeStore(context).put(config.host, config.port, hostProbe, config.username)
+                     RemotePlatformStore(context).put(config.host, config.port, hostProbe.isWindows)
+                 } catch (_: Throwable) {
+                     // 写缓存失败不影响本次测试连接结果
+@@ -267,13 +274,17 @@ internal suspend fun WorkspaceRepository.toConnectionConfig(settings: SshWorkspa
+         host: String,
+         port: Int,
+         workspacePlatform: SshPlatform? = null,
++        user: String? = null,
+     ): String {
+-        val savedHostExplicit = runCatching { getKoin().get<SshHostRepository>() }
+-            .getOrNull()?.getByHost(host)?.let { SshPlatform.fromPreference(it.platform) }
++        val savedHost = runCatching { getKoin().get<SshHostRepository>() }
++            .getOrNull()?.getByHost(host)
++        val savedHostExplicit = savedHost?.let { SshPlatform.fromPreference(it.platform) }
+             ?.takeUnless { it == SshPlatform.AUTO }
+         val explicit = workspacePlatform?.takeUnless { it == SshPlatform.AUTO } ?: savedHostExplicit
++        // 探针缓存的键含用户名：调用方传了用调用方的，否则用已保存主机的登录用户。
++        val probeUser = user ?: savedHost?.user
+         val cached = runCatching { getKoin().get<Context>() }
+-            .getOrNull()?.let { probePreferredWindows(it, host, port) }
++            .getOrNull()?.let { probePreferredWindows(it, host, port, probeUser) }
+         val globalDefault = settingsStore.settingsFlow.value.defaultSshPlatform
+         return when (RemotePlatform.resolveWindows(explicit, cached, globalDefault)) {
+             true -> "WINDOWS"
+@@ -348,36 +359,93 @@ internal suspend fun WorkspaceRepository.readEnvironmentInfoImpl(id: String): Wo
+         return info
+     }
+ 
++/**
++ * AUTO 模式后台补探针的执行作用域（仓库级后台任务同款做法：进程内常驻，
++ * 与 WorkspaceRepository.statsScope 一致；补探针是一次性任务，跑完即结束）。
++ */
++private val hostProbeSupplementScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++
++/**
++ * AUTO 模式后台补探针的启动钩子（默认在 [hostProbeSupplementScope] 上跑；
++ * 单测替换它可断言“启动即返回、不等探测完成”，而不必建真连接）。
++ */
++internal var launchHostProbeSupplement: (suspend () -> Unit) -> Unit =
++    { block -> hostProbeSupplementScope.launch { block() } }
++
+     /**
+-     * 主机探针摘要（供提示词）：缓存命中直接用；未命中时在本次连接上跑一次探针
+-     * （与 app SSH 共用 [SshHostProbe]），写回探针缓存与平台缓存。
+-     * 探针失败只返回 null，不阻塞环境信息读取；下次重读时（缓存未命中）会再试。
++     * 主机探针摘要（供提示词）：缓存命中直接用；未命中时按设置项 `ssh_host_probe` 决定：
++     * - AUTO：启动后台补一次（独立协程 + 自有会话 + 预算，不占调用方超时；
++     *   见 [supplementHostProbeInBackground]），本次返回 null；
++     * - MANUAL_ONLY / OFF：不跑探针，返回 null（只走显式入口：测试连接、工作区页按钮）。
++     * 探针失败只写否定缓存（24h 内不再自动重探），不阻塞环境信息读取。
+      */
+     private suspend fun WorkspaceRepository.readHostProbeSummary(id: String): String? {
+         val workspace = dao.getById(id) ?: return null
+         val settings = workspace.sshSettings() ?: return null
+         val context = runCatching { getKoin().get<Context>() }.getOrNull() ?: return null
+         val store = SshHostProbeStore(context)
+-        store.get(settings.host, settings.port)?.let { return it.summary() }
+-        val platform = resolveSshPlatform(settings.host, settings.port)
+-        val probe = try {
+-            readFromBackend(workspace) { backend ->
+-                SshHostProbe.runProbe(
+-                    exec = { script, timeout -> backend.executeCommand(script, "", timeout, null, emptyMap()) },
+-                    platform = platform,
+-                    execWrapsWindows = platform == "WINDOWS",
++        store.get(settings.host, settings.port, settings.username)?.let { return it.summary() }
++        if (settingsStore.settingsFlow.value.sshHostProbe != SshHostProbeMode.AUTO) return null
++        if (store.isNegativeCached(settings.host, settings.port, settings.username)) return null
++        supplementHostProbeInBackground(id, workspace)
++        return null
++    }
++
++    /**
++     * AUTO 模式的进工作区自动补一次：独立协程 + 自有会话（readFromBackend 每次建连），
++     * 预算 min(15s, 剩余时间-1s)（无调用方 deadline 时 15s）；跑完写回探针缓存与平台缓存，
++     * 成功后刷新环境信息缓存条目的 hostSummary（下次提示词构建即带上）。
++     * 失败写否定缓存（24h 内不再自动重探），任何失败都不影响调用方。
++     */
++    private fun WorkspaceRepository.supplementHostProbeInBackground(id: String, workspace: WorkspaceEntity) {
++        val settings = workspace.sshSettings() ?: return
++        launchHostProbeSupplement {
++            val context = runCatching { getKoin().get<Context>() }.getOrNull()
++                ?: return@launchHostProbeSupplement
++            val store = SshHostProbeStore(context)
++            // 协程启动后重新查一次：测试连接等显式入口可能已在期间写好缓存。
++            if (store.get(settings.host, settings.port, settings.username) != null) {
++                return@launchHostProbeSupplement
++            }
++            if (store.isNegativeCached(settings.host, settings.port, settings.username)) {
++                return@launchHostProbeSupplement
++            }
++            val platform = resolveSshPlatform(settings.host, settings.port, user = settings.username)
++            val budget = probeBudgetMs(deadlineMs = null)
++                ?: SshHostProbe.PROBE_TIMEOUT_MS
++            val probe = try {
++                readFromBackend(workspace) { backend ->
++                    SshHostProbe.runProbe(
++                        exec = { script, timeout -> backend.executeCommand(script, "", timeout, null, emptyMap()) },
++                        platform = platform,
++                        execWrapsWindows = platform == "WINDOWS",
++                        timeoutMs = budget,
++                    )
++                }
++            } catch (e: CancellationException) {
++                throw e
++            } catch (ignored: Throwable) {
++                null
++            }
++            if (probe == null) {
++                runCatching { store.putFailure(settings.host, settings.port, settings.username) }
++                return@launchHostProbeSupplement
++            }
++            runCatching {
++                store.put(settings.host, settings.port, probe, settings.username)
++                RemotePlatformStore(context).put(settings.host, settings.port, probe.isWindows)
++            }
++            // 成功后刷新环境信息缓存条目的 hostSummary（下次提示词构建即带上）。
++            val entry = remoteEnvironments[id]
++            val info = entry?.info
++            if (entry != null && info != null && info.hostSummary == null) {
++                remoteEnvironments[id] = RemoteEnvironment(
++                    entry.configKey,
++                    info.copy(hostSummary = probe.summary()),
++                    entry.failedAt,
+                 )
+             }
+-        } catch (_: Throwable) {
+-            null
+-        } ?: return null
+-        try {
+-            store.put(settings.host, settings.port, probe)
+-            RemotePlatformStore(context).put(settings.host, settings.port, probe.isWindows)
+-        } catch (_: Throwable) {
+-            // 写缓存失败不影响本次摘要
+         }
+-        return probe.summary()
+     }
+ 
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt
+index 3787103e7..c5c76206e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostEditDialog.kt
+@@ -43,6 +43,7 @@ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.Add01
+ import me.rerere.hugeicons.stroke.Key01
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.datastore.SshHostProbeMode
+ import me.rerere.rikkahub.data.datastore.SshPlatform
+ import me.rerere.rikkahub.data.db.entity.SshHostEntity
+ import me.rerere.rikkahub.data.vault.CredentialType
+@@ -392,3 +393,11 @@ internal fun sshPlatformLabelRes(platform: SshPlatform): Int =
+         SshPlatform.LINUX -> R.string.setting_ssh_platform_linux
+         SshPlatform.WINDOWS -> R.string.setting_ssh_platform_windows
+     }
++
++/** 探针触发模式枚举到界面文案的映射。 */
++internal fun sshHostProbeModeLabelRes(mode: SshHostProbeMode): Int =
++    when (mode) {
++        SshHostProbeMode.AUTO -> R.string.setting_ssh_host_probe_auto
++        SshHostProbeMode.MANUAL_ONLY -> R.string.setting_ssh_host_probe_manual_only
++        SshHostProbeMode.OFF -> R.string.setting_ssh_host_probe_off
++    }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostsPage.kt
+index cede58a10..fbaf04390 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingSshHostsPage.kt
+@@ -52,6 +52,7 @@ import me.rerere.hugeicons.stroke.ServerStack01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.data.datastore.SettingsStore
++import me.rerere.rikkahub.data.datastore.SshHostProbeMode
+ import me.rerere.rikkahub.data.datastore.SshPlatform
+ import me.rerere.rikkahub.data.db.entity.SshHostEntity
+ import me.rerere.rikkahub.data.log.AppLog
+@@ -211,6 +212,38 @@ fun SettingSshHostsPage() {
+                 }
+             }
+ 
++            item("sshHostProbe") {
++                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++                    Text(
++                        text = stringResource(R.string.setting_ssh_host_probe),
++                        style = MaterialTheme.typography.titleSmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        modifier = Modifier.padding(horizontal = 4.dp),
++                    )
++                    SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
++                        SshHostProbeMode.entries.forEachIndexed { index, mode ->
++                            SegmentedButton(
++                                shape = SegmentedButtonDefaults.itemShape(index = index, count = SshHostProbeMode.entries.size),
++                                selected = settings.sshHostProbe == mode,
++                                onClick = {
++                                    scope.launch {
++                                        settingsStore.update { it.copy(sshHostProbe = mode) }
++                                    }
++                                },
++                            ) {
++                                Text(stringResource(sshHostProbeModeLabelRes(mode)))
++                            }
++                        }
++                    }
++                    Text(
++                        text = stringResource(R.string.setting_ssh_host_probe_desc),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        modifier = Modifier.padding(horizontal = 4.dp),
++                    )
++                }
++            }
++
+             item("sshHostsGroup") {
+                 // ⚠ CardGroup 内部用 `remember { CardGroupScopeImpl() }` 缓存条目列表，而该列表不是 State：
+                 // 列表数据（hosts）从空加载成 N 个时，LazyColumn 的 item 不保证会让 CardGroup 的 scope 重建，
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index efdb78c7b..79f569d95 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -4300,6 +4300,11 @@
+   <string name="ssh_terminal_platform_unknown">تعذّر تحديد المنصة</string>
+   <string name="setting_ssh_default_platform">المنصة البعيدة الافتراضية</string>
+   <string name="setting_ssh_default_platform_desc">يُستخدم عندما يكون المضيف مضبوطًا على تلقائي</string>
++  <string name="setting_ssh_host_probe">مسبار المضيف</string>
++  <string name="setting_ssh_host_probe_desc">كيفية استكشاف النظام البعيد عند الاتصال الأول: تلقائي يستكشف مرة واحدة عند دخول مساحة العمل (دون استهلاك مهلة الأمر)؛ يدوي فقط يستكشف عند اختبار الاتصال؛ إيقاف لا يستكشف أبدا.</string>
++  <string name="setting_ssh_host_probe_auto">تلقائي</string>
++  <string name="setting_ssh_host_probe_manual_only">يدوي فقط</string>
++  <string name="setting_ssh_host_probe_off">إيقاف</string>
+   <string name="setting_ssh_allow_host_key_rotation">السماح بتدوير مفتاح المضيف</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">الوثوق تلقائيًا بالمفتاح الجديد عند تغيير مفتاح المضيف</string>
+   <string name="setting_page_trusted_keys">مفاتيح المضيف الموثوقة</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 4c3a9c351..c734a1ee7 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -4292,6 +4292,11 @@
+   <string name="ssh_terminal_platform_unknown">平台未判定</string>
+   <string name="setting_ssh_default_platform">預設遠端平台</string>
+   <string name="setting_ssh_default_platform_desc">主機設為自動時使用</string>
++  <string name="setting_ssh_host_probe">主機探針</string>
++  <string name="setting_ssh_host_probe_desc">首次連接時如何探測遠端系統：自動會在進入工作區時補一次（不佔用命令逾時）；僅手動只在測試連接時探測；關閉則永不探測。</string>
++  <string name="setting_ssh_host_probe_auto">自動</string>
++  <string name="setting_ssh_host_probe_manual_only">僅手動</string>
++  <string name="setting_ssh_host_probe_off">關閉</string>
+   <string name="setting_ssh_allow_host_key_rotation">允許主機金鑰輪換</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">主機金鑰變更時自動信任新金鑰</string>
+   <string name="setting_page_trusted_keys">受信主機金鑰</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index e8842f8ac..f2809618a 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -4293,6 +4293,11 @@
+   <string name="ssh_terminal_platform_unknown">プラットフォーム未判定</string>
+   <string name="setting_ssh_default_platform">既定のリモートプラットフォーム</string>
+   <string name="setting_ssh_default_platform_desc">ホストが自動に設定されている場合に使用</string>
++  <string name="setting_ssh_host_probe">ホストプローブ</string>
++  <string name="setting_ssh_host_probe_desc">初回接続時にリモートシステムをどう検出するか：自動はワークスペースに入るときに1回だけ検出します（コマンドのタイムアウトを使いません）。手動のみは接続テスト時のみ検出します。オフは検出しません。</string>
++  <string name="setting_ssh_host_probe_auto">自動</string>
++  <string name="setting_ssh_host_probe_manual_only">手動のみ</string>
++  <string name="setting_ssh_host_probe_off">オフ</string>
+   <string name="setting_ssh_allow_host_key_rotation">ホスト鍵のローテーションを許可</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">ホスト鍵が変更されたときに新しい鍵を自動的に信頼する</string>
+   <string name="setting_page_trusted_keys">信頼済みホスト鍵</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 9c6b64b97..06d6cd2c5 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -4293,6 +4293,11 @@
+   <string name="ssh_terminal_platform_unknown">플랫폼을 확인하지 못했습니다</string>
+   <string name="setting_ssh_default_platform">기본 원격 플랫폼</string>
+   <string name="setting_ssh_default_platform_desc">호스트가 자동으로 설정된 경우에 사용</string>
++  <string name="setting_ssh_host_probe">호스트 프로브</string>
++  <string name="setting_ssh_host_probe_desc">첫 연결 시 원격 시스템을 어떻게 검색할지: 자동은 워크스페이스에 들어갈 때 한 번 검색합니다(명령 시간 제한을 사용하지 않음). 수동만은 연결 테스트 시에만 검색합니다. 끄기는 검색하지 않습니다.</string>
++  <string name="setting_ssh_host_probe_auto">자동</string>
++  <string name="setting_ssh_host_probe_manual_only">수동만</string>
++  <string name="setting_ssh_host_probe_off">끄기</string>
+   <string name="setting_ssh_allow_host_key_rotation">호스트 키 교체 허용</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">호스트 키가 변경되면 새 키를 자동으로 신뢰</string>
+   <string name="setting_page_trusted_keys">신뢰할 수 있는 호스트 키</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 2a4f1a901..3094acee2 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -4297,6 +4297,11 @@
+   <string name="ssh_terminal_platform_unknown">Платформа не определена</string>
+   <string name="setting_ssh_default_platform">Платформа удалённого хоста по умолчанию</string>
+   <string name="setting_ssh_default_platform_desc">Используется, когда для хоста выбрано «Авто»</string>
++  <string name="setting_ssh_host_probe">Зонд хоста</string>
++  <string name="setting_ssh_host_probe_desc">Как определять удалённую систему при первом подключении: автоматически — один раз при входе в рабочую область (без расхода тайм-аута команды); только вручную — при проверке соединения; выключено — никогда.</string>
++  <string name="setting_ssh_host_probe_auto">Авто</string>
++  <string name="setting_ssh_host_probe_manual_only">Только вручную</string>
++  <string name="setting_ssh_host_probe_off">Выкл.</string>
+   <string name="setting_ssh_allow_host_key_rotation">Разрешить смену ключа хоста</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">Автоматически доверять новому ключу при смене ключа хоста</string>
+   <string name="setting_page_trusted_keys">Доверенные ключи хостов</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 7edd45e0c..7137973da 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -2713,6 +2713,11 @@
+   <string name="ssh_terminal_platform_unknown">平台未判定</string>
+   <string name="setting_ssh_default_platform">默认远端平台</string>
+   <string name="setting_ssh_default_platform_desc">主机设为自动时使用</string>
++  <string name="setting_ssh_host_probe">主机探针</string>
++  <string name="setting_ssh_host_probe_desc">首次连接时如何探测远端系统：自动会在进入工作区时补一次（不占用命令超时）；仅手动只在测试连接时探测；关闭则永不探测。</string>
++  <string name="setting_ssh_host_probe_auto">自动</string>
++  <string name="setting_ssh_host_probe_manual_only">仅手动</string>
++  <string name="setting_ssh_host_probe_off">关闭</string>
+   <string name="setting_ssh_allow_host_key_rotation">允许主机密钥轮换</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">主机密钥变更时自动信任新密钥</string>
+   <string name="setting_trusted_keys_title">受信主机密钥</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 03d54e04f..065b60266 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -2706,6 +2706,11 @@
+   <string name="ssh_terminal_platform_unknown">Platform not detected</string>
+   <string name="setting_ssh_default_platform">Default remote platform</string>
+   <string name="setting_ssh_default_platform_desc">Used when a host is set to Auto</string>
++  <string name="setting_ssh_host_probe">Host probe</string>
++  <string name="setting_ssh_host_probe_desc">How the remote system is probed on first connection: Auto probes once when entering a workspace (without using the command timeout); Manual only probes on Test connection; Off never probes.</string>
++  <string name="setting_ssh_host_probe_auto">Auto</string>
++  <string name="setting_ssh_host_probe_manual_only">Manual only</string>
++  <string name="setting_ssh_host_probe_off">Off</string>
+   <string name="setting_ssh_allow_host_key_rotation">Allow host key rotation</string>
+   <string name="setting_ssh_allow_host_key_rotation_desc">Automatically trust the new key when the host key changes</string>
+   <string name="setting_trusted_keys_title">Trusted host keys</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStoreTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStoreTest.kt
+new file mode 100644
+index 000000000..7e7157c2c
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshHostProbeStoreTest.kt
+@@ -0,0 +1,161 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import android.app.Application
++import android.content.Context
++import android.os.Looper
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.runBlocking
++import me.rerere.workspace.ssh.SshHostProbeResult
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++/**
++ * SshHostProbeStore 的缓存语义回归（Robolectric，跑真实 DataStore，不走网络）：
++ * - 否定缓存：探针失败也记 24h，TTL 内自动入口跳过、过期后重探；
++ * - 键含用户名：同主机不同用户互不干扰；
++ * - 正向过期：30 天后的结果视作未命中；
++ * - 旧键回退：老版本 host:port 条目仍可读；
++ * - 成功覆盖否定：同一键解析成功后否定记录清掉。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [35], manifest = Config.NONE, application = Application::class)
++class SshHostProbeStoreTest {
++    private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val context: Context get() = RuntimeEnvironment.getApplication()
++
++    /** Pump Android Main while real DataStore work proceeds on IO. No coroutine implementation is mocked. */
++    private fun <T> perform(block: suspend () -> T): T {
++        val task = workers.async { block() }
++        val deadline = System.nanoTime() + 30_000_000_000L
++        while (!task.isCompleted && System.nanoTime() < deadline) {
++            shadowOf(Looper.getMainLooper()).idle()
++            Thread.sleep(5)
++        }
++        check(task.isCompleted) { "SshHostProbeStore operation timed out" }
++        return runBlocking { task.await() }
++    }
++
++    private fun probeResult(probedAtMs: Long = System.currentTimeMillis()): SshHostProbeResult =
++        SshHostProbeResult(
++            platform = "LINUX",
++            os = "Ubuntu 22.04",
++            arch = "x86_64",
++            shell = "/bin/bash",
++            cpuCores = 4,
++            memoryMb = 8192,
++            diskFreeMb = 10240,
++            tools = listOf("git"),
++            probedAtMs = probedAtMs,
++        )
++
++    @Test
++    fun `negative cache blocks auto re-probe within 24h`() {
++        val store = SshHostProbeStore(context)
++        perform { store.putFailure("neg-24h.example.com", 22, "alice") }
++        assertTrue(perform { store.isNegativeCached("neg-24h.example.com", 22, "alice") })
++        // 否定记录不影响正向读数（只是没成功结果可读）。
++        assertNull(perform { store.get("neg-24h.example.com", 22, "alice") })
++    }
++
++    @Test
++    fun `negative cache older than 24h does not block`() {
++        val store = SshHostProbeStore(context)
++        // 25 小时前的失败：写时即被修剪，读侧同样不过期判定。
++        perform {
++            store.putFailure(
++                "neg-old.example.com",
++                22,
++                "alice",
++                failedAtMs = System.currentTimeMillis() - 25L * 60 * 60 * 1000,
++            )
++        }
++        assertFalse(perform { store.isNegativeCached("neg-old.example.com", 22, "alice") })
++        // 23 小时前的失败仍在 TTL 内。
++        perform {
++            store.putFailure(
++                "neg-recent.example.com",
++                22,
++                "alice",
++                failedAtMs = System.currentTimeMillis() - 23L * 60 * 60 * 1000,
++            )
++        }
++        assertTrue(perform { store.isNegativeCached("neg-recent.example.com", 22, "alice") })
++        // 从未失败过的主机不在否定缓存里。
++        assertFalse(perform { store.isNegativeCached("never.example.com", 22, "alice") })
++    }
++
++    @Test
++    fun `different users have separate probe entries`() {
++        val store = SshHostProbeStore(context)
++        perform { store.put("users.example.com", 22, probeResult(), "alice") }
++        assertEquals("Ubuntu 22.04", perform { store.get("users.example.com", 22, "alice") }?.os)
++        assertNull(perform { store.get("users.example.com", 22, "bob") })
++        // alice 的否定记录不拦 bob。
++        perform { store.putFailure("users.example.com", 22, "alice") }
++        assertTrue(perform { store.isNegativeCached("users.example.com", 22, "alice") })
++        assertFalse(perform { store.isNegativeCached("users.example.com", 22, "bob") })
++    }
++
++    @Test
++    fun `positive result expires after 30 days`() {
++        val store = SshHostProbeStore(context)
++        val now = System.currentTimeMillis()
++        perform {
++            store.put(
++                "expired.example.com",
++                22,
++                probeResult(probedAtMs = now - 31L * 24 * 60 * 60 * 1000),
++                "alice",
++            )
++        }
++        assertNull(perform { store.get("expired.example.com", 22, "alice") })
++        perform {
++            store.put(
++                "fresh.example.com",
++                22,
++                probeResult(probedAtMs = now - 29L * 24 * 60 * 60 * 1000),
++                "alice",
++            )
++        }
++        assertEquals("Ubuntu 22.04", perform { store.get("fresh.example.com", 22, "alice") }?.os)
++    }
++
++    @Test
++    fun `legacy host-port entry is readable via user key`() {
++        val store = SshHostProbeStore(context)
++        // 老版本只写 host:port 键；新读数先查 user 键、再回退旧键。
++        perform { store.put("legacy.example.com", 22, probeResult(), null) }
++        assertEquals("Ubuntu 22.04", perform { store.get("legacy.example.com", 22, "alice") }?.os)
++    }
++
++    @Test
++    fun `successful probe clears the negative record`() {
++        val store = SshHostProbeStore(context)
++        perform { store.putFailure("clear-neg.example.com", 22, "alice") }
++        assertTrue(perform { store.isNegativeCached("clear-neg.example.com", 22, "alice") })
++        perform { store.put("clear-neg.example.com", 22, probeResult(), "alice") }
++        assertFalse(perform { store.isNegativeCached("clear-neg.example.com", 22, "alice") })
++        assertEquals("Ubuntu 22.04", perform { store.get("clear-neg.example.com", 22, "alice") }?.os)
++    }
++
++    @Test
++    fun `clear removes both positive and negative records`() {
++        val store = SshHostProbeStore(context)
++        perform { store.put("clear.example.com", 22, probeResult(), "alice") }
++        perform { store.putFailure("clear.example.com", 22, "alice") }
++        perform { store.clear("clear.example.com", 22, "alice") }
++        assertNull(perform { store.get("clear.example.com", 22, "alice") })
++        assertFalse(perform { store.isNegativeCached("clear.example.com", 22, "alice") })
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshPlatformResolutionTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshPlatformResolutionTest.kt
+index 0569a0fd5..fa769e1c7 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshPlatformResolutionTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/SshPlatformResolutionTest.kt
+@@ -71,4 +71,13 @@ class SshPlatformResolutionTest {
+         assertEquals(SshPlatform.AUTO, SshPlatform.fromPreference("not-a-platform"))
+         assertEquals(SshPlatform.AUTO, SshPlatform.fromPreference(""))
+     }
++
++    @Test
++    fun `probe cache key includes the login user`() {
++        // 同一主机不同用户互不干扰；user 为空时退回旧 host:port 键（平台缓存与旧数据迁移用它）。
++        assertEquals("example.com:22:alice", RemotePlatform.cacheKey("example.com", 22, "alice"))
++        assertEquals("example.com:22", RemotePlatform.cacheKey("example.com", 22, null))
++        assertEquals("example.com:22", RemotePlatform.cacheKey("example.com", 22, "  "))
++        assertEquals("example.com:22:alice", RemotePlatform.cacheKey(" Example.COM ", 22, " Alice "))
++    }
+ }
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/SshHostProbeModeTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/SshHostProbeModeTest.kt
+new file mode 100644
+index 000000000..43e0d65a7
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/SshHostProbeModeTest.kt
+@@ -0,0 +1,35 @@
++package me.rerere.rikkahub.data.datastore
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * SSH 主机探针触发模式（设置项 ssh_host_probe）的纯逻辑回归：
++ * - 偏好值映射（未知/空值回退默认仅手动）；
++ * - Settings() 默认仅手动（不改默认行为：旧版本不自动探）。
++ * codec 落盘往返（SettingsStore 编解码）走 Robolectric 持久化测试，见
++ * SshHostProbeStoreTest 的同类模式；本类只覆盖纯映射与默认值。
++ */
++class SshHostProbeModeTest {
++
++    @Test
++    fun `fromPreference maps all three modes`() {
++        assertEquals(SshHostProbeMode.AUTO, SshHostProbeMode.fromPreference("AUTO"))
++        assertEquals(SshHostProbeMode.MANUAL_ONLY, SshHostProbeMode.fromPreference("MANUAL_ONLY"))
++        assertEquals(SshHostProbeMode.OFF, SshHostProbeMode.fromPreference("OFF"))
++    }
++
++    @Test
++    fun `fromPreference falls back to manual-only for unknown or missing values`() {
++        assertEquals(SshHostProbeMode.MANUAL_ONLY, SshHostProbeMode.fromPreference("BOGUS"))
++        assertEquals(SshHostProbeMode.MANUAL_ONLY, SshHostProbeMode.fromPreference(null))
++        assertEquals(SshHostProbeMode.MANUAL_ONLY, SshHostProbeMode.fromPreference(""))
++    }
++
++    @Test
++    fun `Settings defaults to manual-only probe mode`() {
++        assertEquals(SshHostProbeMode.MANUAL_ONLY, Settings().sshHostProbe)
++        // 邻居字段不受影响：默认平台仍是自动。
++        assertEquals(SshPlatform.AUTO, Settings().defaultSshPlatform)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/repository/HostProbeSupplementLaunchTest.kt b/app/src/test/java/me/rerere/rikkahub/data/repository/HostProbeSupplementLaunchTest.kt
+new file mode 100644
+index 000000000..732ee67b5
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/repository/HostProbeSupplementLaunchTest.kt
+@@ -0,0 +1,33 @@
++package me.rerere.rikkahub.data.repository
++
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * AUTO 模式后台补探针的启动语义回归（P0 核心：工具返回不等探测完成）：
++ * 默认钩子把块发到后台协程——调用返回时块尚未跑完，慢探测不会拖住调用方。
++ * 真连接上的端到端时序（命令接近超时 + 探测很慢仍返回命令结果）需要真实 sshd，
++ * execOneShot 又无法在单测里假造 JSch Session，单测做不了，见说明“未验到”。
++ */
++class HostProbeSupplementLaunchTest {
++
++    @Test
++    fun `launch returns immediately without waiting for the slow block`() {
++        val started = CountDownLatch(1)
++        val release = CountDownLatch(1)
++        val finished = AtomicBoolean(false)
++        launchHostProbeSupplement {
++            started.countDown()
++            release.await(10, TimeUnit.SECONDS)
++            finished.set(true)
++        }
++        // 块已在后台启动，但调用早已返回：块仍被门闩卡住、未跑完。
++        assertTrue(started.await(5, TimeUnit.SECONDS))
++        assertFalse(finished.get())
++        release.countDown()
++    }
++}
+diff --git a/deps/chroot/chroot-run.sh b/deps/chroot/chroot-run.sh
+index cc8a9b84f..9bb097586 100755
+--- a/deps/chroot/chroot-run.sh
++++ b/deps/chroot/chroot-run.sh
+@@ -89,7 +89,10 @@ do_unmount_quiet() {
+         ( umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true ) &
+     done
+     wait
+-    rm -rf "$ROOTFS"/.chroot-mounted "$ROOTFS"/.chroot-fixed "$ROOTFS"/.chroot-lock 2>/dev/null || true
++    # 只删挂载标记：.chroot-fixed 是 do_fixes 已完成的标记，删掉会让下次重跑修复
++    #（只影响速度）；.chroot-lock 全脚本只在删除处出现、从未被创建或检查，是死标记，
++    # 已随本行一并去掉。显式全量拆卸（do_unmount）仍清全部 .chroot-*，不受影响。
++    rm -rf "$ROOTFS"/.chroot-mounted 2>/dev/null || true
+ }
+ 
+ do_unmount() {
+diff --git a/workspace/src/main/java/me/rerere/workspace/ssh/SshConnection.kt b/workspace/src/main/java/me/rerere/workspace/ssh/SshConnection.kt
+index 8dbbb51b1..473261929 100644
+--- a/workspace/src/main/java/me/rerere/workspace/ssh/SshConnection.kt
++++ b/workspace/src/main/java/me/rerere/workspace/ssh/SshConnection.kt
+@@ -368,7 +368,7 @@ internal class SshConnection private constructor(
+         }
+ 
+         /** 用一条临时连接验证配置, 并取回远程环境的基本信息 */
+-        fun probe(config: SshConnectionConfig): SshProbeResult {
++        fun probe(config: SshConnectionConfig, includeHostProbe: Boolean = true): SshProbeResult {
+             // 被取消时放弃等待, 之后建好的连接直接关掉
+             val connection = awaitInterruptibly({ open(config) }, onAbandoned = { it.close() })
+             return connection.use {
+@@ -390,11 +390,16 @@ internal class SshConnection private constructor(
+                     // 首次连接主机探针：与 app SSH 共用 SshHostProbe（同一份命令/解析/摘要）；
+                     // exec 在 config.platform == "WINDOWS" 时自动包 pwsh，故 execWrapsWindows
+                     // 直接取该条件。探针失败只记 null，不影响本次测试连接。
+-                    hostProbe = SshHostProbe.runProbe(
+-                        exec = { script, timeout -> connection.exec(script, timeout) },
+-                        platform = config.platform,
+-                        execWrapsWindows = config.platform == "WINDOWS",
+-                    ),
++                    // 设置为关闭时（includeHostProbe=false）不跑探针，hostProbe 保持 null。
++                    hostProbe = if (includeHostProbe) {
++                        SshHostProbe.runProbe(
++                            exec = { script, timeout -> connection.exec(script, timeout) },
++                            platform = config.platform,
++                            execWrapsWindows = config.platform == "WINDOWS",
++                        )
++                    } else {
++                        null
++                    },
+                 )
+             }
+         }
+diff --git a/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt b/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt
+index 740e4f4cd..15fc37a01 100644
+--- a/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt
++++ b/workspace/src/main/java/me/rerere/workspace/ssh/SshConnectionPool.kt
+@@ -55,7 +55,8 @@ class SshConnectionPool(
+     }
+ 
+     /** 用一条临时连接测试配置, 不进入连接池 */
+-    fun probe(config: SshConnectionConfig): SshProbeResult = SshConnection.probe(config)
++    fun probe(config: SshConnectionConfig, includeHostProbe: Boolean = true): SshProbeResult =
++        SshConnection.probe(config, includeHostProbe)
+ 
+     fun close(id: String) {
+         lockOf(id).withLock {
+diff --git a/workspace/src/main/java/me/rerere/workspace/ssh/SshHostProbe.kt b/workspace/src/main/java/me/rerere/workspace/ssh/SshHostProbe.kt
+index f7f825131..07adfabe5 100644
+--- a/workspace/src/main/java/me/rerere/workspace/ssh/SshHostProbe.kt
++++ b/workspace/src/main/java/me/rerere/workspace/ssh/SshHostProbe.kt
+@@ -263,3 +263,15 @@ object SshHostProbe {
+         return tokens.getOrNull(3)?.toLongOrNull()
+     }
+ }
++
++/**
++ * 探针单次执行预算（毫秒）：默认 [SshHostProbe.PROBE_TIMEOUT_MS]；调用方有 deadline 时取
++ * min(15s, deadline-now-1s)——给调用方留 1 秒收尾；预算耗尽返回 null（跳过本次探测）。
++ * AUTO 模式最多两次执行，每次各取自己的预算。
++ * 放顶层而非 [SshHostProbe] 的成员：对象内函数数有 detekt 阈值，成员再多一个即超限。
++ */
++fun probeBudgetMs(deadlineMs: Long?, nowMs: Long = System.currentTimeMillis()): Long? {
++    val budget = deadlineMs?.let { minOf(SshHostProbe.PROBE_TIMEOUT_MS, it - nowMs - 1_000) }
++        ?: SshHostProbe.PROBE_TIMEOUT_MS
++    return budget.takeIf { it > 0 }
++}
+diff --git a/workspace/src/test/java/me/rerere/workspace/SshHostProbeTest.kt b/workspace/src/test/java/me/rerere/workspace/SshHostProbeTest.kt
+index ddbf3102c..477aa9440 100644
+--- a/workspace/src/test/java/me/rerere/workspace/SshHostProbeTest.kt
++++ b/workspace/src/test/java/me/rerere/workspace/SshHostProbeTest.kt
+@@ -1,6 +1,7 @@
+ package me.rerere.workspace
+ 
+ import me.rerere.workspace.ssh.SshHostProbe
++import me.rerere.workspace.ssh.probeBudgetMs
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNull
+@@ -13,6 +14,7 @@ import java.util.Base64
+  * - POSIX / Windows 探针输出解析（分段、字段、缺失项）；
+  * - 摘要拼装（缺失项省略、MB/GB 换算）；
+  * - runProbe 的平台分发与 AUTO 回退（用假 exec，不走网络）。
++ * - 探针预算 probeBudgetMs（默认 15s、有 deadline 时 min(15s, 剩余-1s)、耗尽返回 null）。
+  * Windows 远端 pwsh 包装、首次连接行为、缓存命中不再重跑，不在本测试覆盖范围。
+  */
+ class SshHostProbeTest {
+@@ -229,6 +231,22 @@ class SshHostProbeTest {
+         assertEquals("Windows 11 Pro", result?.os)
+     }
+ 
++    @Test
++    fun `probeBudgetMs defaults to 15s without a deadline`() {
++        assertEquals(15_000L, probeBudgetMs(deadlineMs = null))
++    }
++
++    @Test
++    fun `probeBudgetMs caps at 15s and reserves 1s before the deadline`() {
++        // deadline 60s 后：15s 上限
++        assertEquals(15_000L, probeBudgetMs(deadlineMs = 60_000L, nowMs = 0L))
++        // deadline 10s 后：10s - 1s = 9s
++        assertEquals(9_000L, probeBudgetMs(deadlineMs = 10_000L, nowMs = 0L))
++        // deadline 只剩 1s 或已过：预算耗尽，返回 null（跳过本次探测）
++        assertNull(probeBudgetMs(deadlineMs = 1_000L, nowMs = 0L))
++        assertNull(probeBudgetMs(deadlineMs = 500L, nowMs = 0L))
++    }
++
+     @Test
+     fun `runProbe returns null when the exec throws or exits non-zero`() {
+         val throwing = SshHostProbe.runProbe(
