@@ -1,0 +1,1470 @@
+diff --git a/ai/src/main/java/me/rerere/ai/ui/TextTruncation.kt b/ai/src/main/java/me/rerere/ai/ui/TextTruncation.kt
+new file mode 100644
+index 000000000..a5d863fca
+--- /dev/null
++++ b/ai/src/main/java/me/rerere/ai/ui/TextTruncation.kt
+@@ -0,0 +1,69 @@
++package me.rerere.ai.ui
++
++/**
++ * 工具输出截断原语：生成期（全文落盘 + 预览）、保留历史、diff 输出三处策略层共用。
++ *
++ * 各策略的上限口径与落盘/摘要行为仍由调用方决定；这里只收敛「超限时保留前 N 字符
++ * 并追加统一截断标记」这一段纯逻辑，避免三处各写各的标记与跨 part 预算。
++ */
++
++/** 统一的截断标记：内容被截断时追加在保留文本之后。 */
++const val TEXT_TRUNCATION_MARKER = "\n…[truncated]"
++
++/** diff 输出的总量截断标记，带上限数值。 */
++fun diffTruncationMarker(maxChars: Int): String = "…<diff truncated: exceeds $maxChars chars>"
++
++/**
++ * 单段文本截断：长度不超限时原样返回；超限时保留前 [limit] 字符并追加 [marker]。
++ */
++fun truncateText(
++    text: String,
++    limit: Int,
++    marker: String = TEXT_TRUNCATION_MARKER,
++): String {
++    if (limit < 0 || text.length <= limit) return text
++    return text.take(limit) + marker
++}
++
++/**
++ * 跨 Text part 按序取字符：非 Text part 原样保留；Text part 按出现顺序分享 [limit]
++ * 的预算；预算耗尽后丢弃后续 Text part，并在最后一个保留的 Text part 后追加 [marker]。
++ *
++ * 总长度不超限时原样返回原列表；截断时保留的 Text part 会复制一份（带原 metadata），
++ * 其余 part 保持同一实例。
++ */
++fun truncateTextParts(
++    parts: List<UIMessagePart>,
++    limit: Int,
++    marker: String = TEXT_TRUNCATION_MARKER,
++): List<UIMessagePart> {
++    val total = parts.filterIsInstance<UIMessagePart.Text>().sumOf { it.text.length }
++    if (total <= limit) return parts
++    var remaining = limit
++    var markerAppended = false
++    val kept =
++        parts.mapNotNull { part ->
++            val text = (part as? UIMessagePart.Text)?.text ?: return@mapNotNull part
++            if (remaining <= 0) return@mapNotNull null
++            val take = minOf(text.length, remaining)
++            remaining -= take
++            if (take < text.length) {
++                markerAppended = true
++                UIMessagePart.Text(text.take(take) + marker, part.metadata)
++            } else {
++                part
++            }
++        }
++    if (markerAppended) return kept
++    // 恰好在 part 边界处耗尽预算：标记追加到最后一个保留的 Text part。
++    val lastTextIndex = kept.indexOfLast { it is UIMessagePart.Text }
++    if (lastTextIndex < 0) return kept
++    return kept.mapIndexed { index, part ->
++        if (index == lastTextIndex) {
++            val textPart = part as UIMessagePart.Text
++            textPart.copy(text = textPart.text + marker)
++        } else {
++            part
++        }
++    }
++}
+diff --git a/ai/src/test/java/me/rerere/ai/ui/TextTruncationTest.kt b/ai/src/test/java/me/rerere/ai/ui/TextTruncationTest.kt
+new file mode 100644
+index 000000000..586056759
+--- /dev/null
++++ b/ai/src/test/java/me/rerere/ai/ui/TextTruncationTest.kt
+@@ -0,0 +1,92 @@
++package me.rerere.ai.ui
++
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TextTruncationTest {
++    // ---- truncateText ----
++
++    @Test
++    fun `short text is returned unchanged`() {
++        assertEquals("hello", truncateText("hello", 10))
++    }
++
++    @Test
++    fun `text at the limit is returned unchanged`() {
++        assertEquals("hello", truncateText("hello", 5))
++    }
++
++    @Test
++    fun `overlong text keeps the head and appends the marker`() {
++        assertEquals("hello\n…[truncated]", truncateText("hello world", 5))
++    }
++
++    @Test
++    fun `custom marker is used`() {
++        assertEquals("hel…<cut>", truncateText("hello", 3, "…<cut>"))
++    }
++
++    // ---- truncateTextParts ----
++
++    @Test
++    fun `parts within the limit are returned as the same list`() {
++        val parts = listOf<UIMessagePart>(
++            UIMessagePart.Text("ab"),
++            UIMessagePart.Image(url = "file:///x.png"),
++            UIMessagePart.Text("cd"),
++        )
++        assertSame(parts, truncateTextParts(parts, 10))
++    }
++
++    @Test
++    fun `overlong parts share one budget in order and keep non-text parts`() {
++        val image = UIMessagePart.Image(url = "file:///x.png")
++        val parts = listOf<UIMessagePart>(
++            UIMessagePart.Text("abcdef"),
++            image,
++            UIMessagePart.Text("ghijkl"),
++        )
++        val result = truncateTextParts(parts, 8)
++        assertEquals(3, result.size)
++        assertEquals("abcdef", (result[0] as UIMessagePart.Text).text)
++        assertSame(image, result[1])
++        assertEquals("gh\n…[truncated]", (result[2] as UIMessagePart.Text).text)
++    }
++
++    @Test
++    fun `parts after the budget is exhausted are dropped and the marker goes on the last kept text part`() {
++        val parts = listOf<UIMessagePart>(
++            UIMessagePart.Text("abc"),
++            UIMessagePart.Text("def"),
++            UIMessagePart.Text("ghi"),
++        )
++        val result = truncateTextParts(parts, 6)
++        assertEquals(2, result.size)
++        assertEquals("abc", (result[0] as UIMessagePart.Text).text)
++        assertEquals("def\n…[truncated]", (result[1] as UIMessagePart.Text).text)
++    }
++
++    @Test
++    fun `truncated text part keeps its metadata`() {
++        val metadata = buildJsonObject { put("kind", "diff") }
++        val parts = listOf<UIMessagePart>(UIMessagePart.Text("abcdef", metadata))
++        val result = truncateTextParts(parts, 3)
++        val text = result.single() as UIMessagePart.Text
++        assertEquals("abc\n…[truncated]", text.text)
++        assertEquals(metadata, text.metadata)
++    }
++
++    @Test
++    fun `empty parts stay empty`() {
++        assertTrue(truncateTextParts(emptyList(), 10).isEmpty())
++    }
++
++    @Test
++    fun `diff marker carries the limit`() {
++        assertEquals("…<diff truncated: exceeds 32768 chars>", diffTruncationMarker(32768))
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/ToolOutputProcessor.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/ToolOutputProcessor.kt
+index 23dc615a7..f29842514 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/ToolOutputProcessor.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/ToolOutputProcessor.kt
+@@ -2,6 +2,7 @@ package me.rerere.rikkahub.data.ai
+ 
+ import android.content.Context
+ import me.rerere.ai.ui.UIMessagePart
++import me.rerere.ai.ui.truncateText
+ import me.rerere.rikkahub.data.files.FileFolders
+ import me.rerere.rikkahub.data.log.AppLog
+ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+@@ -44,7 +45,8 @@ internal class ToolOutputProcessor(
+         val fullText = textParts.joinToString("\n") { it.text }
+         val digestMode = digestKeywords != null
+         val preview =
+-            fullText.take(
++            truncateText(
++                fullText,
+                 if (digestMode) TOOL_OUTPUT_DIGEST_PREVIEW_CHARS else TOOL_OUTPUT_PREVIEW_CHARS,
+             )
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/CoreInlineTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/CoreInlineTools.kt
+index 853f31286..62bd650b3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/CoreInlineTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/CoreInlineTools.kt
+@@ -10,7 +10,9 @@ import kotlinx.serialization.json.jsonArray
+ import kotlinx.serialization.json.jsonObject
+ import kotlinx.serialization.json.jsonPrimitive
+ import kotlinx.serialization.json.put
++import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.WebDavConfig
++import me.rerere.rikkahub.data.datastore.getSelectedTTSProvider
+ import me.rerere.rikkahub.data.sync.BackupEncryptionManager
+ import me.rerere.rikkahub.data.sync.S3Sync
+ import me.rerere.rikkahub.data.sync.s3.S3Config
+@@ -23,6 +25,7 @@ import me.rerere.rikkahub.data.event.AppEvent
+ import me.rerere.rikkahub.data.event.AppEventBus
+ import me.rerere.rikkahub.utils.readClipboardText
+ import me.rerere.rikkahub.utils.writeClipboardText
++import me.rerere.tts.provider.TTSManager
+ import java.time.ZonedDateTime
+ import java.time.format.TextStyle
+ import java.util.Locale
+@@ -300,7 +303,11 @@ internal fun buildClipboardTool(context: Context): Tool = run {
+         )
+     }
+ 
+-internal fun buildTtsTool(eventBus: AppEventBus): Tool = run {
++internal fun buildTtsTool(
++    eventBus: AppEventBus,
++    ttsManager: TTSManager,
++    settingsStore: SettingsStore,
++): Tool = run {
+         Tool(
+             name = "text_to_speech",
+             description = """
+@@ -309,6 +316,12 @@ internal fun buildTtsTool(eventBus: AppEventBus): Tool = run {
+                 The tool returns immediately; audio plays in the background on the device.
+                 Provide natural, readable text without markdown formatting.
+             """.trimIndent().replace("\n", " "),
++            systemPrompt = { _, _ ->
++                // 当前选中的 TTS provider 若硬编码了语气标记引导，则注入 system prompt（否则为空）
++                settingsStore.settingsFlow.value.getSelectedTTSProvider()
++                    ?.let { ttsManager.getPromptGuidance(it) }
++                    .orEmpty()
++            },
+             parameters = {
+                 InputSchema.Obj(
+                     properties = buildJsonObject {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+index 4fa9315ac..763511d47 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+@@ -100,6 +100,7 @@ import me.rerere.rikkahub.data.ai.tools.local.batchMoveTool
+ import me.rerere.rikkahub.data.ai.tools.local.batchDeleteTool
+ import me.rerere.rikkahub.data.ai.tools.local.webFetchTool
+ import me.rerere.rikkahub.data.event.AppEventBus
++import org.koin.java.KoinJavaComponent.getKoin
+ 
+ 
+ class LocalTools(
+@@ -161,7 +162,13 @@ class LocalTools(
+     val appBackupTool by lazy { buildAppBackupTool(settingsStore) }
+     val timeTool by lazy { buildTimeTool() }
+     val clipboardTool by lazy { buildClipboardTool(context) }
+-    val ttsTool by lazy { buildTtsTool(eventBus) }
++    // TTSManager 不走构造函数注入：LocalTools 构造参数已触 detekt LongParameterList 存量基线，
++    // 加参会改签名、使基线失效；TTS 只在 ttsTool 首次使用时经 Koin 解析。
++    private val ttsManager: me.rerere.tts.provider.TTSManager by lazy {
++        getKoin().get<me.rerere.tts.provider.TTSManager>()
++    }
++
++    val ttsTool by lazy { buildTtsTool(eventBus, ttsManager, settingsStore) }
+     val askUserTool by lazy { buildAskUserTool() }
+ 
+     // 拆分为域分组函数，拼接顺序与原来完全一致，仅为满足行数限制。
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
+index 7bbc16971..4c42ee352 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
+@@ -12,6 +12,8 @@ import kotlinx.serialization.json.jsonObject
+ import kotlinx.serialization.json.jsonPrimitive
+ import kotlinx.serialization.json.put
+ import me.rerere.ai.ui.UIMessagePart
++import me.rerere.ai.ui.diffTruncationMarker
++import me.rerere.ai.ui.truncateText
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.files.FilesManager
+ import me.rerere.rikkahub.data.vault.CredentialPurpose
+@@ -58,23 +60,13 @@ internal fun workspaceToolMessage(@StringRes resId: Int, vararg args: Any?): Str
+     return String.format(fallback, *args)
+ }
+ 
+-/** 超长行截断 + 总输出上限，避免 diff 撑爆消息或上下文。 */
++/** 超长行截断 + 总输出上限，避免 diff 撑爆消息或上下文。逐行 400 字符的口径保持独立，总量截断走共享原语。 */
+ internal fun limitDiffOutput(diff: String, maxChars: Int = MAX_DIFF_TOTAL_CHARS): String {
+-    val sb = StringBuilder()
+-    var total = 0
+-    for (line in diff.lineSequence()) {
+-        val limited =
+-            if (line.length > MAX_DIFF_LINE_CHARS) line.take(MAX_DIFF_LINE_CHARS) + "…<line truncated>"
+-            else line
+-        if (sb.isNotEmpty() && total + limited.length + 1 > maxChars) {
+-            sb.append('\n').append("…<diff truncated: exceeds $maxChars chars>")
+-            break
++    val lineTruncated =
++        diff.lineSequence().joinToString("\n") { line ->
++            if (line.length > MAX_DIFF_LINE_CHARS) line.take(MAX_DIFF_LINE_CHARS) + "…<line truncated>" else line
+         }
+-        if (sb.isNotEmpty()) sb.append('\n')
+-        sb.append(limited)
+-        total += limited.length + 1
+-    }
+-    return sb.toString()
++    return truncateText(lineTruncated, maxChars, diffTruncationMarker(maxChars))
+ }
+ 
+ internal const val SHELL_PRESETS_RELATIVE_PATH = ".agents/shell-presets.json"
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt
+index e5a9b6640..eff1f87a1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SshTool.kt
+@@ -4,7 +4,7 @@ import me.rerere.rikkahub.data.ai.tools.ToolErrors
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.SshPlatform
+ import me.rerere.rikkahub.data.log.AppLog
+-import me.rerere.rikkahub.data.sync.replaceFilePreservingTarget
++import me.rerere.workspace.replaceFilePreservingTarget
+ 
+ import me.rerere.rikkahub.data.vault.message
+ import me.rerere.rikkahub.data.vault.ensureTrailingNewline
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/crypto/EncryptedJsonStore.kt b/app/src/main/java/me/rerere/rikkahub/data/crypto/EncryptedJsonStore.kt
+index 4afb57071..8666bd5d2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/crypto/EncryptedJsonStore.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/crypto/EncryptedJsonStore.kt
+@@ -5,7 +5,7 @@ import javax.crypto.Cipher
+ import javax.crypto.spec.GCMParameterSpec
+ import kotlinx.serialization.KSerializer
+ import kotlinx.serialization.json.Json
+-import me.rerere.rikkahub.data.sync.replaceFilePreservingTarget
++import me.rerere.workspace.replaceFilePreservingTarget
+ 
+ /**
+  * 统一的 AES-256-GCM 加密 JSON 文件存储基建。
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/sync/AtomicFileReplacement.kt b/app/src/main/java/me/rerere/rikkahub/data/sync/AtomicFileReplacement.kt
+deleted file mode 100644
+index c78f1c5d0..000000000
+--- a/app/src/main/java/me/rerere/rikkahub/data/sync/AtomicFileReplacement.kt
++++ /dev/null
+@@ -1,52 +0,0 @@
+-package me.rerere.rikkahub.data.sync
+-
+-import java.io.File
+-import java.io.IOException
+-import me.rerere.rikkahub.data.log.AppLog
+-
+-private const val TAG = "AtomicFileReplacement"
+-
+-/**
+- * Replace a file from a fully-written sibling temporary file without deleting the existing target.
+- * Prefer the platform's same-filesystem rename (atomic on supported filesystems). If replacement
+- * over an existing target is refused, preserve the target under a recovery name before retrying.
+- * If the retry fails, restore the old target; if restoration also fails, leave its backup intact.
+- */
+-@Suppress("TooGenericExceptionCaught") // Rollback must run for any rename/copy failure so the original target is not lost.
+-internal fun replaceFilePreservingTarget(
+-    tempFile: File,
+-    targetFile: File,
+-    rename: (File, File) -> Boolean = { source, destination -> source.renameTo(destination) },
+-) {
+-    val parent = targetFile.parentFile ?: throw IOException("Target has no parent directory: $targetFile")
+-    if (tempFile.parentFile?.canonicalFile != parent.canonicalFile) {
+-        throw IOException("Temporary file must be a sibling of the target: $tempFile")
+-    }
+-    if (!tempFile.isFile) throw IOException("Temporary file is missing: $tempFile")
+-
+-    // On Android/Linux this normally performs one atomic rename and replaces the existing file.
+-    if (rename(tempFile, targetFile)) return
+-    if (!targetFile.exists()) {
+-        throw IOException("Failed to place restored file at ${targetFile.absolutePath}")
+-    }
+-
+-    val backup = File(parent, "${targetFile.name}.restore-backup-${System.nanoTime()}")
+-    if (!rename(targetFile, backup)) {
+-        throw IOException("Could not preserve existing target ${targetFile.absolutePath}; target was not removed")
+-    }
+-
+-    try {
+-        if (!rename(tempFile, targetFile)) {
+-            throw IOException("Could not install restored file; original target is preserved at ${backup.absolutePath}")
+-        }
+-    } catch (failure: Throwable) {
+-        if (!targetFile.exists() && backup.exists() && !rename(backup, targetFile)) {
+-            failure.addSuppressed(IOException("Could not restore original target; recovery copy remains at ${backup.absolutePath}"))
+-        }
+-        AppLog.e(TAG, "replaceFilePreservingTarget failed: ${targetFile.absolutePath}", failure)
+-        throw failure
+-    }
+-
+-    // Replacement succeeded; a stale recovery copy is harmless if the filesystem refuses deletion.
+-    backup.delete()
+-}
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ToolHistoryHelper.kt b/app/src/main/java/me/rerere/rikkahub/service/ToolHistoryHelper.kt
+index 70bcea1b7..fbdeb8e91 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ToolHistoryHelper.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ToolHistoryHelper.kt
+@@ -2,6 +2,8 @@ package me.rerere.rikkahub.service
+ 
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.ui.UIMessagePart
++import me.rerere.ai.ui.truncateText
++import me.rerere.ai.ui.truncateTextParts
+ import me.rerere.rikkahub.data.log.AppLog
+ 
+ private const val TAG = "ToolHistoryHelper"
+@@ -30,7 +32,7 @@ internal object ToolHistoryHelper {
+                         val trimmedInput =
+                             if (part.input.length > limit) {
+                                 AppLog.d(TAG, "B5 截断工具入参: tool=${part.toolName} ${part.input.length}→$limit chars")
+-                                part.input.take(limit) + "\n…[truncated]"
++                                truncateText(part.input, limit)
+                             } else {
+                                 part.input
+                             }
+@@ -38,21 +40,7 @@ internal object ToolHistoryHelper {
+                         val totalLen = textParts.sumOf { it.text.length }
+                         if (totalLen > limit) {
+                             AppLog.d(TAG, "T12 截断工具输出: tool=${part.toolName} $totalLen→$limit chars")
+-                            var remaining = limit
+-                            val truncated =
+-                                part.output.mapNotNull { p ->
+-                                    val t = (p as? UIMessagePart.Text)?.text
+-                                    if (t == null) {
+-                                        p
+-                                    } else if (remaining > 0) {
+-                                        val take = minOf(t.length, remaining)
+-                                        remaining -= take
+-                                        if (take == t.length) UIMessagePart.Text(t) else UIMessagePart.Text(t.take(take) + "\n…[truncated]")
+-                                    } else {
+-                                        null
+-                                    }
+-                                }
+-                            part.copy(input = trimmedInput, output = truncated)
++                            part.copy(input = trimmedInput, output = truncateTextParts(part.output, limit))
+                         } else if (trimmedInput !== part.input) {
+                             part.copy(input = trimmedInput)
+                         } else {
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/TranslationLanguages.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/TranslationLanguages.kt
+new file mode 100644
+index 000000000..e27d9fd5d
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/TranslationLanguages.kt
+@@ -0,0 +1,40 @@
++package me.rerere.rikkahub.ui.components.ai
++
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.res.stringResource
++import me.rerere.rikkahub.R
++import java.util.Locale
++
++// 翻译功能可选的目标语言，消息翻译和翻译页共用
++val TranslationLanguages: List<Locale> = listOf(
++    Locale.SIMPLIFIED_CHINESE,
++    Locale.ENGLISH,
++    Locale.TRADITIONAL_CHINESE,
++    Locale.JAPANESE,
++    Locale.KOREAN,
++    Locale.FRENCH,
++    Locale.GERMAN,
++    Locale.ITALIAN,
++    Locale.forLanguageTag("es-ES"),
++    Locale.forLanguageTag("ar"),
++    Locale.forLanguageTag("fa"),
++    Locale.forLanguageTag("ur"),
++)
++
++// 带国旗 emoji 的语言名，Locale.displayName 拿不到 emoji
++@Composable
++fun translationLanguageName(locale: Locale): String = when (locale) {
++    Locale.SIMPLIFIED_CHINESE -> stringResource(R.string.language_simplified_chinese)
++    Locale.ENGLISH -> stringResource(R.string.language_english)
++    Locale.TRADITIONAL_CHINESE -> stringResource(R.string.language_traditional_chinese)
++    Locale.JAPANESE -> stringResource(R.string.language_japanese)
++    Locale.KOREAN -> stringResource(R.string.language_korean)
++    Locale.FRENCH -> stringResource(R.string.language_french)
++    Locale.GERMAN -> stringResource(R.string.language_german)
++    Locale.ITALIAN -> stringResource(R.string.language_italian)
++    Locale.forLanguageTag("es-ES") -> stringResource(R.string.language_spanish)
++    Locale.forLanguageTag("ar") -> stringResource(R.string.language_arabic)
++    Locale.forLanguageTag("fa") -> stringResource(R.string.language_persian)
++    Locale.forLanguageTag("ur") -> stringResource(R.string.language_urdu)
++    else -> locale.getDisplayLanguage(Locale.getDefault())
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTranslation.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTranslation.kt
+index 4d25be975..7ab1f2396 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTranslation.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/message/ChatMessageTranslation.kt
+@@ -50,6 +50,8 @@ import me.rerere.hugeicons.stroke.ArrowUp01
+ import me.rerere.hugeicons.stroke.Cancel01
+ import me.rerere.hugeicons.stroke.LanguageCircle
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.ui.components.ai.TranslationLanguages
++import me.rerere.rikkahub.ui.components.ai.translationLanguageName
+ import me.rerere.rikkahub.ui.components.richtext.MarkdownBlock
+ import java.util.Locale
+ 
+@@ -59,44 +61,6 @@ fun LanguageSelectionDialog(
+     onClearTranslation: () -> Unit = {},
+     onDismissRequest: () -> Unit,
+ ) {
+-    // 支持的语言列表
+-    val languages =
+-        remember {
+-            listOf(
+-                Locale.SIMPLIFIED_CHINESE,
+-                Locale.ENGLISH,
+-                Locale.TRADITIONAL_CHINESE,
+-                Locale.JAPANESE,
+-                Locale.KOREAN,
+-                Locale.FRENCH,
+-                Locale.GERMAN,
+-                Locale.forLanguageTag("es-ES"),
+-                Locale.ITALIAN,
+-                Locale.forLanguageTag("ar"),
+-                Locale.forLanguageTag("fa"),
+-                Locale.forLanguageTag("ur"),
+-            )
+-        }
+-
+-    // 语言名称映射函数，原有的 locale.displayName 方法无法获取 emoji
+-    @Composable
+-    fun getLanguageDisplayName(locale: Locale): String =
+-        when (locale) {
+-            Locale.SIMPLIFIED_CHINESE -> stringResource(R.string.language_simplified_chinese)
+-            Locale.ENGLISH -> stringResource(R.string.language_english)
+-            Locale.TRADITIONAL_CHINESE -> stringResource(R.string.language_traditional_chinese)
+-            Locale.JAPANESE -> stringResource(R.string.language_japanese)
+-            Locale.KOREAN -> stringResource(R.string.language_korean)
+-            Locale.FRENCH -> stringResource(R.string.language_french)
+-            Locale.GERMAN -> stringResource(R.string.language_german)
+-            Locale.ITALIAN -> stringResource(R.string.language_italian)
+-            Locale.forLanguageTag("es-ES") -> stringResource(R.string.language_spanish)
+-            Locale.forLanguageTag("ar") -> stringResource(R.string.language_arabic)
+-            Locale.forLanguageTag("fa") -> stringResource(R.string.language_persian)
+-            Locale.forLanguageTag("ur") -> stringResource(R.string.language_urdu)
+-            else -> locale.getDisplayLanguage(Locale.getDefault())
+-        }
+-
+     ModalBottomSheet(
+         onDismissRequest = onDismissRequest,
+         sheetState =
+@@ -124,7 +88,7 @@ fun LanguageSelectionDialog(
+                 verticalArrangement = Arrangement.spacedBy(8.dp),
+                 modifier = Modifier.fillMaxWidth(),
+             ) {
+-                items(languages, key = { it.toLanguageTag() }) { language ->
++                items(TranslationLanguages, key = { it.toLanguageTag() }) { language ->
+                     Card(
+                         onClick = {
+                             onLanguageSelected(language)
+@@ -145,7 +109,7 @@ fun LanguageSelectionDialog(
+                                 modifier = Modifier.size(24.dp),
+                             )
+                             Text(
+-                                text = getLanguageDisplayName(language),
++                                text = translationLanguageName(language),
+                                 style = MaterialTheme.typography.titleMedium,
+                             )
+                         }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/permission/PermissionCards.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/permission/PermissionCards.kt
+new file mode 100644
+index 000000000..8cc98be98
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/permission/PermissionCards.kt
+@@ -0,0 +1,137 @@
++package me.rerere.rikkahub.ui.components.ui.permission
++
++import android.os.Build
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialShapes
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.toShape
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.vector.ImageVector
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Alert01
++import me.rerere.hugeicons.stroke.Notification01
++import me.rerere.rikkahub.R
++
++/**
++ * 本地网络权限状态, Android 17 以下不需要这个权限, 返回 null
++ */
++@Composable
++fun rememberLocalNetworkPermissionState(): PermissionState? {
++    return if (Build.VERSION.SDK_INT >= 37) rememberPermissionState(PermissionLocalNetwork) else null
++}
++
++/**
++ * 通知权限状态, Android 13 以下不需要运行时申请, 返回 null
++ */
++@Composable
++fun rememberNotificationPermissionState(): PermissionState? {
++    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++        rememberPermissionState(PermissionNotification)
++    } else {
++        null
++    }
++}
++
++/**
++ * 提示用户授予本地网络权限的卡片, 点击后发起申请
++ *
++ * 是否显示由调用方根据 [permissionState] 决定, 在 LazyColumn 里按条件添加 item, 避免留下空白间距
++ */
++@Composable
++fun LocalNetworkPermissionCard(
++    permissionState: PermissionState,
++    modifier: Modifier = Modifier,
++) {
++    PermissionRequestCard(
++        permissionState = permissionState,
++        icon = HugeIcons.Alert01,
++        title = stringResource(R.string.permission_local_network),
++        description = stringResource(R.string.permission_local_network_desc),
++        modifier = modifier,
++    )
++}
++
++/**
++ * 提示用户授予通知权限的卡片, 没有通知权限时前台服务（生成、Web 服务器等）的通知不会显示
++ *
++ * 是否显示由调用方根据 [permissionState] 决定, 在 LazyColumn 里按条件添加 item, 避免留下空白间距
++ */
++@Composable
++fun NotificationPermissionCard(
++    permissionState: PermissionState,
++    modifier: Modifier = Modifier,
++) {
++    PermissionRequestCard(
++        permissionState = permissionState,
++        icon = HugeIcons.Notification01,
++        title = stringResource(R.string.permission_notification),
++        description = stringResource(R.string.permission_notification_card_desc),
++        modifier = modifier,
++    )
++}
++
++@Composable
++private fun PermissionRequestCard(
++    permissionState: PermissionState,
++    icon: ImageVector,
++    title: String,
++    description: String,
++    modifier: Modifier = Modifier,
++) {
++    PermissionManager(permissionState = permissionState)
++
++    Surface(
++        onClick = { permissionState.requestPermissions() },
++        modifier = modifier.fillMaxWidth(),
++        shape = MaterialTheme.shapes.extraLarge,
++        color = MaterialTheme.colorScheme.tertiaryContainer,
++        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
++    ) {
++        Row(
++            modifier = Modifier.padding(16.dp),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.spacedBy(16.dp),
++        ) {
++            Box(
++                modifier = Modifier
++                    .size(56.dp)
++                    .background(MaterialTheme.colorScheme.tertiary, MaterialShapes.Cookie9Sided.toShape()),
++                contentAlignment = Alignment.Center,
++            ) {
++                Icon(
++                    imageVector = icon,
++                    contentDescription = null,
++                    modifier = Modifier.size(28.dp),
++                    tint = MaterialTheme.colorScheme.onTertiary,
++                )
++            }
++            Column(
++                modifier = Modifier.weight(1f),
++                verticalArrangement = Arrangement.spacedBy(2.dp),
++            ) {
++                Text(
++                    text = title,
++                    style = MaterialTheme.typography.titleMediumEmphasized,
++                )
++                Text(
++                    text = description,
++                    style = MaterialTheme.typography.bodyMedium,
++                )
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/history/HistoryPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/history/HistoryPage.kt
+index 1ed892b9f..3b097b26b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/history/HistoryPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/history/HistoryPage.kt
+@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.itemsIndexed
+-import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+@@ -37,7 +36,6 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Shape
+ import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.compose.ui.res.stringResource
+-import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+@@ -51,6 +49,7 @@ import me.rerere.hugeicons.stroke.TransactionHistory
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.data.model.Conversation
++import me.rerere.rikkahub.ui.components.ai.ExtensionEmptyState
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.SwipeToDelete
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
+@@ -111,9 +110,15 @@ fun HistoryPage(vm: HistoryVM = koinViewModel()) {
+         containerColor = CustomColors.topBarColors.containerColor,
+     ) { contentPadding ->
+         if (assistant != null && conversations.isEmpty()) {
+-            HistoryEmptyState(
++            Box(
+                 modifier = Modifier.fillMaxSize().padding(contentPadding),
+-            )
++            ) {
++                ExtensionEmptyState(
++                    message = stringResource(R.string.history_page_empty_title),
++                    description = stringResource(R.string.history_page_empty_hint),
++                    icon = HugeIcons.TransactionHistory,
++                )
++            }
+         } else {
+             val snackMessageDeleted = stringResource(R.string.history_page_conversation_deleted)
+             val snackMessageUndo = stringResource(R.string.history_page_undo)
+@@ -181,42 +186,6 @@ fun HistoryPage(vm: HistoryVM = koinViewModel()) {
+     }
+ }
+ 
+-@Composable
+-private fun HistoryEmptyState(modifier: Modifier = Modifier) {
+-    Column(
+-        modifier = modifier.padding(horizontal = 32.dp),
+-        horizontalAlignment = Alignment.CenterHorizontally,
+-        verticalArrangement = Arrangement.spacedBy(12.dp),
+-    ) {
+-        Surface(
+-            modifier = Modifier.size(72.dp),
+-            shape = CircleShape,
+-            color = MaterialTheme.colorScheme.secondaryContainer,
+-            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+-        ) {
+-            Box(contentAlignment = Alignment.Center) {
+-                Icon(
+-                    imageVector = HugeIcons.TransactionHistory,
+-                    contentDescription = null,
+-                    modifier = Modifier.size(32.dp),
+-                )
+-            }
+-        }
+-        Text(
+-            text = stringResource(R.string.history_page_empty_title),
+-            style = MaterialTheme.typography.titleMedium,
+-            color = MaterialTheme.colorScheme.onSurface,
+-            textAlign = TextAlign.Center,
+-        )
+-        Text(
+-            text = stringResource(R.string.history_page_empty_hint),
+-            style = MaterialTheme.typography.bodyMedium,
+-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+-            textAlign = TextAlign.Center,
+-        )
+-    }
+-}
+-
+ @Composable
+ private fun SwipeableConversationItem(
+     conversation: Conversation,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/search/SearchPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/search/SearchPage.kt
+index f761851d1..c63739a09 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/search/SearchPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/search/SearchPage.kt
+@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+-import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.foundation.text.KeyboardActions
+ import androidx.compose.foundation.text.KeyboardOptions
+@@ -44,7 +43,6 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.focus.FocusRequester
+ import androidx.compose.ui.focus.focusRequester
+-import androidx.compose.ui.graphics.vector.ImageVector
+ import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+ import androidx.compose.ui.res.stringResource
+@@ -63,6 +61,7 @@ import me.rerere.hugeicons.stroke.Sorting01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.db.fts.MessageSearchResult
+ import me.rerere.rikkahub.data.db.fts.MessageSearchSort
++import me.rerere.rikkahub.ui.components.ai.ExtensionEmptyState
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.context.LocalNavController
+ import me.rerere.rikkahub.ui.theme.CustomColors
+@@ -238,14 +237,14 @@ fun SearchPage(vm: SearchVM = koinViewModel()) {
+                     }
+ 
+                     vm.searchQuery.isBlank() -> {
+-                        SearchEmptyState(
++                        ExtensionEmptyState(
+                             icon = HugeIcons.Search01,
+                             message = stringResource(R.string.search_page_hint),
+                         )
+                     }
+ 
+                     vm.results.isEmpty() -> {
+-                        SearchEmptyState(
++                        ExtensionEmptyState(
+                             icon = HugeIcons.Search01,
+                             message = stringResource(R.string.search_page_no_results),
+                         )
+@@ -306,44 +305,6 @@ private fun SearchProgressState(message: String? = null) {
+     }
+ }
+ 
+-@Composable
+-private fun SearchEmptyState(
+-    icon: ImageVector,
+-    message: String,
+-) {
+-    Box(
+-        modifier = Modifier.fillMaxSize(),
+-        contentAlignment = Alignment.Center,
+-    ) {
+-        Column(
+-            horizontalAlignment = Alignment.CenterHorizontally,
+-            verticalArrangement = Arrangement.spacedBy(16.dp),
+-            modifier = Modifier.padding(horizontal = 32.dp),
+-        ) {
+-            Surface(
+-                modifier = Modifier.size(64.dp),
+-                shape = CircleShape,
+-                color = MaterialTheme.colorScheme.primaryContainer,
+-            ) {
+-                Box(contentAlignment = Alignment.Center) {
+-                    Icon(
+-                        imageVector = icon,
+-                        contentDescription = null,
+-                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+-                        modifier = Modifier.size(28.dp),
+-                    )
+-                }
+-            }
+-            Text(
+-                text = message,
+-                style = MaterialTheme.typography.bodyLarge,
+-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+-                textAlign = TextAlign.Center,
+-            )
+-        }
+-    }
+-}
+-
+ @Composable
+ private fun SortMenuButton(
+     current: MessageSearchSort,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+index 99829e85b..62a2338a1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+@@ -80,6 +80,10 @@ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+ import me.rerere.rikkahub.ui.components.ui.CardGroupScope
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
++import me.rerere.rikkahub.ui.components.ui.permission.LocalNetworkPermissionCard
++import me.rerere.rikkahub.ui.components.ui.permission.NotificationPermissionCard
++import me.rerere.rikkahub.ui.components.ui.permission.rememberLocalNetworkPermissionState
++import me.rerere.rikkahub.ui.components.ui.permission.rememberNotificationPermissionState
+ import me.rerere.rikkahub.ui.components.ui.icons.DiscordIcon
+ import me.rerere.rikkahub.ui.components.ui.icons.TencentQQIcon
+ import me.rerere.rikkahub.ui.context.LocalNavController
+@@ -115,6 +119,8 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
+     val shortcutEntries by vm.shortcutEntries.collectAsStateWithLifecycle(initialValue = vm.shortcutEntriesNow())
+     val filesManager: FilesManager = koinInject()
+     val secretsStore: SkillSecretsStore = koinInject()
++    val localNetworkPermission = rememberLocalNetworkPermissionState()
++    val notificationPermission = rememberNotificationPermissionState()
+ 
+     Scaffold(
+         topBar = {
+@@ -165,6 +171,18 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
+                 }
+             }
+ 
++            if (localNetworkPermission?.allRequiredPermissionsGranted == false) {
++                item("localNetworkPermission") {
++                    LocalNetworkPermissionCard(permissionState = localNetworkPermission)
++                }
++            }
++
++            if (notificationPermission?.allRequiredPermissionsGranted == false) {
++                item("notificationPermission") {
++                    NotificationPermissionCard(permissionState = notificationPermission)
++                }
++            }
++
+             if (secretsStore.isSecurityDegraded()) {
+                 item {
+                     SecurityDegradedWarningCard()
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingTrustedKeysPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingTrustedKeysPage.kt
+index 99634a9f1..f420021f9 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingTrustedKeysPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingTrustedKeysPage.kt
+@@ -45,7 +45,7 @@ import me.rerere.hugeicons.stroke.Delete01
+ import me.rerere.hugeicons.stroke.Key01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.ai.tools.local.knownHostsFile
+-import me.rerere.rikkahub.data.sync.replaceFilePreservingTarget
++import me.rerere.workspace.replaceFilePreservingTarget
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SshTerminalPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SshTerminalPage.kt
+index 1fcb4c45a..ce76230a4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SshTerminalPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SshTerminalPage.kt
+@@ -76,7 +76,7 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.SshPlatform
+ import me.rerere.rikkahub.data.log.AppLog
+ import me.rerere.rikkahub.data.repository.SshHostRepository
+-import me.rerere.rikkahub.data.sync.replaceFilePreservingTarget
++import me.rerere.workspace.replaceFilePreservingTarget
+ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+ import me.rerere.rikkahub.data.vault.ensureTrailingNewline
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/translator/TranslatorPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/translator/TranslatorPage.kt
+index 35c707102..7bf7cfdeb 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/translator/TranslatorPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/translator/TranslatorPage.kt
+@@ -60,6 +60,8 @@ import me.rerere.hugeicons.stroke.Clipboard
+ import me.rerere.hugeicons.stroke.LanguageCircle
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.ui.components.ai.ModelSelector
++import me.rerere.rikkahub.ui.components.ai.TranslationLanguages
++import me.rerere.rikkahub.ui.components.ai.translationLanguageName
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.CardGroupIcon
+@@ -251,23 +253,6 @@ fun TranslatorPage(vm: TranslatorVM = koinViewModel()) {
+     }
+ }
+ 
+-private val Locales by lazy {
+-    listOf(
+-        Locale.SIMPLIFIED_CHINESE,
+-        Locale.ENGLISH,
+-        Locale.TRADITIONAL_CHINESE,
+-        Locale.JAPANESE,
+-        Locale.KOREAN,
+-        Locale.FRENCH,
+-        Locale.GERMAN,
+-        Locale.ITALIAN,
+-        Locale.forLanguageTag("es-ES"),
+-        Locale.forLanguageTag("ar"),
+-        Locale.forLanguageTag("fa"),
+-        Locale.forLanguageTag("ur"),
+-    )
+-}
+-
+ @Composable
+ private fun LanguageSelector(
+     targetLanguage: Locale,
+@@ -275,24 +260,6 @@ private fun LanguageSelector(
+ ) {
+     var expanded by remember { mutableStateOf(false) }
+ 
+-    @Composable
+-    fun getLanguageDisplayName(locale: Locale): String =
+-        when (locale) {
+-            Locale.SIMPLIFIED_CHINESE -> stringResource(R.string.language_simplified_chinese)
+-            Locale.ENGLISH -> stringResource(R.string.language_english)
+-            Locale.TRADITIONAL_CHINESE -> stringResource(R.string.language_traditional_chinese)
+-            Locale.JAPANESE -> stringResource(R.string.language_japanese)
+-            Locale.KOREAN -> stringResource(R.string.language_korean)
+-            Locale.FRENCH -> stringResource(R.string.language_french)
+-            Locale.GERMAN -> stringResource(R.string.language_german)
+-            Locale.ITALIAN -> stringResource(R.string.language_italian)
+-            Locale.forLanguageTag("es-ES") -> stringResource(R.string.language_spanish)
+-            Locale.forLanguageTag("ar") -> stringResource(R.string.language_arabic)
+-            Locale.forLanguageTag("fa") -> stringResource(R.string.language_persian)
+-            Locale.forLanguageTag("ur") -> stringResource(R.string.language_urdu)
+-            else -> locale.getDisplayLanguage(Locale.getDefault())
+-        }
+-
+     Box(
+         modifier = Modifier.padding(horizontal = 4.dp),
+     ) {
+@@ -301,7 +268,7 @@ private fun LanguageSelector(
+             onExpandedChange = { expanded = it },
+         ) {
+             OutlinedTextField(
+-                value = getLanguageDisplayName(targetLanguage),
++                value = translationLanguageName(targetLanguage),
+                 onValueChange = {},
+                 readOnly = true,
+                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+@@ -321,9 +288,9 @@ private fun LanguageSelector(
+                 expanded = expanded,
+                 onDismissRequest = { expanded = false },
+             ) {
+-                Locales.forEach { language ->
++                TranslationLanguages.forEach { language ->
+                     DropdownMenuItem(
+-                        text = { Text(getLanguageDisplayName(language)) },
++                        text = { Text(translationLanguageName(language)) },
+                         onClick = {
+                             onLanguageSelected(language)
+                             expanded = false
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index efdb78c7b..6c5649a14 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -668,6 +668,7 @@
+   <string name="permission_go_to_settings">الانتقال إلى الإعداد</string>
+   <string name="permission_notification">الإشعار</string>
+   <string name="permission_notification_desc">إرسال الإشعارات</string>
++  <string name="permission_notification_card_desc">اسمح بالإشعارات لعرض تقدّم المهام الخلفية مثل توليد الذكاء الاصطناعي وخادم الويب</string>
+   <string name="permission_local_network">الشبكة المحلية</string>
+   <string name="permission_local_network_desc">مطلوب على Android 17+ لـ SSH وخادم ويب الشبكة المحلية</string>
+   <string name="permission_permanently_denied">مرفوض نهائيًا</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 4c3a9c351..c517ecefa 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -545,6 +545,7 @@
+   <string name="permission_microphone_desc">需要麥克風權限才能進行語音辨識</string>
+   <string name="permission_notification">通知</string>
+   <string name="permission_notification_desc">傳送通知</string>
++  <string name="permission_notification_card_desc">允許通知，以便查看 AI 生成、Web 伺服器等背景任務的進度</string>
+   <string name="permission_permanently_denied">永久拒絕</string>
+   <string name="permission_required">必要</string>
+   <string name="photo">照片</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index e8842f8ac..a8ecac784 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -555,6 +555,7 @@
+   <string name="permission_microphone_desc">音声認識にはマイクの権限が必要です</string>
+   <string name="permission_notification">通知</string>
+   <string name="permission_notification_desc">通知を送信する</string>
++  <string name="permission_notification_card_desc">AI 生成や Web サーバーなどのバックグラウンドタスクの進捗を確認できるよう、通知を許可してください</string>
+   <string name="permission_permanently_denied">永久に拒否されました</string>
+   <string name="permission_required">必須</string>
+   <string name="photo">写真</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 9c6b64b97..47ff81ef7 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -555,6 +555,7 @@
+   <string name="permission_microphone_desc">음성 인식을 위해 마이크 권한이 필요합니다</string>
+   <string name="permission_notification">알림</string>
+   <string name="permission_notification_desc">알림 보내기</string>
++  <string name="permission_notification_card_desc">AI 생성, 웹 서버 등 백그라운드 작업의 진행 상황을 확인할 수 있도록 알림을 허용하세요</string>
+   <string name="permission_permanently_denied">영구적으로 거부됨</string>
+   <string name="permission_required">필요함</string>
+   <string name="photo">사진</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 2a4f1a901..3acc3b633 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -550,6 +550,7 @@
+   <string name="permission_microphone_desc">Для распознавания речи требуется разрешение на использование микрофона</string>
+   <string name="permission_notification">Уведомление</string>
+   <string name="permission_notification_desc">Отправлять уведомления</string>
++  <string name="permission_notification_card_desc">Разрешите уведомления, чтобы видеть ход фоновых задач, таких как генерация ИИ и веб-сервер</string>
+   <string name="permission_permanently_denied">Запрещено навсегда</string>
+   <string name="permission_required">Требуется</string>
+   <string name="photo">Фото</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 7edd45e0c..5f17293a9 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -678,6 +678,7 @@
+   <string name="permission_microphone_desc">需要麦克风权限以进行语音识别</string>
+   <string name="permission_notification">通知</string>
+   <string name="permission_notification_desc">发送通知</string>
++  <string name="permission_notification_card_desc">允许通知，以便查看 AI 生成、Web 服务器等后台任务的进度</string>
+   <string name="permission_permanently_denied">已永久拒绝</string>
+   <string name="permission_required">必需</string>
+   <string name="photo">照片</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 03d54e04f..2bf407eea 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -682,6 +682,7 @@
+   <string name="permission_microphone_desc">Microphone permission is required for speech recognition</string>
+   <string name="permission_notification">Notification</string>
+   <string name="permission_notification_desc">Send notifications</string>
++  <string name="permission_notification_card_desc">Allow notifications to see the progress of background tasks such as AI generation and the web server</string>
+   <string name="permission_calendar_read">Read Calendar</string>
+   <string name="permission_calendar_read_desc">Read calendar events to answer your schedule-related questions</string>
+   <string name="permission_calendar_write">Write Calendar</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/TtsToolSystemPromptTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/TtsToolSystemPromptTest.kt
+new file mode 100644
+index 000000000..7ff0e61aa
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/TtsToolSystemPromptTest.kt
+@@ -0,0 +1,113 @@
++package me.rerere.rikkahub.data.ai.tools
++
++import android.app.Application
++import android.os.Looper
++import androidx.datastore.preferences.core.PreferenceDataStoreFactory
++import androidx.datastore.preferences.preferencesDataStoreFile
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.runBlocking
++import me.rerere.ai.provider.Model
++import me.rerere.rikkahub.AppScope
++import me.rerere.rikkahub.data.datastore.ProviderCredentialCipher
++import me.rerere.rikkahub.data.datastore.SettingsStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsKeyStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsSecurityProvider
++import me.rerere.rikkahub.data.event.AppEventBus
++import me.rerere.tts.provider.TTSManager
++import me.rerere.tts.provider.TTSProviderSetting
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++import java.security.Security
++import javax.crypto.KeyGenerator
++
++/**
++ * text_to_speech 工具的 systemPrompt 钩子：按当前选中的 TTS provider 注入语气标记引导。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class TtsToolSystemPromptTest {
++    private val context: Application = RuntimeEnvironment.getApplication()
++    private val dataStoreScope = CoroutineScope(Dispatchers.Default)
++    private val dataStore = PreferenceDataStoreFactory.create(scope = dataStoreScope) {
++        context.preferencesDataStoreFile("test-tts-settings")
++    }
++    private val appScope = AppScope()
++    private val settingsStore = SettingsStore(context, appScope, dataStore)
++    private val ttsManager = TTSManager(context)
++    private val tool = buildTtsTool(AppEventBus(), ttsManager, settingsStore)
++    private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private lateinit var securityProvider: SyntheticSettingsSecurityProvider
++
++    /**
++     * Pump Android Main while real DataStore work proceeds on IO.
++     * SettingsStore 的初始化收集器跑在 AppScope（Dispatchers.Main）上，
++     * Robolectric 下 Main looper 默认暂停，裸 runBlocking 会等初始化等到天荒地老；
++     * 挂起操作放 IO 协程跑、主线程循环 idle Main looper 才能推进。
++     */
++    private fun <T> perform(block: suspend () -> T): Result<T> {
++        val task = workers.async { block() }
++        val deadline = System.nanoTime() + 30_000_000_000L
++        while (!task.isCompleted && System.nanoTime() < deadline) {
++            shadowOf(Looper.getMainLooper()).idle()
++            Thread.sleep(5)
++        }
++        check(task.isCompleted) { "TTS settings operation timed out" }
++        return runCatching { runBlocking { task.await() } }
++    }
++
++    @Before
++    fun setUp() {
++        // 落盘要过 ProviderCredentialCipher，它读 AndroidKeyStore；
++        // Robolectric 下没有 AndroidKeyStore，用仓内既有的合成 fixture 代替
++        //（仅外部 key 来源是合成的，生产 AES-GCM 与 Base64 代码原样跑）。
++        securityProvider = SyntheticSettingsSecurityProvider()
++        Security.insertProviderAt(securityProvider, 1)
++        SyntheticSettingsKeyStore.key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
++        SyntheticSettingsKeyStore.unavailable = false
++        ProviderCredentialCipher.clearDegradedStateForTest()
++    }
++
++    @After
++    fun tearDown() {
++        workers.cancel()
++        dataStoreScope.cancel()
++        appScope.cancel()
++        SyntheticSettingsKeyStore.key = null
++        SyntheticSettingsKeyStore.unavailable = false
++        Security.removeProvider(securityProvider.name)
++    }
++
++    @Test
++    fun `default system provider injects no guidance`() {
++        val prompt = perform { tool.systemPrompt(Model(), emptyList()) }.getOrThrow()
++        assertEquals("", prompt)
++    }
++
++    @Test
++    fun `selected MiMo provider injects its tone guidance`() {
++        val mimo = TTSProviderSetting.MiMo()
++        perform {
++            settingsStore.update { current ->
++                current.copy(
++                    ttsProviders = current.ttsProviders + mimo,
++                    selectedTTSProviderId = mimo.id,
++                )
++            }
++        }.getOrThrow()
++        val prompt = perform { tool.systemPrompt(Model(), emptyList()) }.getOrThrow()
++        assertEquals(ttsManager.getPromptGuidance(mimo), prompt)
++        assertTrue(prompt.isNotBlank())
++    }
++}
+diff --git a/workspace/src/main/java/me/rerere/workspace/AtomicFileReplacement.kt b/workspace/src/main/java/me/rerere/workspace/AtomicFileReplacement.kt
+index 767116e1e..18a809624 100644
+--- a/workspace/src/main/java/me/rerere/workspace/AtomicFileReplacement.kt
++++ b/workspace/src/main/java/me/rerere/workspace/AtomicFileReplacement.kt
+@@ -13,7 +13,7 @@ private const val TAG = "AtomicFileReplacement"
+  * If the retry fails, restore the old target; if restoration also fails, leave its backup intact.
+  */
+ @Suppress("TooGenericExceptionCaught")
+-internal fun replaceFilePreservingTarget(
++fun replaceFilePreservingTarget(
+     tempFile: File,
+     targetFile: File,
+     rename: (File, File) -> Boolean = { source, destination -> source.renameTo(destination) },
+diff --git a/workspace/src/main/java/me/rerere/workspace/Workspace.kt b/workspace/src/main/java/me/rerere/workspace/Workspace.kt
+index 25bc4946a..876eb7e0e 100644
+--- a/workspace/src/main/java/me/rerere/workspace/Workspace.kt
++++ b/workspace/src/main/java/me/rerere/workspace/Workspace.kt
+@@ -105,12 +105,6 @@ data class WorkspaceFileEntry(
+     val isSymlink: Boolean = false,
+ )
+ 
+-data class WorkspaceSearchMatch(
+-    val path: String,
+-    val line: Int,
+-    val text: String,
+-)
+-
+ /** 递归目录树的一个条目, [depth] 相对于树的起点目录, 直接子项为 1 */
+ data class WorkspaceTreeEntry(
+     val path: String,
+diff --git a/workspace/src/main/java/me/rerere/workspace/WorkspaceFileSystem.kt b/workspace/src/main/java/me/rerere/workspace/WorkspaceFileSystem.kt
+index 2ae4c1d4e..b56028f1e 100644
+--- a/workspace/src/main/java/me/rerere/workspace/WorkspaceFileSystem.kt
++++ b/workspace/src/main/java/me/rerere/workspace/WorkspaceFileSystem.kt
+@@ -23,13 +23,6 @@ data class WorkspaceListResult(
+     val totalCount: Int,
+ )
+ 
+-/** [WorkspaceFileSystem.grepDetailed] 的返回: 匹配 + 是否因上限截断 + 跳过的大文件数。 */
+-data class WorkspaceSearchResult(
+-    val matches: List<WorkspaceSearchMatch>,
+-    val truncated: Boolean,
+-    val skippedLargeFiles: Int,
+-)
+-
+ /** [WorkspaceFileSystem.globDetailed] 的返回: 条目 + 空结果时给调用方的提示, 有匹配时为空。 */
+ data class WorkspaceGlobResult(
+     val entries: List<WorkspaceFileEntry>,
+@@ -502,83 +495,6 @@ class WorkspaceFileSystem(
+             )
+         }
+ 
+-    fun grep(
+-        root: File,
+-        query: String,
+-        path: String = "",
+-        regex: Boolean = false,
+-        ignoreCase: Boolean = true,
+-        includeGlob: String? = null,
+-    ): List<WorkspaceSearchMatch> = grepDetailed(root, query, path, regex, ignoreCase, includeGlob).matches
+-
+-    /**
+-     * 与 [grep] 相同, 但额外返回是否因 [WorkspaceConfig.maxSearchResults] 截断，
+-     * 以及因超 [WorkspaceConfig.maxReadBytes] 而跳过的大文件数。
+-     */
+-    fun grepDetailed(
+-        root: File,
+-        query: String,
+-        path: String = "",
+-        regex: Boolean = false,
+-        ignoreCase: Boolean = true,
+-        includeGlob: String? = null,
+-    ): WorkspaceSearchResult {
+-        require(query.isNotBlank()) { "Search query is required" }
+-        val start = resolvePath(root, path)
+-        require(start.exists()) { "Path does not exist: $path" }
+-        val options = if (ignoreCase) setOf(RegexOption.IGNORE_CASE) else emptySet()
+-        val matcher = if (regex) Regex(query, options) else Regex(Regex.escape(query), options)
+-        val includeMatcher =
+-            includeGlob
+-                ?.takeIf { it.isNotBlank() }
+-                ?.let { globMatcher(it) }
+-
+-        val results = mutableListOf<WorkspaceSearchMatch>()
+-        var truncated = false
+-        var skippedLargeFiles = 0
+-        walk(start) { paths ->
+-            paths
+-                .filter { !Files.isSymbolicLink(it) }
+-                .filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) }
+-                .filter { !it.toFile().name.startsWith(".l2s.") }
+-                .forEach { path ->
+-                    if (truncated) return@forEach
+-                    if (includeMatcher != null &&
+-                        !includeMatcher.matches(root.toPath().relativize(path).normalizeForMatch())
+-                    ) {
+-                        return@forEach
+-                    }
+-                    val file = path.toFile()
+-                    if (file.length() > config.maxReadBytes) {
+-                        skippedLargeFiles++
+-                        return@forEach
+-                    }
+-                    file.useLines(StandardCharsets.UTF_8) { lines ->
+-                        lines.forEachIndexed { index, line ->
+-                            if (matcher.containsMatchIn(line)) {
+-                                if (results.size >= config.maxSearchResults) {
+-                                    // 已满后又发现匹配，才算真的截断
+-                                    truncated = true
+-                                    return@useLines
+-                                }
+-                                results +=
+-                                    WorkspaceSearchMatch(
+-                                        path = file.relativePath(root),
+-                                        line = index + 1,
+-                                        text = line,
+-                                    )
+-                            }
+-                        }
+-                    }
+-                }
+-        }
+-        return WorkspaceSearchResult(
+-            matches = results,
+-            truncated = truncated,
+-            skippedLargeFiles = skippedLargeFiles,
+-        )
+-    }
+-
+     private fun <T> walk(
+         start: File,
+         block: (Sequence<Path>) -> T,
+diff --git a/workspace/src/main/java/me/rerere/workspace/WorkspaceManager.kt b/workspace/src/main/java/me/rerere/workspace/WorkspaceManager.kt
+index bd12562af..0891e4f0b 100644
+--- a/workspace/src/main/java/me/rerere/workspace/WorkspaceManager.kt
++++ b/workspace/src/main/java/me/rerere/workspace/WorkspaceManager.kt
+@@ -542,25 +542,6 @@ class WorkspaceManager(
+         path: String = "",
+     ): WorkspaceGlobResult = fileSystem.globDetailed(filesDir(root), pattern, path)
+ 
+-    fun grep(
+-        root: String,
+-        query: String,
+-        path: String = "",
+-        regex: Boolean = false,
+-        ignoreCase: Boolean = true,
+-        includeGlob: String? = null,
+-    ): List<WorkspaceSearchMatch> = fileSystem.grep(filesDir(root), query, path, regex, ignoreCase, includeGlob)
+-
+-    /** 与 [grep] 相同, 但额外返回是否截断以及跳过的大文件数。 */
+-    fun grepDetailed(
+-        root: String,
+-        query: String,
+-        path: String = "",
+-        regex: Boolean = false,
+-        ignoreCase: Boolean = true,
+-        includeGlob: String? = null,
+-    ): WorkspaceSearchResult = fileSystem.grepDetailed(filesDir(root), query, path, regex, ignoreCase, includeGlob)
+-
+     fun executeCommand(
+         root: String,
+         command: String,
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/sync/AtomicFileReplacementTest.kt b/workspace/src/test/java/me/rerere/workspace/AtomicFileReplacementTest.kt
+similarity index 68%
+rename from app/src/test/java/me/rerere/rikkahub/data/sync/AtomicFileReplacementTest.kt
+rename to workspace/src/test/java/me/rerere/workspace/AtomicFileReplacementTest.kt
+index 1c7667379..e999e1985 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/sync/AtomicFileReplacementTest.kt
++++ b/workspace/src/test/java/me/rerere/workspace/AtomicFileReplacementTest.kt
+@@ -1,14 +1,44 @@
+-package me.rerere.rikkahub.data.sync
++package me.rerere.workspace
+ 
+ import java.io.File
+ import java.io.IOException
+ import java.nio.file.Files
++import me.rerere.common.log.AppLogger
++import org.junit.After
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertTrue
++import org.junit.Before
+ import org.junit.Test
+ 
+ class AtomicFileReplacementTest {
++    // 失败路径经 AppLogger 记日志；未装 sink 时它退回 android.util.Log，
++    // 纯 JVM 单测里那是 stub、会抛异常，故先装空 sink。
++    private val noopSink =
++        object : AppLogger.Sink {
++            override fun d(tag: String, message: String) = Unit
++
++            override fun i(tag: String, message: String) = Unit
++
++            override fun w(tag: String, message: String) = Unit
++
++            override fun w(tag: String, message: String, tr: Throwable?) = Unit
++
++            override fun e(tag: String, message: String) = Unit
++
++            override fun e(tag: String, message: String, tr: Throwable?) = Unit
++        }
++
++    @Before
++    fun setUp() {
++        AppLogger.install(noopSink)
++    }
++
++    @After
++    fun tearDown() {
++        AppLogger.install(noopSink)
++    }
++
+     @Test
+     fun `failed replacement restores original target`() {
+         val dir = Files.createTempDirectory("atomic-replace-test").toFile()
+diff --git a/workspace/src/test/java/me/rerere/workspace/ExampleUnitTest.kt b/workspace/src/test/java/me/rerere/workspace/ExampleUnitTest.kt
+index 86d5c728c..bc8cd83c3 100644
+--- a/workspace/src/test/java/me/rerere/workspace/ExampleUnitTest.kt
++++ b/workspace/src/test/java/me/rerere/workspace/ExampleUnitTest.kt
+@@ -20,10 +20,6 @@ class ExampleUnitTest {
+         assertEquals("hello\nworkspace", fileSystem.readText(root, "src/main.txt"))
+         assertEquals(listOf("src"), fileSystem.list(root).map { it.path })
+         assertEquals(listOf("src/main.txt"), fileSystem.glob(root, "**/*.txt").map { it.path })
+-        assertEquals(
+-            listOf(WorkspaceSearchMatch(path = "src/main.txt", line = 2, text = "workspace")),
+-            fileSystem.grep(root, "workspace"),
+-        )
+     }
+ 
+     @Test
