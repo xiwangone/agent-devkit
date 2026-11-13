@@ -36,7 +36,9 @@ on:
       gradle_tasks:
         description: "要跑的 Gradle 任务"
         required: false
-        default: ":app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest"
+        # 默认跑 tests.yml 的 11 个模块 + :workspace 全量：只跑 :app + :workspace 时，
+        # patch 动了 :ai/:common 等模块，它们的专属单测不会跑，漏网。
+        default: ":app:compileDebugKotlin :app:testDebugUnitTest :ai:testDebugUnitTest :common:testDebugUnitTest :document:testDebugUnitTest :highlight:testDebugUnitTest :llama-cpp:testDebugUnitTest :material3:testDebugUnitTest :search:testDebugUnitTest :speech:testDebugUnitTest :videogen:testDebugUnitTest :web:testDebugUnitTest :workspace:testDebugUnitTest"
   push:
     branches:
       - "patch/**"
@@ -57,7 +59,7 @@ jobs:
       # push 触发时 inputs 整个为空，这里故意不写 || 默认值，
       # 由下面“打 patch”一步按分支名推导（patch/<名> → patches/<名>.patch）。
       PATCH_PATH: ${{ github.event.inputs.patch_path }}
-      GRADLE_TASKS: ${{ github.event.inputs.gradle_tasks || ':app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest' }}
+      GRADLE_TASKS: ${{ github.event.inputs.gradle_tasks || ':app:compileDebugKotlin :app:testDebugUnitTest :ai:testDebugUnitTest :common:testDebugUnitTest :document:testDebugUnitTest :highlight:testDebugUnitTest :llama-cpp:testDebugUnitTest :material3:testDebugUnitTest :search:testDebugUnitTest :speech:testDebugUnitTest :videogen:testDebugUnitTest :web:testDebugUnitTest :workspace:testDebugUnitTest' }}
     steps:
       - name: 解析 base 为完整 SHA
         id: resolve-base
