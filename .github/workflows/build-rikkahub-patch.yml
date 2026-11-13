@@ -1,0 +1,116 @@
+name: build-rikkahub-patch
+
+# 外挂验证 lane：对 xiwangone/rikkahub-agents 的某个 base 打一个存放在本仓
+# patch 分支里的 patch，跑编译 + 单测。不碰 rikkahub-agents 本仓
+# （只读 clone + runner 本地打 patch），结果用 gh 拉回来看。
+#
+# 用法：
+#   gh workflow run build-rikkahub-patch.yml --repo xiwangone/agent-devkit --ref main \
+#     -f base_sha=<sha> -f patch_ref=<分支> -f patch_path=<分支内路径>
+#
+# 注意：runner 是 4 核 16G / 14G 盘的标准免费 runner；Gradle 缓存
+# （modules-2 / build-cache-1）按本仓单独存，首跑是冷的，跑几轮后热起来。
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "rikkahub-agents base commit"
+        required: true
+        default: "14fc3a17099d91ff07a00c144731c4a4427af7bb"
+      patch_ref:
+        description: "本仓里放 patch 的分支"
+        required: true
+        default: "patch/stale-tests-14fc3a170"
+      patch_path:
+        description: "分支里 patch 文件的路径"
+        required: true
+        default: "patches/stale-tests-14fc3a170.patch"
+      gradle_tasks:
+        description: "要跑的 Gradle 任务"
+        required: false
+        default: ":app:compileDebugKotlin :app:testDebugUnitTest :workspace:testDebugUnitTest"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GRADLE_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
+      _JAVA_OPTIONS: "-Djava.net.preferIPv4Stack=true"
+    steps:
+      - name: 取 rikkahub-agents（base，工作区根目录）
+        uses: actions/checkout@v4
+        with:
+          repository: xiwangone/rikkahub-agents
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 1
+          submodules: true
+
+      - name: 取本仓 patch 分支
+        uses: actions/checkout@v4
+        with:
+          repository: xiwangone/agent-devkit
+          ref: ${{ inputs.patch_ref }}
+          path: patch-src
+          fetch-depth: 1
+
+      - name: 打 patch（先 --check）
+        run: |
+          set -e
+          git apply --check "patch-src/${{ inputs.patch_path }}"
+          git apply "patch-src/${{ inputs.patch_path }}"
+          echo "--- 改动规模 ---"
+          git diff --stat | tail -3
+
+      - name: 准备构建环境（复用本仓 setup-build-env）
+        uses: xiwangone/rikkahub-agents/.github/actions/setup-build-env@${{ inputs.base_sha }}
+
+      - name: 缓存 Gradle 发行版
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: ${{ runner.os }}-gradle-dist-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-dist-
+
+      - name: 缓存 Gradle 依赖
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches/modules-2
+          key: ${{ runner.os }}-gradle-modules-${{ hashFiles('gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-modules-
+
+      - name: 缓存 Gradle 构建缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/caches/build-cache-1
+          key: ${{ runner.os }}-gradle-buildcache-${{ hashFiles('gradle/libs.versions.toml', '**/*.gradle.kts') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-buildcache-
+          save-always: true
+
+      - name: 磁盘用量（跑前）
+        run: df -h .
+
+      - name: 编译 + 单测
+        run: |
+          ./gradlew ${{ inputs.gradle_tasks }} --no-daemon --no-configuration-cache -x :web:buildWebUi -Pkotlin.compiler.execution.strategy=in-process --max-workers=2 2>&1 | tee gradle-verify.log
+
+      - name: 磁盘用量（跑后）
+        if: always()
+        run: df -h .
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/build/test-results/testDebugUnitTest/*.xml
+            gradle-verify.log
+          if-no-files-found: ignore
