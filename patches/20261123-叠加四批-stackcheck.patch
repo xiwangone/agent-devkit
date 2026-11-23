@@ -1,0 +1,1330 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+index ece2d5c6b..b12b1d3a4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+@@ -257,6 +257,29 @@ data class Settings(
+         return (webDavConfigs.firstOrNull() ?: webDavConfig).withLegacyExpanded()
+     }
+ 
++    /**
++     * 删除一个 WebDAV 配置（保留至少一个）。
++     *
++     * @return 删除后的 Settings；删除后将无配置剩余时返回 null；id 不存在时返回原值。
++     * 删除当前生效配置时，生效配置顺延为剩余列表首个（与旧单配置槽保持同步）。
++     */
++    fun withoutWebDavConfig(cfgId: String): Settings? {
++        if (webDavConfigs.isEmpty()) {
++            // 旧单配置模式：唯一配置在旧单配置槽里，删它会归零 → 拒绝；id 对不上则不做任何改动。
++            if (webDavConfig.id == cfgId) return null
++            return this
++        }
++        val remaining = webDavConfigs.filterNot { it.id == cfgId }
++        if (remaining.size == webDavConfigs.size) return this
++        if (remaining.isEmpty()) return null
++        val newActive = remaining.first()
++        return copy(
++            webDavConfigs = remaining,
++            activeWebDavConfigId = newActive.id,
++            webDavConfig = newActive,
++        )
++    }
++
+     /**
+      * 当前生效的 S3 配置（同 [activeWebDavConfig] 逻辑：id 悬空时退回旧单配置，
+      * 不静默换到列表首个配置）。
+@@ -270,6 +293,29 @@ data class Settings(
+         return (s3Configs.firstOrNull() ?: s3Config).withLegacyExpanded()
+     }
+ 
++    /**
++     * 删除一个 S3 配置（保留至少一个）。
++     *
++     * @return 删除后的 Settings；删除后将无配置剩余时返回 null；id 不存在时返回原值。
++     * 删除当前生效配置时，生效配置顺延为剩余列表首个（与旧单配置槽保持同步）。
++     */
++    fun withoutS3Config(cfgId: String): Settings? {
++        if (s3Configs.isEmpty()) {
++            // 旧单配置模式：唯一配置在旧单配置槽里，删它会归零 → 拒绝；id 对不上则不做任何改动。
++            if (s3Config.id == cfgId) return null
++            return this
++        }
++        val remaining = s3Configs.filterNot { it.id == cfgId }
++        if (remaining.size == s3Configs.size) return this
++        if (remaining.isEmpty()) return null
++        val newActive = remaining.first()
++        return copy(
++            s3Configs = remaining,
++            activeS3ConfigId = newActive.id,
++            s3Config = newActive,
++        )
++    }
++
+     companion object {
+         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
+         fun dummy() = Settings(init = true)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+index dcf1ed1de..5606ff0e4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+@@ -109,6 +109,38 @@ data class NetworkRoutingSettings(
+     fun isConfigured(): Boolean =
+         defaultRoute != NetworkRoute.PROXY || scopeRoutes.isNotEmpty() ||
+             providerRoutes.isNotEmpty() || forceDirect
++
++    /** True when [providerId] has a route of its own; a stored FOLLOW_DEFAULT entry counts as none. */
++    fun hasProviderOverride(providerId: String): Boolean =
++        providerRoutes[providerId]?.takeIf { it != NetworkRoute.FOLLOW_DEFAULT } != null
++
++    /**
++     * Apply [route] to every provider in [providerIds]. FOLLOW_DEFAULT clears the
++     * override, matching what tapping "Default" on a single provider row does.
++     */
++    fun withProviderRoutes(
++        providerIds: Collection<String>,
++        route: NetworkRoute,
++    ): NetworkRoutingSettings {
++        val routes = providerRoutes.toMutableMap()
++        for (id in providerIds) {
++            if (route == NetworkRoute.FOLLOW_DEFAULT) routes.remove(id) else routes[id] = route
++        }
++        return copy(providerRoutes = routes)
++    }
++}
++
++/**
++ * On-device providers make no network requests, so routes are meaningless for them.
++ * Mirrors [providerEndpointHosts], which returns an empty host list for the same set.
++ */
++fun isOnDeviceProvider(provider: ProviderSetting): Boolean = when (provider) {
++    is ProviderSetting.AICore,
++    is ProviderSetting.LiteRtLocal,
++    is ProviderSetting.LlamaCppLocal,
++    -> true
++
++    else -> false
+ }
+ 
+ /**
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
+index 467241f7d..296449d05 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
+@@ -54,6 +54,7 @@ import com.dokar.sonner.ToastType
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withTimeoutOrNull
+ import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Delete01
+ import me.rerere.hugeicons.stroke.PlusSign
+ import me.rerere.hugeicons.stroke.Upload02
+ import me.rerere.rikkahub.R
+@@ -96,6 +97,7 @@ fun S3Tab(
+     var pendingPasswordError by remember { mutableStateOf<String?>(null) }
+     var isBackingUp by remember { mutableStateOf(false) }
+     var configMenuExpanded by remember { mutableStateOf(false) }
++    var showDeleteConfigConfirm by remember { mutableStateOf(false) }
+     // 备份缺口令：弹加密设置框；设好口令后自动重试备份
+     var showEncryptionDialog by remember { mutableStateOf(false) }
+     var pendingBackupRetryAfterPassword by remember { mutableStateOf(false) }
+@@ -208,6 +210,13 @@ fun S3Tab(
+         }
+     }
+ 
++    /** 删除配置（保留至少一个：删最后一个时 withoutS3Config 返回 null，不做改动）。 */
++    fun removeS3Config(cfgId: String) {
++        vm.updateSettings { current ->
++            current.withoutS3Config(cfgId) ?: current
++        }
++    }
++
+     val lastBackupText =
+         if (settings.backupReminderConfig.lastBackupTime == 0L) {
+             stringResource(R.string.backup_page_reminder_no_record)
+@@ -290,6 +299,13 @@ fun S3Tab(
+                             IconButton(onClick = { addS3Config() }) {
+                                 Icon(HugeIcons.PlusSign, contentDescription = stringResource(R.string.backup_page_add_config))
+                             }
++                            // 删除当前配置：先弹确认；仅剩一个时禁用（保留至少一个）。
++                            IconButton(
++                                onClick = { showDeleteConfigConfirm = true },
++                                enabled = allConfigs.size > 1,
++                            ) {
++                                Icon(HugeIcons.Delete01, contentDescription = stringResource(R.string.backup_page_delete_s3_config))
++                            }
+                         }
+                     },
+                 )
+@@ -635,6 +651,21 @@ fun S3Tab(
+         )
+     }
+ 
++    // 删除当前配置：与删除备份文件同一确认样式；仅剩一个时按钮已禁用，这里只作兜底。
++    RikkaDeleteConfirmDialog(
++        show = showDeleteConfigConfirm,
++        title = stringResource(R.string.backup_page_delete),
++        message = stringResource(
++            R.string.backup_delete_s3_config_confirm,
++            s3Config.displayName.ifBlank { stringResource(R.string.backup_config_unnamed) },
++        ),
++        onConfirm = {
++            showDeleteConfigConfirm = false
++            removeS3Config(s3Config.id)
++        },
++        onDismiss = { showDeleteConfigConfirm = false },
++    )
++
+     // 备份缺口令：弹加密设置框让用户设口令，设好后自动重试备份。
+     if (showEncryptionDialog) {
+         BackupEncryptionDialog(
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
+index ec0c87147..d12afcf60 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
+@@ -56,6 +56,7 @@ import kotlin.uuid.Uuid
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withTimeoutOrNull
+ import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Delete01
+ import me.rerere.hugeicons.stroke.PlusSign
+ import me.rerere.hugeicons.stroke.Upload02
+ import me.rerere.rikkahub.R
+@@ -110,8 +111,7 @@ fun WebDavTab(
+     var showBackupFiles by remember { mutableStateOf(false) }
+     var isBackingUp by remember { mutableStateOf(false) }
+     var restoringItemId by remember { mutableStateOf<String?>(null) }
+-    var showAddConfigDialog by remember { mutableStateOf(false) }
+-    var showConfigMenuFor by remember { mutableStateOf<String?>(null) }
++    var showDeleteConfigConfirm by remember { mutableStateOf(false) }
+     var configMenuExpanded by remember { mutableStateOf(false) }
+     // 恢复加密备份：需输口令的待处理项
+     var pendingPasswordItem by remember { mutableStateOf<WebDavBackupItem?>(null) }
+@@ -224,17 +224,10 @@ fun WebDavTab(
+         }
+     }
+ 
+-    /** 删除配置（保留至少一个）。 */
++    /** 删除配置（保留至少一个：删最后一个时 withoutWebDavConfig 返回 null，不做改动）。 */
+     fun removeWebDavConfig(cfgId: String) {
+-        if (webDavConfigs.size <= 1 && settings.webDavConfig.id == cfgId) return
+-        val remaining = webDavConfigs.filterNot { it.id == cfgId }
+-        val newActive = remaining.firstOrNull()?.id
+         vm.updateSettings { current ->
+-            current.copy(
+-                webDavConfigs = remaining,
+-                activeWebDavConfigId = newActive,
+-                webDavConfig = remaining.firstOrNull() ?: WebDavConfig(),
+-            )
++            current.withoutWebDavConfig(cfgId) ?: current
+         }
+     }
+ 
+@@ -319,6 +312,13 @@ fun WebDavTab(
+                             IconButton(onClick = { addWebDavConfig() }) {
+                                 Icon(HugeIcons.PlusSign, contentDescription = stringResource(R.string.backup_page_add_config))
+                             }
++                            // 删除当前配置：先弹确认；仅剩一个时禁用（保留至少一个）。
++                            IconButton(
++                                onClick = { showDeleteConfigConfirm = true },
++                                enabled = allConfigs.size > 1,
++                            ) {
++                                Icon(HugeIcons.Delete01, contentDescription = stringResource(R.string.backup_page_delete_config))
++                            }
+                         }
+                     },
+                 )
+@@ -638,6 +638,21 @@ fun WebDavTab(
+         )
+     }
+ 
++    // 删除当前配置：与删除备份文件同一确认样式；仅剩一个时按钮已禁用，这里只作兜底。
++    RikkaDeleteConfirmDialog(
++        show = showDeleteConfigConfirm,
++        title = stringResource(R.string.backup_page_delete),
++        message = stringResource(
++            R.string.backup_delete_config_confirm,
++            webDavConfig.displayName.ifBlank { stringResource(R.string.backup_config_unnamed) },
++        ),
++        onConfirm = {
++            showDeleteConfigConfirm = false
++            removeWebDavConfig(webDavConfig.id)
++        },
++        onDismiss = { showDeleteConfigConfirm = false },
++    )
++
+     // 备份缺口令：弹加密设置框让用户设口令，设好后自动重试备份。
+     if (showEncryptionDialog) {
+         BackupEncryptionDialog(
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
+index 17c58fff1..81a2cac2a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
+@@ -2,34 +2,52 @@ package me.rerere.rikkahub.ui.pages.setting
+ 
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Checkbox
++import androidx.compose.material3.Icon
+ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.ListItemDefaults
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import me.rerere.ai.provider.ProviderSetting
++import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.ArrowDown01
++import me.rerere.hugeicons.stroke.ArrowUp01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.network.NetworkRoute
+ import me.rerere.rikkahub.data.network.NetworkRoutingSettings
+ import me.rerere.rikkahub.data.network.NetworkScope
+ import me.rerere.rikkahub.data.network.WebViewProxy
++import me.rerere.rikkahub.data.network.isOnDeviceProvider
+ import me.rerere.rikkahub.data.network.resolveProxyPasswordForAuth
+ import me.rerere.rikkahub.data.network.toProxyOrNull
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
++import me.rerere.rikkahub.ui.components.ui.CardGroupScope
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
++import me.rerere.rikkahub.ui.components.ui.ListSelectableItem
+ import org.koin.androidx.compose.koinViewModel
+ 
+ /**
+@@ -49,6 +67,15 @@ fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
+     val proxyConfigured = net.proxyUrl.toProxyOrNull() != null
+     val webViewSupported = remember { WebViewProxy.isSupported() }
+     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
++    // On-device providers make no network requests, so they have no route to set.
++    val routableProviders = settings.providers.filterNot(::isOnDeviceProvider)
++    val customizedProviders =
++        routableProviders.filter { routing.hasProviderOverride(it.id.toString()) }
++    val followingDefaultProviders =
++        routableProviders.filterNot { routing.hasProviderOverride(it.id.toString()) }
++    // Fold state is UI-local only; it is not persisted and does not touch the schema.
++    var providerListExpanded by remember { mutableStateOf(false) }
++    var batchDialogVisible by remember { mutableStateOf(false) }
+ 
+     fun updateRouting(transform: (NetworkRoutingSettings) -> NetworkRoutingSettings) {
+         // Compute the new routing first: the browser proxy is applied with the
+@@ -188,54 +215,68 @@ fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
+                     }
+                 }
+             }
+-            item {
+-                CardGroup(
+-                    modifier = Modifier.padding(horizontal = 8.dp),
+-                    title = { Text(stringResource(R.string.setting_page_network_routing_provider_title)) },
+-                ) {
+-                    settings.providers.forEach { provider ->
+-                        val providerId = provider.id.toString()
+-                        val selected =
+-                            routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
+-                        formItem(
+-                            headlineContent = {
+-                                Text(provider.name)
+-                            },
+-                            supportingContent = {
+-                                Column {
++            if (routableProviders.isNotEmpty()) {
++                item {
++                    CardGroup(
++                        modifier = Modifier.padding(horizontal = 8.dp),
++                        title = {
++                            Row(
++                                modifier = Modifier.fillMaxWidth(),
++                                horizontalArrangement = Arrangement.SpaceBetween,
++                                verticalAlignment = Alignment.CenterVertically,
++                            ) {
++                                Text(stringResource(R.string.setting_page_network_routing_provider_title))
++                                TextButton(
++                                    onClick = { batchDialogVisible = true },
++                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
++                                ) {
++                                    Text(stringResource(R.string.setting_page_network_routing_batch))
++                                }
++                            }
++                        },
++                    ) {
++                        customizedProviders.forEach { provider ->
++                            ProviderRouteItem(
++                                provider = provider,
++                                routing = routing,
++                                proxyConfigured = proxyConfigured,
++                                onRouteSelect = { providerId, route ->
++                                    updateRouting { it.withProviderRoutes(listOf(providerId), route) }
++                                },
++                            )
++                        }
++                        if (providerListExpanded) {
++                            followingDefaultProviders.forEach { provider ->
++                                ProviderRouteItem(
++                                    provider = provider,
++                                    routing = routing,
++                                    proxyConfigured = proxyConfigured,
++                                    onRouteSelect = { providerId, route ->
++                                        updateRouting { it.withProviderRoutes(listOf(providerId), route) }
++                                    },
++                                )
++                            }
++                        }
++                        if (followingDefaultProviders.isNotEmpty()) {
++                            item(
++                                onClick = { providerListExpanded = !providerListExpanded },
++                                headlineContent = {
+                                     Text(
+                                         stringResource(
+-                                            R.string.setting_page_network_routing_effective,
+-                                            routeName(routing.resolveRoute(providerId = providerId)),
++                                            R.string.setting_page_network_routing_provider_rest,
++                                            followingDefaultProviders.size,
+                                         ),
+                                     )
+-                                    if (selected == NetworkRoute.PROXY && !proxyConfigured) {
+-                                        Text(stringResource(R.string.setting_page_network_routing_no_proxy))
+-                                    }
+-                                    if (selected == NetworkRoute.TAILSCALE) {
+-                                        Text(stringResource(R.string.setting_page_network_routing_tailscale_note))
+-                                    }
+-                                }
+-                            },
+-                        ) {
+-                            RouteChoiceButtons(
+-                                selected = selected,
+-                                options = listOf(
+-                                    NetworkRoute.DIRECT,
+-                                    NetworkRoute.TAILSCALE,
+-                                    NetworkRoute.PROXY,
+-                                    NetworkRoute.FOLLOW_DEFAULT,
+-                                ),
+-                                onSelect = { route ->
+-                                    updateRouting { current ->
+-                                        val routes = current.providerRoutes.toMutableMap()
+-                                        if (route == NetworkRoute.FOLLOW_DEFAULT) {
+-                                            routes.remove(providerId)
++                                },
++                                trailingContent = {
++                                    Icon(
++                                        imageVector = if (providerListExpanded) {
++                                            HugeIcons.ArrowUp01
+                                         } else {
+-                                            routes[providerId] = route
+-                                        }
+-                                        current.copy(providerRoutes = routes)
+-                                    }
++                                            HugeIcons.ArrowDown01
++                                        },
++                                        contentDescription = null,
++                                    )
+                                 },
+                             )
+                         }
+@@ -273,6 +314,18 @@ fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
+                 }
+             }
+         }
++        if (batchDialogVisible) {
++            ProviderBatchRouteDialog(
++                providers = routableProviders,
++                routing = routing,
++                proxyConfigured = proxyConfigured,
++                onDismiss = { batchDialogVisible = false },
++                onApply = { providerIds, route ->
++                    updateRouting { it.withProviderRoutes(providerIds, route) }
++                    batchDialogVisible = false
++                },
++            )
++        }
+     }
+ }
+ 
+@@ -311,3 +364,151 @@ private fun scopeName(scope: NetworkScope): String = stringResource(
+         NetworkScope.BACKUP -> R.string.setting_page_network_routing_scope_backup
+     },
+ )
++
++/** One provider row: name + effective route + the four route buttons. */
++@Composable
++private fun CardGroupScope.ProviderRouteItem(
++    provider: ProviderSetting,
++    routing: NetworkRoutingSettings,
++    proxyConfigured: Boolean,
++    onRouteSelect: (providerId: String, route: NetworkRoute) -> Unit,
++) {
++    val providerId = provider.id.toString()
++    val selected = routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
++    formItem(
++        headlineContent = {
++            Text(provider.name)
++        },
++        supportingContent = {
++            Column {
++                Text(
++                    stringResource(
++                        R.string.setting_page_network_routing_effective,
++                        routeName(routing.resolveRoute(providerId = providerId)),
++                    ),
++                )
++                if (selected == NetworkRoute.PROXY && !proxyConfigured) {
++                    Text(stringResource(R.string.setting_page_network_routing_no_proxy))
++                }
++                if (selected == NetworkRoute.TAILSCALE) {
++                    Text(stringResource(R.string.setting_page_network_routing_tailscale_note))
++                }
++            }
++        },
++    ) {
++        RouteChoiceButtons(
++            selected = selected,
++            options = listOf(
++                NetworkRoute.DIRECT,
++                NetworkRoute.TAILSCALE,
++                NetworkRoute.PROXY,
++                NetworkRoute.FOLLOW_DEFAULT,
++            ),
++            onSelect = { route -> onRouteSelect(providerId, route) },
++        )
++    }
++}
++
++/**
++ * Batch route dialog: check any number of providers, pick a route, apply it to
++ * all of them at once. Picking "Default" clears the override for the selection.
++ */
++@Composable
++private fun ProviderBatchRouteDialog(
++    providers: List<ProviderSetting>,
++    routing: NetworkRoutingSettings,
++    proxyConfigured: Boolean,
++    onDismiss: () -> Unit,
++    onApply: (providerIds: List<String>, route: NetworkRoute) -> Unit,
++) {
++    var selectedIds by remember { mutableStateOf(setOf<String>()) }
++    var batchRoute by remember { mutableStateOf(routing.defaultRoute) }
++    val allSelected = providers.isNotEmpty() && selectedIds.size == providers.size
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(R.string.setting_page_network_routing_batch)) },
++        text = {
++            Column(
++                modifier = Modifier.verticalScroll(rememberScrollState()),
++                verticalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                Text(
++                    text = stringResource(R.string.setting_page_network_routing_batch_desc),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(6.dp),
++                ) {
++                    Checkbox(
++                        checked = allSelected,
++                        onCheckedChange = { checked ->
++                            selectedIds = if (checked) {
++                                providers.map { it.id.toString() }.toSet()
++                            } else {
++                                emptySet()
++                            }
++                        },
++                    )
++                    Text(stringResource(R.string.setting_page_network_routing_batch_select_all))
++                }
++                providers.forEach { provider ->
++                    val providerId = provider.id.toString()
++                    val selected =
++                        routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
++                    ListSelectableItem(
++                        key = providerId,
++                        selectedKeys = selectedIds.toList(),
++                        onSelectChange = { key ->
++                            val id = key as String
++                            selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id
++                        },
++                    ) {
++                        Column {
++                            Text(provider.name)
++                            Text(
++                                text = stringResource(
++                                    R.string.setting_page_network_routing_effective,
++                                    routeName(routing.resolveRoute(providerId = providerId)),
++                                ),
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            )
++                            if (selected == NetworkRoute.PROXY && !proxyConfigured) {
++                                Text(
++                                    text = stringResource(R.string.setting_page_network_routing_no_proxy),
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                                )
++                            }
++                        }
++                    }
++                }
++                RouteChoiceButtons(
++                    selected = batchRoute,
++                    options = listOf(
++                        NetworkRoute.DIRECT,
++                        NetworkRoute.TAILSCALE,
++                        NetworkRoute.PROXY,
++                        NetworkRoute.FOLLOW_DEFAULT,
++                    ),
++                    onSelect = { batchRoute = it },
++                )
++            }
++        },
++        confirmButton = {
++            TextButton(
++                onClick = { onApply(selectedIds.toList(), batchRoute) },
++                enabled = selectedIds.isNotEmpty(),
++            ) {
++                Text(stringResource(R.string.confirm))
++            }
++        },
++        dismissButton = {
++            TextButton(onClick = onDismiss) {
++                Text(stringResource(R.string.cancel))
++            }
++        },
++    )
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelList.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelList.kt
+index 90cbcaffb..5eeab193d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelList.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelList.kt
+@@ -15,14 +15,17 @@ import androidx.compose.foundation.layout.plus
+ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.foundation.lazy.rememberLazyListState
++import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.material3.FloatingToolbarDefaults.ScreenOffset
+ import androidx.compose.material3.FloatingToolbarDefaults.floatingToolbarVerticalNestedScroll
+ import androidx.compose.material3.HorizontalFloatingToolbar
+ import androidx.compose.material3.Icon
++import androidx.compose.material3.IconButton
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+@@ -52,10 +55,13 @@ import kotlinx.coroutines.launch
+ import me.rerere.ai.provider.Model
+ import me.rerere.ai.provider.ProviderManager
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.ai.provider.filterByKeywords
+ import me.rerere.rikkahub.data.ai.diagnoseFailure
+ import me.rerere.ai.registry.ModelRegistry
+ import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Cancel01
+ import me.rerere.hugeicons.stroke.Refresh03
++import me.rerere.hugeicons.stroke.Search01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.log.AppLog
+ import me.rerere.rikkahub.ui.context.LocalToaster
+@@ -127,6 +133,8 @@ internal fun ModelList(
+         modelListLoading = false
+     }
+     var expanded by rememberSaveable { mutableStateOf(true) }
++    // 模型搜索：按模型 ID / 显示名过滤（复用 filterByKeywords，与提供商页同口径）。
++    var searchQuery by remember { mutableStateOf("") }
+     val lazyListState = rememberLazyListState()
+     // 拖动期间只改本地顺序：onUpdateProvider 会写设置（DataStore），每移动一格提交一次会明显卡顿
+     // → 停手 delay(400) 后再提交一次。providerSetting 变化（增删改 / 外部更新）时重置本地顺序。
+@@ -142,6 +150,11 @@ internal fun ModelList(
+             localModels.addAll(providerSetting.models)
+         }
+     }
++    // 过滤态只改展示列表，不动 localModels 的全量顺序；未过滤时直接用全量（避免多余拷贝）。
++    val displayedModels =
++        remember(localModels, searchQuery) {
++            if (searchQuery.isBlank()) localModels.toList() else localModels.filterByKeywords(searchQuery)
++        }
+     var reorderCommitJob by remember { mutableStateOf<Job?>(null) }
+     // 「正在拖动」标志：只给协程读，故意不用 Compose state（手势回调里写 state 会触发重组）
+     val draggingNow = remember { booleanArrayOf(false) }
+@@ -313,6 +326,30 @@ internal fun ModelList(
+                         }
+                     }
+                 }
++                // 搜索框：模型多时按 ID / 显示名过滤列表；与提供商页同款样式。
++                item {
++                    OutlinedTextField(
++                        value = searchQuery,
++                        onValueChange = { searchQuery = it },
++                        modifier = Modifier.fillMaxWidth(),
++                        placeholder = { Text(stringResource(R.string.setting_provider_page_search_models)) },
++                        leadingIcon = {
++                            Icon(HugeIcons.Search01, contentDescription = null)
++                        },
++                        trailingIcon = {
++                            if (searchQuery.isNotEmpty()) {
++                                IconButton(onClick = { searchQuery = "" }) {
++                                    Icon(
++                                        HugeIcons.Cancel01,
++                                        contentDescription = stringResource(R.string.accessibility_clear_text),
++                                    )
++                                }
++                            }
++                        },
++                        singleLine = true,
++                        shape = CircleShape,
++                    )
++                }
+             }
+ 
+             // 拉取失败：页内显示原因与重试入口。
+@@ -372,8 +409,22 @@ internal fun ModelList(
+                         }
+                     }
+                 }
++            } else if (displayedModels.isEmpty()) {
++                // 搜索无结果：只留搜索框与该提示，不渲染空列表。
++                item {
++                    Text(
++                        text = stringResource(R.string.setting_provider_page_empty_search_models),
++                        style = MaterialTheme.typography.bodyMedium,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant,
++                        textAlign = TextAlign.Center,
++                        modifier =
++                            Modifier
++                                .fillMaxWidth()
++                                .padding(16.dp),
++                    )
++                }
+             } else {
+-                items(localModels, key = { it.id }) { item ->
++                items(displayedModels, key = { it.id }) { item ->
+                     // 拖动性能埋点：统计本次拖动会话内的卡片重组次数（仅 debug 构建，release 不进入组合）
+                     if (reorderPerf.enabled) {
+                         SideEffect { ReorderRecomposeCounter.count++ }
+@@ -422,7 +473,8 @@ internal fun ModelList(
+                                                     )
+                                                 },
+                                             )
+-                                        } else {
++                                        } else if (searchQuery.isBlank()) {
++                                            // 过滤态禁用拖动：过滤后列表下标与全量不一致，拖动会移错项
+                                             mod.longPressDraggableHandle(
+                                                 onDragStarted = { draggingNow[0] = true },
+                                                 onDragStopped = {
+@@ -432,6 +484,8 @@ internal fun ModelList(
+                                                     commitOrder()
+                                                 },
+                                             )
++                                        } else {
++                                            mod
+                                         }
+                                     }.graphicsLayer {
+                                         if (isDragging) {
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt
+index bc6920f19..2371eb63d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt
+@@ -73,6 +73,38 @@ fun settingsSearchIndex(developerMode: Boolean): List<SettingsSearchEntry> {
+             groupRes = R.string.setting_page_preferences,
+             route = Screen.SettingPreferencesUI,
+         ),
++        // 网络子页：偏好设置 → 网络下的 5 个子页。Catalog 只登记首页分组入口，
++        // 子页按本文件 KDoc 约定走硬编码区（与上方偏好子页同款）。
++        SettingsSearchEntry(
++            titleRes = R.string.setting_page_preferences_network_routing,
++            groupRes = R.string.setting_page_preferences,
++            route = Screen.SettingNetworkRouting,
++            searchTermsRes = listOf(R.string.setting_page_preferences_network),
++        ),
++        SettingsSearchEntry(
++            titleRes = R.string.setting_page_preferences_network_proxy,
++            groupRes = R.string.setting_page_preferences,
++            route = Screen.SettingNetworkProxy,
++            searchTermsRes = listOf(R.string.setting_page_preferences_network),
++        ),
++        SettingsSearchEntry(
++            titleRes = R.string.setting_page_preferences_network_dns_title,
++            groupRes = R.string.setting_page_preferences,
++            route = Screen.SettingNetworkDns,
++            searchTermsRes = listOf(R.string.setting_page_preferences_network),
++        ),
++        SettingsSearchEntry(
++            titleRes = R.string.setting_page_preferences_network_host_overrides,
++            groupRes = R.string.setting_page_preferences,
++            route = Screen.SettingNetworkHostOverrides,
++            searchTermsRes = listOf(R.string.setting_page_preferences_network),
++        ),
++        SettingsSearchEntry(
++            titleRes = R.string.tunnel_enable_title,
++            groupRes = R.string.setting_page_preferences,
++            route = Screen.SettingNetworkTunnel,
++            searchTermsRes = listOf(R.string.setting_page_preferences_network),
++        ),
+     )
+ 
+     if (developerMode) {
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 2c8d7a1a8..5b6565c40 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -353,6 +353,8 @@
+   <string name="backup_page_s3_backup">نسخ احتياطي S3</string>
+   <string name="backup_page_s3_backup_files">ملفات النسخ الاحتياطي S3</string>
+   <string name="backup_page_s3_bucket">الحاوية</string>
++  <string name="backup_page_delete_s3_config">حذف إعداد S3</string>
++  <string name="backup_delete_s3_config_confirm">هل تريد حذف إعداد S3 \"%1$s\"؟ لن تتأثر النسخ الاحتياطية المحفوظة في هذه الحاوية. لا يمكن التراجع عن هذا الإجراء.</string>
+   <string name="backup_page_s3_endpoint">نقطة النهاية</string>
+   <string name="backup_page_s3_region">المنطقة</string>
+   <string name="backup_page_s3_secret_access_key">مفتاح الوصول السري</string>
+@@ -1184,6 +1186,8 @@
+   <string name="setting_provider_page_search_providers">البحث في المزوّدين</string>
+   <string name="setting_provider_page_empty">لا يوجد موفّرون بعد</string>
+   <string name="setting_provider_page_empty_search">لا يوجد موفّرون مطابقون</string>
++  <string name="setting_provider_page_search_models">البحث في النماذج</string>
++  <string name="setting_provider_page_empty_search_models">لا توجد نماذج مطابقة</string>
+   <string name="setting_provider_page_select_all">تحديد الكل (%1$d)</string>
+   <string name="setting_provider_page_select_from_gallery">الاختيار من المعرض</string>
+   <string name="setting_provider_page_service_account_email">البريد الإلكتروني لحساب الخدمة</string>
+@@ -3263,6 +3267,10 @@
+   <string name="setting_page_network_routing_default_desc">يُستخدم عندما لا يكون للنطاق أو المزوّد مسار خاص به. اختيار الوكيل يحافظ على السلوك السابق: تمر الحركة عبر الوكيل المُعدّ، أو مباشرةً عند عدم وجود وكيل.</string>
+   <string name="setting_page_network_routing_scope_title">مسارات حسب النطاق</string>
+   <string name="setting_page_network_routing_provider_title">مسارات حسب المزوّد</string>
++  <string name="setting_page_network_routing_batch">تعيين جماعي</string>
++  <string name="setting_page_network_routing_batch_desc">حدّد مقدمي الخدمة ثم اختر مسارًا لتطبيقه على جميع المحددين.</string>
++  <string name="setting_page_network_routing_batch_select_all">تحديد الكل</string>
++  <string name="setting_page_network_routing_provider_rest">يتبع %1$d من مقدمي الخدمة الآخرين المسار الافتراضي</string>
+   <string name="setting_page_network_routing_route_direct">مباشر</string>
+   <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+   <string name="setting_page_network_routing_route_proxy">وكيل</string>
+@@ -4497,6 +4505,8 @@
+   <string name="backend_service_name_required">الاسم مطلوب</string>
+   <string name="backup_config_unnamed">بدون اسم</string>
+   <string name="backup_delete_remote_confirm">هل تريد حذف النسخة الاحتياطية \"%1$s\" من السحابة؟ لن تتأثر الملفات المحلية. لا يمكن التراجع عن هذا الإجراء.</string>
++  <string name="backup_page_delete_config">حذف الإعداد</string>
++  <string name="backup_delete_config_confirm">هل تريد حذف الإعداد \"%1$s\"؟ لن تتأثر النسخ الاحتياطية المحفوظة على هذا الخادم. لا يمكن التراجع عن هذا الإجراء.</string>
+   <string name="backup_encryption_required">تحتوي النسخة الاحتياطية على أسرار بنص صريح (مفاتيح المزوّدين، وبيانات اعتماد المخزن، وما إلى ذلك). فعّل التشفير أولًا من \"النسخ الاحتياطي والاستعادة → إعدادات التشفير\" وعيّن كلمة مرور.</string>
+   <string name="backup_page_item_media_creation">ملفات إنشاء الوسائط</string>
+   <string name="backup_page_item_media_creation_desc">الصور والصوت والفيديو التي أنشأتها أدوات الوسائط (files/media_creation/)</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 15ba03192..b5bbb2132 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -230,6 +230,8 @@
+   <string name="backup_page_s3_backup">S3 備份</string>
+   <string name="backup_page_s3_backup_files">S3 備份檔案</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">刪除 S3 配置</string>
++  <string name="backup_delete_s3_config_confirm">刪除 S3 配置「%1$s」？已儲存在該 Bucket 中的備份不受影響。此操作無法復原。</string>
+   <string name="backup_page_s3_endpoint">端點</string>
+   <string name="backup_page_s3_region">區域</string>
+   <string name="backup_page_s3_secret_access_key">私密存取金鑰</string>
+@@ -1149,6 +1151,8 @@
+   <string name="setting_provider_page_search_providers">搜尋提供者</string>
+   <string name="setting_provider_page_empty">還沒有供應商</string>
+   <string name="setting_provider_page_empty_search">沒有相符的供應商</string>
++  <string name="setting_provider_page_search_models">搜尋模型</string>
++  <string name="setting_provider_page_empty_search_models">沒有相符的模型</string>
+   <string name="setting_provider_page_recommend">推薦提供者</string>
+   <string name="setting_provider_page_select_all">全選 (%1$d)</string>
+   <string name="setting_provider_page_select_from_gallery">從相簿選擇</string>
+@@ -2569,6 +2573,10 @@
+     <string name="setting_page_network_routing_default_desc">未單獨設定路由的範圍或提供商使用它。選代理可保持以往行為：走已設定的代理，未設定時直連。</string>
+     <string name="setting_page_network_routing_scope_title">按範圍設定路由</string>
+     <string name="setting_page_network_routing_provider_title">按提供商設定路由</string>
++    <string name="setting_page_network_routing_batch">批次設定</string>
++    <string name="setting_page_network_routing_batch_desc">先勾選提供商，再選一個路由，一次套用到全部已選提供商。</string>
++    <string name="setting_page_network_routing_batch_select_all">全選</string>
++    <string name="setting_page_network_routing_provider_rest">其餘 %1$d 個提供商跟隨預設</string>
+     <string name="setting_page_network_routing_route_direct">直連</string>
+     <string name="setting_page_network_routing_route_tailscale">隧道</string>
+     <string name="setting_page_network_routing_route_proxy">代理</string>
+@@ -4489,6 +4497,8 @@
+   <string name="backend_service_name_required">名稱不能為空</string>
+   <string name="backup_config_unnamed">未命名</string>
+   <string name="backup_delete_remote_confirm">從雲端刪除備份「%1$s」？本機檔案不受影響。此操作無法復原。</string>
++  <string name="backup_page_delete_config">刪除配置</string>
++  <string name="backup_delete_config_confirm">刪除配置「%1$s」？已儲存在該伺服器上的備份不受影響。此操作無法復原。</string>
+   <string name="backup_encryption_required">備份包含明文密鑰（提供者金鑰／憑證庫等）。請先在「備份與還原 → 加密設定」開啟加密並設定密碼。</string>
+   <string name="backup_page_item_media_creation">媒體創作檔案</string>
+   <string name="backup_page_item_media_creation_desc">媒體工具創作的圖片、音訊與影片（files/media_creation/）</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 83f8a08e4..575f4190d 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -234,6 +234,8 @@
+   <string name="backup_page_s3_backup">S3バックアップ</string>
+   <string name="backup_page_s3_backup_files">S3バックアップファイル</string>
+   <string name="backup_page_s3_bucket">バケット</string>
++  <string name="backup_page_delete_s3_config">S3 構成を削除</string>
++  <string name="backup_delete_s3_config_confirm">S3 構成「%1$s」を削除しますか？このバケットに保存済みのバックアップには影響しません。この操作は取り消せません。</string>
+   <string name="backup_page_s3_endpoint">エンドポイント</string>
+   <string name="backup_page_s3_region">リージョン</string>
+   <string name="backup_page_s3_secret_access_key">シークレットアクセスキー</string>
+@@ -1147,6 +1149,8 @@
+   <string name="setting_provider_page_search_providers">プロバイダーを検索</string>
+   <string name="setting_provider_page_empty">プロバイダーがまだありません</string>
+   <string name="setting_provider_page_empty_search">一致するプロバイダーがありません</string>
++  <string name="setting_provider_page_search_models">モデルを検索</string>
++  <string name="setting_provider_page_empty_search_models">一致するモデルがありません</string>
+   <string name="setting_provider_page_recommend">おすすめのプロバイダー</string>
+   <string name="setting_provider_page_select_all">すべて選択 (%1$d)</string>
+   <string name="setting_provider_page_select_from_gallery">ギャラリーから選択</string>
+@@ -2244,6 +2248,10 @@
+ <string name="setting_page_network_routing_default_desc">範囲やプロバイダーに個別のルートが未設定の場合に使用します。プロキシを選ぶと従来の動作を維持します。設定済みのプロキシ経由、未設定の場合は直接接続します。</string>
+ <string name="setting_page_network_routing_scope_title">範囲別ルート</string>
+ <string name="setting_page_network_routing_provider_title">プロバイダー別ルート</string>
++<string name="setting_page_network_routing_batch">一括設定</string>
++<string name="setting_page_network_routing_batch_desc">プロバイダーを選択し、ルートを選ぶと、選択したすべてに適用されます。</string>
++<string name="setting_page_network_routing_batch_select_all">すべて選択</string>
++<string name="setting_page_network_routing_provider_rest">残り%1$d件のプロバイダーは既定に従います</string>
+ <string name="setting_page_network_routing_route_direct">直接</string>
+ <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+ <string name="setting_page_network_routing_route_proxy">プロキシ</string>
+@@ -4490,6 +4498,8 @@
+   <string name="backend_service_name_required">名前は必須です</string>
+   <string name="backup_config_unnamed">名前なし</string>
+   <string name="backup_delete_remote_confirm">クラウドからバックアップ「%1$s」を削除しますか？ローカルファイルには影響しません。この操作は取り消せません。</string>
++  <string name="backup_page_delete_config">構成を削除</string>
++  <string name="backup_delete_config_confirm">構成「%1$s」を削除しますか？このサーバーに保存済みのバックアップには影響しません。この操作は取り消せません。</string>
+   <string name="backup_encryption_required">バックアップに平文のシークレット（プロバイダーのキー、保管庫の認証情報など）が含まれています。「バックアップと復元 → 暗号化設定」で暗号化をオンにし、パスワードを先に設定してください。</string>
+   <string name="backup_page_item_media_creation">メディア作成ファイル</string>
+   <string name="backup_page_item_media_creation_desc">メディアツールで作成した画像・音声・動画（files/media_creation/）</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 0396c7a61..1c39b7065 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -234,6 +234,8 @@
+   <string name="backup_page_s3_backup">S3 백업</string>
+   <string name="backup_page_s3_backup_files">S3 백업 파일</string>
+   <string name="backup_page_s3_bucket">버킷</string>
++  <string name="backup_page_delete_s3_config">S3 구성 삭제</string>
++  <string name="backup_delete_s3_config_confirm">S3 구성 \"%1$s\"을(를) 삭제하시겠습니까? 이 버킷에 이미 저장된 백업에는 영향을 주지 않습니다. 이 작업은 되돌릴 수 없습니다.</string>
+   <string name="backup_page_s3_endpoint">엔드포인트</string>
+   <string name="backup_page_s3_region">리전</string>
+   <string name="backup_page_s3_secret_access_key">비밀 액세스 키</string>
+@@ -1147,6 +1149,8 @@
+   <string name="setting_provider_page_search_providers">공급자 검색</string>
+   <string name="setting_provider_page_empty">아직 공급자가 없습니다</string>
+   <string name="setting_provider_page_empty_search">일치하는 공급자가 없습니다</string>
++  <string name="setting_provider_page_search_models">모델 검색</string>
++  <string name="setting_provider_page_empty_search_models">일치하는 모델이 없습니다</string>
+   <string name="setting_provider_page_recommend">추천 공급자</string>
+   <string name="setting_provider_page_select_all">전체 선택 (%1$d)</string>
+   <string name="setting_provider_page_select_from_gallery">갤러리에서 선택</string>
+@@ -2241,6 +2245,10 @@
+ <string name="setting_page_network_routing_default_desc">범위나 제공업체에 개별 경로가 없을 때 사용합니다. 프록시를 선택하면 이전 동작을 유지합니다. 설정된 프록시를 경유하고, 설정되지 않았으면 직접 연결합니다.</string>
+ <string name="setting_page_network_routing_scope_title">범위별 경로</string>
+ <string name="setting_page_network_routing_provider_title">제공업체별 경로</string>
++<string name="setting_page_network_routing_batch">일괄 설정</string>
++<string name="setting_page_network_routing_batch_desc">제공업체를 선택한 뒤 경로를 선택하면 선택한 모든 제공업체에 적용됩니다.</string>
++<string name="setting_page_network_routing_batch_select_all">모두 선택</string>
++<string name="setting_page_network_routing_provider_rest">나머지 %1$d개 제공업체는 기본값을 따릅니다</string>
+ <string name="setting_page_network_routing_route_direct">직접</string>
+ <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+ <string name="setting_page_network_routing_route_proxy">프록시</string>
+@@ -4490,6 +4498,8 @@
+   <string name="backend_service_name_required">이름을 입력하세요</string>
+   <string name="backup_config_unnamed">이름 없음</string>
+   <string name="backup_delete_remote_confirm">클라우드에서 백업 \"%1$s\"을(를) 삭제하시겠습니까? 로컬 파일에는 영향을 주지 않습니다. 이 작업은 되돌릴 수 없습니다.</string>
++  <string name="backup_page_delete_config">구성 삭제</string>
++  <string name="backup_delete_config_confirm">구성 \"%1$s\"을(를) 삭제하시겠습니까? 이 서버에 이미 저장된 백업에는 영향을 주지 않습니다. 이 작업은 되돌릴 수 없습니다.</string>
+   <string name="backup_encryption_required">백업에 평문 비밀정보(제공업체 키, 자격 증명 보관함 등)가 포함되어 있습니다. \"백업 및 복원 → 암호화 설정\"에서 암호화를 켜고 비밀번호를 먼저 설정하세요.</string>
+   <string name="backup_page_item_media_creation">미디어 생성 파일</string>
+   <string name="backup_page_item_media_creation_desc">미디어 도구로 만든 이미지, 오디오 및 동영상(files/media_creation/)</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 1d2817891..dae6e4c37 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -234,6 +234,8 @@
+   <string name="backup_page_s3_backup">Резервное копирование S3</string>
+   <string name="backup_page_s3_backup_files">Файлы резервного копирования S3</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">Удалить профиль S3</string>
++  <string name="backup_delete_s3_config_confirm">Удалить профиль S3 «%1$s»? Резервные копии, уже сохранённые в этом Bucket, не будут затронуты. Это действие нельзя отменить.</string>
+   <string name="backup_page_s3_endpoint">Конечная точка</string>
+   <string name="backup_page_s3_region">Регион</string>
+   <string name="backup_page_s3_secret_access_key">Секретный ключ доступа</string>
+@@ -1142,6 +1144,8 @@
+   <string name="setting_provider_page_search_providers">Поиск поставщиков</string>
+   <string name="setting_provider_page_empty">Пока нет поставщиков</string>
+   <string name="setting_provider_page_empty_search">Нет подходящих поставщиков</string>
++  <string name="setting_provider_page_search_models">Поиск моделей</string>
++  <string name="setting_provider_page_empty_search_models">Нет подходящих моделей</string>
+   <string name="setting_provider_page_recommend">Рекомендуемые поставщики</string>
+   <string name="setting_provider_page_select_all">Выбрать все (%1$d)</string>
+   <string name="setting_provider_page_select_from_gallery">Выбрать из галереи</string>
+@@ -2239,6 +2243,10 @@
+ <string name="setting_page_network_routing_default_desc">Используется, когда у области или провайдера нет собственного маршрута. «Прокси» сохраняет прежнее поведение: трафик идёт через настроенный прокси, а при его отсутствии — напрямую.</string>
+ <string name="setting_page_network_routing_scope_title">Маршруты по областям</string>
+ <string name="setting_page_network_routing_provider_title">Маршруты по провайдерам</string>
++<string name="setting_page_network_routing_batch">Массовая настройка</string>
++<string name="setting_page_network_routing_batch_desc">Выберите провайдеров, затем маршрут — он применится ко всем выбранным.</string>
++<string name="setting_page_network_routing_batch_select_all">Выбрать все</string>
++<string name="setting_page_network_routing_provider_rest">Остальные провайдеры (%1$d) следуют маршруту по умолчанию</string>
+ <string name="setting_page_network_routing_route_direct">Напрямую</string>
+ <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+ <string name="setting_page_network_routing_route_proxy">Прокси</string>
+@@ -4494,6 +4502,8 @@
+   <string name="backend_service_name_required">Укажите имя</string>
+   <string name="backup_config_unnamed">Без названия</string>
+   <string name="backup_delete_remote_confirm">Удалить резервную копию «%1$s» из облака? Локальные файлы не изменятся. Это действие нельзя отменить.</string>
++  <string name="backup_page_delete_config">Удалить профиль</string>
++  <string name="backup_delete_config_confirm">Удалить профиль «%1$s»? Резервные копии, уже сохранённые на этом сервере, не будут затронуты. Это действие нельзя отменить.</string>
+   <string name="backup_encryption_required">Резервная копия содержит секреты в открытом виде (ключи провайдеров, учётные данные хранилища и т. д.). Сначала включите шифрование в разделе «Резервное копирование и восстановление → Настройки шифрования» и задайте пароль.</string>
+   <string name="backup_page_item_media_creation">Файлы, созданные медиаинструментами</string>
+   <string name="backup_page_item_media_creation_desc">Изображения, аудио и видео, созданные медиаинструментами (files/media_creation/)</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 19aa2a081..d94ae98ed 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -297,6 +297,8 @@
+   <string name="backup_page_connection_success">连接成功</string>
+   <string name="backup_page_delete">删除</string>
+   <string name="backup_delete_remote_confirm">从云端删除备份“%1$s”？本地文件不受影响。此操作无法撤销。</string>
++  <string name="backup_page_delete_config">删除配置</string>
++  <string name="backup_delete_config_confirm">删除配置“%1$s”？已保存在该服务器上的备份不受影响。此操作无法撤销。</string>
+   <string name="backup_page_delete_failed">删除失败: %s</string>
+   <string name="backup_page_delete_success">删除成功</string>
+   <string name="backup_page_export_desc">导出APP数据为文件</string>
+@@ -373,6 +375,8 @@
+   <string name="backup_page_s3_backup_files">S3备份文件</string>
+   <string name="backup_page_s3_list_truncated">仅显示最近 1000 个备份</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">删除 S3 配置</string>
++  <string name="backup_delete_s3_config_confirm">删除 S3 配置“%1$s”？已保存在该 Bucket 中的备份不受影响。此操作无法撤销。</string>
+   <string name="backup_page_s3_endpoint">端点</string>
+   <string name="backup_page_s3_path_style">路径样式</string>
+   <string name="backup_page_s3_path_style_desc">使用 endpoint/bucket/object。关闭后使用 bucket.endpoint/object。</string>
+@@ -1349,6 +1353,8 @@
+   <string name="setting_provider_page_search_providers">搜索提供商</string>
+   <string name="setting_provider_page_empty">还没有供应商</string>
+   <string name="setting_provider_page_empty_search">没有匹配的供应商</string>
++  <string name="setting_provider_page_search_models">搜索模型</string>
++  <string name="setting_provider_page_empty_search_models">没有匹配的模型</string>
+   <string name="setting_provider_page_recommend">推荐提供商</string>
+   <string name="setting_provider_page_select_all">全选（%1$d）</string>
+   <string name="setting_provider_page_select_from_gallery">从相册选择</string>
+@@ -1555,6 +1561,10 @@
+   <string name="setting_page_network_routing_default_desc">未单独设置路由的范围或提供商使用它。选代理可保持以往行为：走已配置的代理，未配置时直连。</string>
+   <string name="setting_page_network_routing_scope_title">按范围设置路由</string>
+   <string name="setting_page_network_routing_provider_title">按提供商设置路由</string>
++  <string name="setting_page_network_routing_batch">批量设置</string>
++  <string name="setting_page_network_routing_batch_desc">先勾选提供商，再选一个路由，一次应用到全部已选提供商。</string>
++  <string name="setting_page_network_routing_batch_select_all">全选</string>
++  <string name="setting_page_network_routing_provider_rest">其余 %1$d 个提供商跟随默认</string>
+   <string name="setting_page_network_routing_route_direct">直连</string>
+   <string name="setting_page_network_routing_route_tailscale">隧道</string>
+   <string name="setting_page_network_routing_route_proxy">代理</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 0a69a152b..11d4d5f3c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -297,6 +297,8 @@
+   <string name="backup_page_connection_success">Connection successful</string>
+   <string name="backup_page_delete">Delete</string>
+   <string name="backup_delete_remote_confirm">Delete backup \"%1$s\" from the cloud? Local files are not affected. This action cannot be undone.</string>
++  <string name="backup_page_delete_config">Delete profile</string>
++  <string name="backup_delete_config_confirm">Delete profile \"%1$s\"? Backups already stored on this server are not affected. This action cannot be undone.</string>
+   <string name="backup_page_delete_failed">Delete failed: %s</string>
+   <string name="backup_page_delete_success">Delete successful</string>
+   <string name="backup_page_export_desc">Export app data to a file</string>
+@@ -373,6 +375,8 @@
+   <string name="backup_page_s3_backup_files">S3 Backup Files</string>
+   <string name="backup_page_s3_list_truncated">Only showing the most recent 1000 backups</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">Delete S3 profile</string>
++  <string name="backup_delete_s3_config_confirm">Delete S3 profile \"%1$s\"? Backups already stored in this bucket are not affected. This action cannot be undone.</string>
+   <string name="backup_page_s3_endpoint">Endpoint</string>
+   <string name="backup_page_s3_path_style">Path Style</string>
+   <string name="backup_page_s3_path_style_desc">Use endpoint/bucket/object. Turn off to use bucket.endpoint/object.</string>
+@@ -1209,6 +1213,10 @@
+   <string name="setting_page_network_routing_default_desc">Used when a scope or provider has no route of its own. Proxy keeps the previous behavior: traffic goes through the configured proxy, or direct when none is configured.</string>
+   <string name="setting_page_network_routing_scope_title">Per-scope routes</string>
+   <string name="setting_page_network_routing_provider_title">Per-provider routes</string>
++  <string name="setting_page_network_routing_batch">Batch set routes</string>
++  <string name="setting_page_network_routing_batch_desc">Select providers, then choose a route to apply to all of them.</string>
++  <string name="setting_page_network_routing_batch_select_all">Select all</string>
++  <string name="setting_page_network_routing_provider_rest">Other %1$d providers follow the default</string>
+   <string name="setting_page_network_routing_route_direct">Direct</string>
+   <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+   <string name="setting_page_network_routing_route_proxy">Proxy</string>
+@@ -1417,6 +1425,8 @@
+   <string name="setting_provider_page_search_providers">Search providers</string>
+   <string name="setting_provider_page_empty">No providers yet</string>
+   <string name="setting_provider_page_empty_search">No matching providers</string>
++  <string name="setting_provider_page_search_models">Search models</string>
++  <string name="setting_provider_page_empty_search_models">No matching models</string>
+   <string name="setting_provider_page_recommend">Recommended providers</string>
+   <string name="setting_provider_page_select_all">Select All (%1$d)</string>
+   <string name="setting_provider_page_select_from_gallery">Select from Gallery</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/S3ConfigRemovalTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/S3ConfigRemovalTest.kt
+new file mode 100644
+index 000000000..629bf3ccd
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/S3ConfigRemovalTest.kt
+@@ -0,0 +1,78 @@
++package me.rerere.rikkahub.data.datastore
++
++import me.rerere.rikkahub.data.sync.s3.S3Config
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * S3 配置删除（Settings.withoutS3Config）的纯逻辑回归：
++ * 删当前生效配置时生效配置顺延为剩余首个；删最后一个（列表仅剩一个或旧单配置模式）
++ * 必须拒绝；不存在的 id 不做任何改动。
++ */
++class S3ConfigRemovalTest {
++
++    private fun config(id: String, name: String) = S3Config(id = id, name = name)
++
++    @Test
++    fun `deleting the active config promotes the remaining one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            s3Configs = listOf(first, second),
++            activeS3ConfigId = "b",
++            s3Config = second,
++        )
++        val result = settings.withoutS3Config("b")
++        assertEquals(listOf(first), result?.s3Configs)
++        assertEquals("a", result?.activeS3ConfigId)
++        assertEquals(first, result?.s3Config)
++    }
++
++    @Test
++    fun `deleting a non-active config keeps the active one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            s3Configs = listOf(first, second),
++            activeS3ConfigId = "a",
++            s3Config = first,
++        )
++        val result = settings.withoutS3Config("b")
++        assertEquals(listOf(first), result?.s3Configs)
++        assertEquals("a", result?.activeS3ConfigId)
++        assertEquals(first, result?.s3Config)
++    }
++
++    @Test
++    fun `deleting the only listed config is refused`() {
++        val only = config("a", "only")
++        val settings = Settings(
++            s3Configs = listOf(only),
++            activeS3ConfigId = "a",
++            s3Config = only,
++        )
++        assertNull(settings.withoutS3Config("a"))
++    }
++
++    @Test
++    fun `deleting the legacy single config is refused`() {
++        val legacy = config("legacy", "legacy")
++        val settings = Settings(s3Config = legacy)
++        assertNull(settings.withoutS3Config("legacy"))
++    }
++
++    @Test
++    fun `unknown id leaves settings unchanged`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            s3Configs = listOf(first, second),
++            activeS3ConfigId = "a",
++            s3Config = first,
++        )
++        assertEquals(settings, settings.withoutS3Config("missing"))
++        val legacySettings = Settings(s3Config = config("legacy", "legacy"))
++        assertEquals(legacySettings, legacySettings.withoutS3Config("missing"))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/WebDavConfigRemovalTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/WebDavConfigRemovalTest.kt
+new file mode 100644
+index 000000000..5a533e76b
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/WebDavConfigRemovalTest.kt
+@@ -0,0 +1,77 @@
++package me.rerere.rikkahub.data.datastore
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * WebDAV 配置删除（Settings.withoutWebDavConfig）的纯逻辑回归：
++ * 删当前生效配置时生效配置顺延为剩余首个；删最后一个（列表仅剩一个或旧单配置模式）
++ * 必须拒绝；不存在的 id 不做任何改动。
++ */
++class WebDavConfigRemovalTest {
++
++    private fun config(id: String, name: String) = WebDavConfig(id = id, name = name)
++
++    @Test
++    fun `deleting the active config promotes the remaining one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            webDavConfigs = listOf(first, second),
++            activeWebDavConfigId = "b",
++            webDavConfig = second,
++        )
++        val result = settings.withoutWebDavConfig("b")
++        assertEquals(listOf(first), result?.webDavConfigs)
++        assertEquals("a", result?.activeWebDavConfigId)
++        assertEquals(first, result?.webDavConfig)
++    }
++
++    @Test
++    fun `deleting a non-active config keeps the active one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            webDavConfigs = listOf(first, second),
++            activeWebDavConfigId = "a",
++            webDavConfig = first,
++        )
++        val result = settings.withoutWebDavConfig("b")
++        assertEquals(listOf(first), result?.webDavConfigs)
++        assertEquals("a", result?.activeWebDavConfigId)
++        assertEquals(first, result?.webDavConfig)
++    }
++
++    @Test
++    fun `deleting the only listed config is refused`() {
++        val only = config("a", "only")
++        val settings = Settings(
++            webDavConfigs = listOf(only),
++            activeWebDavConfigId = "a",
++            webDavConfig = only,
++        )
++        assertNull(settings.withoutWebDavConfig("a"))
++    }
++
++    @Test
++    fun `deleting the legacy single config is refused`() {
++        val legacy = config("legacy", "legacy")
++        val settings = Settings(webDavConfig = legacy)
++        assertNull(settings.withoutWebDavConfig("legacy"))
++    }
++
++    @Test
++    fun `unknown id leaves settings unchanged`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            webDavConfigs = listOf(first, second),
++            activeWebDavConfigId = "a",
++            webDavConfig = first,
++        )
++        assertEquals(settings, settings.withoutWebDavConfig("missing"))
++        val legacySettings = Settings(webDavConfig = config("legacy", "legacy"))
++        assertEquals(legacySettings, legacySettings.withoutWebDavConfig("missing"))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt b/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
+index 83b44a037..55623d2a9 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
+@@ -205,4 +205,59 @@ class NetworkRoutingTest {
+             ).isEmpty(),
+         )
+     }
++
++    @Test
++    fun `batch apply sets the same route for several providers`() {
++        val updated = empty.withProviderRoutes(
++            listOf("p1", "p2"),
++            NetworkRoute.DIRECT,
++        )
++        assertEquals(NetworkRoute.DIRECT, updated.providerRoutes["p1"])
++        assertEquals(NetworkRoute.DIRECT, updated.providerRoutes["p2"])
++        assertEquals(NetworkRoute.DIRECT, updated.resolveRoute(providerId = "p1"))
++    }
++
++    @Test
++    fun `batch apply with default clears overrides and keeps the rest`() {
++        val routing = empty.copy(
++            providerRoutes = mapOf(
++                "p1" to NetworkRoute.DIRECT,
++                "p2" to NetworkRoute.PROXY,
++                "p3" to NetworkRoute.TAILSCALE,
++            ),
++        )
++        val updated = routing.withProviderRoutes(listOf("p1", "p2"), NetworkRoute.FOLLOW_DEFAULT)
++        assertFalse("p1" in updated.providerRoutes)
++        assertFalse("p2" in updated.providerRoutes)
++        assertEquals(NetworkRoute.TAILSCALE, updated.providerRoutes["p3"])
++        assertEquals(NetworkRoute.PROXY, updated.resolveRoute(providerId = "p1"))
++    }
++
++    @Test
++    fun `batch apply with an empty selection changes nothing`() {
++        val routing = empty.copy(providerRoutes = mapOf("p1" to NetworkRoute.DIRECT))
++        assertEquals(routing, routing.withProviderRoutes(emptyList(), NetworkRoute.PROXY))
++    }
++
++    @Test
++    fun `hasProviderOverride ignores stored follow-default entries`() {
++        val routing = empty.copy(
++            providerRoutes = mapOf(
++                "p1" to NetworkRoute.DIRECT,
++                "p2" to NetworkRoute.FOLLOW_DEFAULT,
++            ),
++        )
++        assertTrue(routing.hasProviderOverride("p1"))
++        assertFalse(routing.hasProviderOverride("p2"))
++        assertFalse(routing.hasProviderOverride("p3"))
++    }
++
++    @Test
++    fun `on-device providers are excluded from routing`() {
++        assertTrue(isOnDeviceProvider(ProviderSetting.AICore()))
++        assertTrue(isOnDeviceProvider(ProviderSetting.LiteRtLocal()))
++        assertTrue(isOnDeviceProvider(ProviderSetting.LlamaCppLocal()))
++        assertFalse(isOnDeviceProvider(ProviderSetting.OpenAI()))
++        assertFalse(isOnDeviceProvider(ProviderSetting.Google()))
++    }
+ }
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndexTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndexTest.kt
+index 76c180d47..faf3a63d0 100644
+--- a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndexTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndexTest.kt
+@@ -43,4 +43,15 @@ class SettingsSearchIndexTest {
+         assertTrue(withDeveloper.any { it.route == Screen.Developer })
+         assertEquals(withoutDeveloper.size + 1, withDeveloper.size)
+     }
++
++    @Test
++    fun `network sub-pages are searchable`() {
++        // 偏好设置 → 网络下的 5 个子页必须进搜索索引，否则搜「路由」「代理」「DNS」等找不到入口。
++        val routes = settingsSearchIndex(developerMode = false).map { it.route }
++        assertTrue(routes.contains(Screen.SettingNetworkRouting))
++        assertTrue(routes.contains(Screen.SettingNetworkProxy))
++        assertTrue(routes.contains(Screen.SettingNetworkDns))
++        assertTrue(routes.contains(Screen.SettingNetworkHostOverrides))
++        assertTrue(routes.contains(Screen.SettingNetworkTunnel))
++    }
+ }
