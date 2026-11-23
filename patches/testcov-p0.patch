@@ -1,0 +1,3621 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index a7420a6c1..c59766928 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -83,7 +83,7 @@ jobs:
+           key: webui-${{ hashFiles('web-ui/pnpm-lock.yaml', 'web-ui/package.json') }}
+           restore-keys: webui-
+ 
+-      - name: 单元测试（实际执行 14 个模块，不替代 Android 验收）
++      - name: 单元测试（实际执行 16 个模块，不替代 Android 验收）
+         run: |
+           chmod +x gradlew
+           set -o pipefail
+@@ -96,8 +96,11 @@ jobs:
+           #   在 df5ad9c71 上全量运行 0 失败（旧的「需外网」「本地回环失败」未复现）；
+           #   local-llm 单开 JDK 21 job（本文件 unit-test-local-llm）：JDK 17 下 LiteRT
+           #   类文件 65.0 报 UnsupportedClassVersionError，JDK 21 下 150 例全过。
++          # 2026-11-24 纳入 mediagen（56 例，FakeHttp 拦截器、无真实网络）与
++          #   terminal（144 例，JUnit3 风格 TestCase + 6 个 JUnit4 用例，纯 JVM 逻辑、
++          #   不碰 native 方法）：此前 tests.yml 漏了这两个模块。
+           for i in 1 2; do
+-            ./gradlew :app:testDebugUnitTest :ai:testDebugUnitTest :common:testDebugUnitTest --build-cache :document:testDebugUnitTest :highlight:testDebugUnitTest :llama-cpp:testDebugUnitTest :material3:testDebugUnitTest :search:testDebugUnitTest :speech:testDebugUnitTest :videogen:testDebugUnitTest :web:testDebugUnitTest :workspace:testDebugUnitTest :agent-tools:testDebugUnitTest :oauth:testDebugUnitTest --parallel --build-cache --configuration-cache --continue 2>&1 | tee -a "unit-test-attempt-$i.log"
++            ./gradlew :app:testDebugUnitTest :ai:testDebugUnitTest :common:testDebugUnitTest --build-cache :document:testDebugUnitTest :highlight:testDebugUnitTest :llama-cpp:testDebugUnitTest :material3:testDebugUnitTest :mediagen:testDebugUnitTest :search:testDebugUnitTest :speech:testDebugUnitTest :terminal:testDebugUnitTest :videogen:testDebugUnitTest :web:testDebugUnitTest :workspace:testDebugUnitTest :agent-tools:testDebugUnitTest :oauth:testDebugUnitTest --parallel --build-cache --configuration-cache --continue 2>&1 | tee -a "unit-test-attempt-$i.log"
+             [ "${PIPESTATUS[0]}" = "0" ] && break
+             if [ "$i" = "2" ]; then echo "❌ 两次均失败"; exit 1; fi
+             # 只有日志含下载/网络超时特征才重试：断言或编译失败重跑整轮也是失败，不浪费一次全量
+@@ -129,8 +132,10 @@ jobs:
+             highlight/build/reports/tests/testDebugUnitTest
+             llama-cpp/build/reports/tests/testDebugUnitTest
+             material3/build/reports/tests/testDebugUnitTest
++            mediagen/build/reports/tests/testDebugUnitTest
+             search/build/reports/tests/testDebugUnitTest
+             speech/build/reports/tests/testDebugUnitTest
++            terminal/build/reports/tests/testDebugUnitTest
+             videogen/build/reports/tests/testDebugUnitTest
+             web/build/reports/tests/testDebugUnitTest
+             workspace/build/reports/tests/testDebugUnitTest
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/11.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/11.json
+new file mode 100644
+index 000000000..1bd9fcd00
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/11.json
+@@ -0,0 +1,155 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 11,
++    "identityHash": "d4531feb17ecd98589ce788814c4f17b",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `truncate_index` INTEGER NOT NULL DEFAULT -1, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "truncateIndex",
++            "columnName": "truncate_index",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "-1"
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'd4531feb17ecd98589ce788814c4f17b')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/12.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/12.json
+new file mode 100644
+index 000000000..023d3419f
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/12.json
+@@ -0,0 +1,221 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 12,
++    "identityHash": "67176cc43926c14988e9c81ed5e48b26",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `truncate_index` INTEGER NOT NULL DEFAULT -1, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "truncateIndex",
++            "columnName": "truncate_index",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "-1"
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "message_node",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `conversation_id` TEXT NOT NULL, `node_index` INTEGER NOT NULL, `messages` TEXT NOT NULL, `select_index` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversation_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodeIndex",
++            "columnName": "node_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "messages",
++            "columnName": "messages",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "selectIndex",
++            "columnName": "select_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_message_node_conversation_id",
++            "unique": false,
++            "columnNames": [
++              "conversation_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_node_conversation_id` ON `${TABLE_NAME}` (`conversation_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "ConversationEntity",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "conversation_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '67176cc43926c14988e9c81ed5e48b26')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/20.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/20.json
+new file mode 100644
+index 000000000..5e9e3d4b0
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/20.json
+@@ -0,0 +1,549 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 20,
++    "identityHash": "82fe62c3af412ed32ccfada98b2f14a6",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "message_node",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `conversation_id` TEXT NOT NULL, `node_index` INTEGER NOT NULL, `messages` TEXT NOT NULL, `select_index` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversation_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodeIndex",
++            "columnName": "node_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "messages",
++            "columnName": "messages",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "selectIndex",
++            "columnName": "select_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_message_node_conversation_id",
++            "unique": false,
++            "columnNames": [
++              "conversation_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_node_conversation_id` ON `${TABLE_NAME}` (`conversation_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "ConversationEntity",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "conversation_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "managed_files",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder` TEXT NOT NULL, `relative_path` TEXT NOT NULL, `display_name` TEXT NOT NULL, `mime_type` TEXT NOT NULL, `size_bytes` INTEGER NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "folder",
++            "columnName": "folder",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "relativePath",
++            "columnName": "relative_path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "displayName",
++            "columnName": "display_name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mimeType",
++            "columnName": "mime_type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sizeBytes",
++            "columnName": "size_bytes",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_managed_files_relative_path",
++            "unique": true,
++            "columnNames": [
++              "relative_path"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_managed_files_relative_path` ON `${TABLE_NAME}` (`relative_path`)"
++          },
++          {
++            "name": "index_managed_files_folder",
++            "unique": false,
++            "columnNames": [
++              "folder"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_managed_files_folder` ON `${TABLE_NAME}` (`folder`)"
++          }
++        ]
++      },
++      {
++        "tableName": "favorites",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `type` TEXT NOT NULL, `ref_key` TEXT NOT NULL, `ref_json` TEXT NOT NULL, `snapshot_json` TEXT NOT NULL, `meta_json` TEXT, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refKey",
++            "columnName": "ref_key",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refJson",
++            "columnName": "ref_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "snapshotJson",
++            "columnName": "snapshot_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "metaJson",
++            "columnName": "meta_json",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_favorites_ref_key",
++            "unique": true,
++            "columnNames": [
++              "ref_key"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_favorites_ref_key` ON `${TABLE_NAME}` (`ref_key`)"
++          },
++          {
++            "name": "index_favorites_type",
++            "unique": false,
++            "columnNames": [
++              "type"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_type` ON `${TABLE_NAME}` (`type`)"
++          },
++          {
++            "name": "index_favorites_created_at",
++            "unique": false,
++            "columnNames": [
++              "created_at"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_created_at` ON `${TABLE_NAME}` (`created_at`)"
++          }
++        ]
++      },
++      {
++        "tableName": "scheduled_jobs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `prompt` TEXT NOT NULL, `assistantId` TEXT NOT NULL, `scheduleType` TEXT NOT NULL, `atUnixMs` INTEGER, `intervalSeconds` INTEGER, `enabled` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `nextRunAtMs` INTEGER, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistantId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduleType",
++            "columnName": "scheduleType",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "atUnixMs",
++            "columnName": "atUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "intervalSeconds",
++            "columnName": "intervalSeconds",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "nextRunAtMs",
++            "columnName": "nextRunAtMs",
++            "affinity": "INTEGER"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "ssh_hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`name` TEXT NOT NULL, `host` TEXT NOT NULL, `port` INTEGER NOT NULL, `user` TEXT NOT NULL, `password` TEXT, `privateKey` TEXT, `passphrase` TEXT, `createdAtMs` INTEGER NOT NULL, PRIMARY KEY(`name`))",
++        "fields": [
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "host",
++            "columnName": "host",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "user",
++            "columnName": "user",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "password",
++            "columnName": "password",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "privateKey",
++            "columnName": "privateKey",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "passphrase",
++            "columnName": "passphrase",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "name"
++          ]
++        }
++      },
++      {
++        "tableName": "telegram_chats",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chatId` INTEGER NOT NULL, `conversationId` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastMessageAtMs` INTEGER NOT NULL, PRIMARY KEY(`chatId`))",
++        "fields": [
++          {
++            "fieldPath": "chatId",
++            "columnName": "chatId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastMessageAtMs",
++            "columnName": "lastMessageAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "chatId"
++          ]
++        }
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '82fe62c3af412ed32ccfada98b2f14a6')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/21.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/21.json
+new file mode 100644
+index 000000000..52bf42de3
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/21.json
+@@ -0,0 +1,672 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 21,
++    "identityHash": "5d89aecf758e9382a66ddcccedc8d913",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "message_node",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `conversation_id` TEXT NOT NULL, `node_index` INTEGER NOT NULL, `messages` TEXT NOT NULL, `select_index` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversation_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodeIndex",
++            "columnName": "node_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "messages",
++            "columnName": "messages",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "selectIndex",
++            "columnName": "select_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_message_node_conversation_id",
++            "unique": false,
++            "columnNames": [
++              "conversation_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_node_conversation_id` ON `${TABLE_NAME}` (`conversation_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "ConversationEntity",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "conversation_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "managed_files",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder` TEXT NOT NULL, `relative_path` TEXT NOT NULL, `display_name` TEXT NOT NULL, `mime_type` TEXT NOT NULL, `size_bytes` INTEGER NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "folder",
++            "columnName": "folder",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "relativePath",
++            "columnName": "relative_path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "displayName",
++            "columnName": "display_name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mimeType",
++            "columnName": "mime_type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sizeBytes",
++            "columnName": "size_bytes",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_managed_files_relative_path",
++            "unique": true,
++            "columnNames": [
++              "relative_path"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_managed_files_relative_path` ON `${TABLE_NAME}` (`relative_path`)"
++          },
++          {
++            "name": "index_managed_files_folder",
++            "unique": false,
++            "columnNames": [
++              "folder"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_managed_files_folder` ON `${TABLE_NAME}` (`folder`)"
++          }
++        ]
++      },
++      {
++        "tableName": "favorites",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `type` TEXT NOT NULL, `ref_key` TEXT NOT NULL, `ref_json` TEXT NOT NULL, `snapshot_json` TEXT NOT NULL, `meta_json` TEXT, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refKey",
++            "columnName": "ref_key",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refJson",
++            "columnName": "ref_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "snapshotJson",
++            "columnName": "snapshot_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "metaJson",
++            "columnName": "meta_json",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_favorites_ref_key",
++            "unique": true,
++            "columnNames": [
++              "ref_key"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_favorites_ref_key` ON `${TABLE_NAME}` (`ref_key`)"
++          },
++          {
++            "name": "index_favorites_type",
++            "unique": false,
++            "columnNames": [
++              "type"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_type` ON `${TABLE_NAME}` (`type`)"
++          },
++          {
++            "name": "index_favorites_created_at",
++            "unique": false,
++            "columnNames": [
++              "created_at"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_created_at` ON `${TABLE_NAME}` (`created_at`)"
++          }
++        ]
++      },
++      {
++        "tableName": "scheduled_jobs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `prompt` TEXT, `assistantId` TEXT NOT NULL, `scheduleType` TEXT NOT NULL, `atUnixMs` INTEGER, `intervalSeconds` INTEGER, `enabled` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `nextRunAtMs` INTEGER, `mode` TEXT NOT NULL DEFAULT 'llm', `actionsJson` TEXT, `cronExpression` TEXT, `timezone` TEXT, `startAtUnixMs` INTEGER, `endAtUnixMs` INTEGER, `maxRuns` INTEGER, `runsSoFar` INTEGER NOT NULL DEFAULT 0, `catchup` TEXT NOT NULL DEFAULT 'fire_once', `description` TEXT, `tags` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistantId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduleType",
++            "columnName": "scheduleType",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "atUnixMs",
++            "columnName": "atUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "intervalSeconds",
++            "columnName": "intervalSeconds",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "nextRunAtMs",
++            "columnName": "nextRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'llm'"
++          },
++          {
++            "fieldPath": "actionsJson",
++            "columnName": "actionsJson",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "cronExpression",
++            "columnName": "cronExpression",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "timezone",
++            "columnName": "timezone",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "startAtUnixMs",
++            "columnName": "startAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "endAtUnixMs",
++            "columnName": "endAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "maxRuns",
++            "columnName": "maxRuns",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "runsSoFar",
++            "columnName": "runsSoFar",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "catchup",
++            "columnName": "catchup",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'fire_once'"
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "tags",
++            "columnName": "tags",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "scheduled_job_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `jobId` TEXT NOT NULL, `mode` TEXT NOT NULL, `scheduledAtMs` INTEGER NOT NULL, `startedAtMs` INTEGER NOT NULL, `finishedAtMs` INTEGER, `outcome` TEXT NOT NULL, `conversationId` TEXT, `errorMessage` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "jobId",
++            "columnName": "jobId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduledAtMs",
++            "columnName": "scheduledAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startedAtMs",
++            "columnName": "startedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "finishedAtMs",
++            "columnName": "finishedAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "outcome",
++            "columnName": "outcome",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "ssh_hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`name` TEXT NOT NULL, `host` TEXT NOT NULL, `port` INTEGER NOT NULL, `user` TEXT NOT NULL, `password` TEXT, `privateKey` TEXT, `passphrase` TEXT, `createdAtMs` INTEGER NOT NULL, PRIMARY KEY(`name`))",
++        "fields": [
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "host",
++            "columnName": "host",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "user",
++            "columnName": "user",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "password",
++            "columnName": "password",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "privateKey",
++            "columnName": "privateKey",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "passphrase",
++            "columnName": "passphrase",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "name"
++          ]
++        }
++      },
++      {
++        "tableName": "telegram_chats",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chatId` INTEGER NOT NULL, `conversationId` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastMessageAtMs` INTEGER NOT NULL, PRIMARY KEY(`chatId`))",
++        "fields": [
++          {
++            "fieldPath": "chatId",
++            "columnName": "chatId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastMessageAtMs",
++            "columnName": "lastMessageAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "chatId"
++          ]
++        }
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '5d89aecf758e9382a66ddcccedc8d913')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/23.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/23.json
+new file mode 100644
+index 000000000..b821ba53f
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/23.json
+@@ -0,0 +1,826 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 23,
++    "identityHash": "c7fc79e48a76befcfa337b9c36754bff",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `type` TEXT NOT NULL DEFAULT 'image_generation', `source_paths` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'image_generation'"
++          },
++          {
++            "fieldPath": "sourcePaths",
++            "columnName": "source_paths",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "message_node",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `conversation_id` TEXT NOT NULL, `node_index` INTEGER NOT NULL, `messages` TEXT NOT NULL, `select_index` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversation_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodeIndex",
++            "columnName": "node_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "messages",
++            "columnName": "messages",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "selectIndex",
++            "columnName": "select_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_message_node_conversation_id",
++            "unique": false,
++            "columnNames": [
++              "conversation_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_node_conversation_id` ON `${TABLE_NAME}` (`conversation_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "ConversationEntity",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "conversation_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "managed_files",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder` TEXT NOT NULL, `relative_path` TEXT NOT NULL, `display_name` TEXT NOT NULL, `mime_type` TEXT NOT NULL, `size_bytes` INTEGER NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "folder",
++            "columnName": "folder",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "relativePath",
++            "columnName": "relative_path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "displayName",
++            "columnName": "display_name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mimeType",
++            "columnName": "mime_type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sizeBytes",
++            "columnName": "size_bytes",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_managed_files_relative_path",
++            "unique": true,
++            "columnNames": [
++              "relative_path"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_managed_files_relative_path` ON `${TABLE_NAME}` (`relative_path`)"
++          },
++          {
++            "name": "index_managed_files_folder",
++            "unique": false,
++            "columnNames": [
++              "folder"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_managed_files_folder` ON `${TABLE_NAME}` (`folder`)"
++          }
++        ]
++      },
++      {
++        "tableName": "favorites",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `type` TEXT NOT NULL, `ref_key` TEXT NOT NULL, `ref_json` TEXT NOT NULL, `snapshot_json` TEXT NOT NULL, `meta_json` TEXT, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refKey",
++            "columnName": "ref_key",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refJson",
++            "columnName": "ref_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "snapshotJson",
++            "columnName": "snapshot_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "metaJson",
++            "columnName": "meta_json",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_favorites_ref_key",
++            "unique": true,
++            "columnNames": [
++              "ref_key"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_favorites_ref_key` ON `${TABLE_NAME}` (`ref_key`)"
++          },
++          {
++            "name": "index_favorites_type",
++            "unique": false,
++            "columnNames": [
++              "type"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_type` ON `${TABLE_NAME}` (`type`)"
++          },
++          {
++            "name": "index_favorites_created_at",
++            "unique": false,
++            "columnNames": [
++              "created_at"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_created_at` ON `${TABLE_NAME}` (`created_at`)"
++          }
++        ]
++      },
++      {
++        "tableName": "scheduled_jobs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `prompt` TEXT, `assistantId` TEXT NOT NULL, `scheduleType` TEXT NOT NULL, `atUnixMs` INTEGER, `intervalSeconds` INTEGER, `enabled` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `nextRunAtMs` INTEGER, `mode` TEXT NOT NULL DEFAULT 'llm', `actionsJson` TEXT, `cronExpression` TEXT, `timezone` TEXT, `startAtUnixMs` INTEGER, `endAtUnixMs` INTEGER, `maxRuns` INTEGER, `runsSoFar` INTEGER NOT NULL DEFAULT 0, `catchup` TEXT NOT NULL DEFAULT 'fire_once', `description` TEXT, `tags` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistantId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduleType",
++            "columnName": "scheduleType",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "atUnixMs",
++            "columnName": "atUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "intervalSeconds",
++            "columnName": "intervalSeconds",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "nextRunAtMs",
++            "columnName": "nextRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'llm'"
++          },
++          {
++            "fieldPath": "actionsJson",
++            "columnName": "actionsJson",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "cronExpression",
++            "columnName": "cronExpression",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "timezone",
++            "columnName": "timezone",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "startAtUnixMs",
++            "columnName": "startAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "endAtUnixMs",
++            "columnName": "endAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "maxRuns",
++            "columnName": "maxRuns",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "runsSoFar",
++            "columnName": "runsSoFar",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "catchup",
++            "columnName": "catchup",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'fire_once'"
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "tags",
++            "columnName": "tags",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "scheduled_job_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `jobId` TEXT NOT NULL, `mode` TEXT NOT NULL, `scheduledAtMs` INTEGER NOT NULL, `startedAtMs` INTEGER NOT NULL, `finishedAtMs` INTEGER, `outcome` TEXT NOT NULL, `conversationId` TEXT, `errorMessage` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "jobId",
++            "columnName": "jobId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduledAtMs",
++            "columnName": "scheduledAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startedAtMs",
++            "columnName": "startedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "finishedAtMs",
++            "columnName": "finishedAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "outcome",
++            "columnName": "outcome",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "ssh_hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`name` TEXT NOT NULL, `host` TEXT NOT NULL, `port` INTEGER NOT NULL, `user` TEXT NOT NULL, `password` TEXT, `privateKey` TEXT, `passphrase` TEXT, `createdAtMs` INTEGER NOT NULL, PRIMARY KEY(`name`))",
++        "fields": [
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "host",
++            "columnName": "host",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "user",
++            "columnName": "user",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "password",
++            "columnName": "password",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "privateKey",
++            "columnName": "privateKey",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "passphrase",
++            "columnName": "passphrase",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "name"
++          ]
++        }
++      },
++      {
++        "tableName": "telegram_chats",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chatId` INTEGER NOT NULL, `conversationId` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastMessageAtMs` INTEGER NOT NULL, PRIMARY KEY(`chatId`))",
++        "fields": [
++          {
++            "fieldPath": "chatId",
++            "columnName": "chatId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastMessageAtMs",
++            "columnName": "lastMessageAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "chatId"
++          ]
++        }
++      },
++      {
++        "tableName": "workflows",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `description` TEXT, `enabled` INTEGER NOT NULL DEFAULT 1, `definitionJson` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `updatedAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `lastRunStatus` TEXT, `lastRunError` TEXT, `runsTodayCount` INTEGER NOT NULL DEFAULT 0, `runsTodayDate` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "1"
++          },
++          {
++            "fieldPath": "definitionJson",
++            "columnName": "definitionJson",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAtMs",
++            "columnName": "updatedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "lastRunStatus",
++            "columnName": "lastRunStatus",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "lastRunError",
++            "columnName": "lastRunError",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "runsTodayCount",
++            "columnName": "runsTodayCount",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "runsTodayDate",
++            "columnName": "runsTodayDate",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "''"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "workflow_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`rowId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `workflowId` TEXT NOT NULL, `firedAtMs` INTEGER NOT NULL, `status` TEXT NOT NULL, `durationMs` INTEGER NOT NULL, `errorMessage` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "rowId",
++            "columnName": "rowId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "workflowId",
++            "columnName": "workflowId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "firedAtMs",
++            "columnName": "firedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "status",
++            "columnName": "status",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "durationMs",
++            "columnName": "durationMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "rowId"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_workflow_runs_workflowId_firedAtMs",
++            "unique": false,
++            "columnNames": [
++              "workflowId",
++              "firedAtMs"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_workflow_runs_workflowId_firedAtMs` ON `${TABLE_NAME}` (`workflowId`, `firedAtMs`)"
++          }
++        ]
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'c7fc79e48a76befcfa337b9c36754bff')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/24.json b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/24.json
+new file mode 100644
+index 000000000..e7ab702fc
+--- /dev/null
++++ b/app/src/debug/assets/me.rerere.rikkahub.data.db.AppDatabase/24.json
+@@ -0,0 +1,938 @@
++{
++  "formatVersion": 1,
++  "database": {
++    "version": 24,
++    "identityHash": "9ffa1ab14738379852d10550ffdb2ee5",
++    "entities": [
++      {
++        "tableName": "ConversationEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `assistant_id` TEXT NOT NULL DEFAULT '0950e2dc-9bd5-4801-afa3-aa887aa36b4e', `title` TEXT NOT NULL, `nodes` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `update_at` INTEGER NOT NULL, `suggestions` TEXT NOT NULL DEFAULT '[]', `is_pinned` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'0950e2dc-9bd5-4801-afa3-aa887aa36b4e'"
++          },
++          {
++            "fieldPath": "title",
++            "columnName": "title",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodes",
++            "columnName": "nodes",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updateAt",
++            "columnName": "update_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "chatSuggestions",
++            "columnName": "suggestions",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'[]'"
++          },
++          {
++            "fieldPath": "isPinned",
++            "columnName": "is_pinned",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "MemoryEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `assistant_id` TEXT NOT NULL, `content` TEXT NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistant_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "content",
++            "columnName": "content",
++            "affinity": "TEXT",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "GenMediaEntity",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `path` TEXT NOT NULL, `model_id` TEXT NOT NULL, `prompt` TEXT NOT NULL, `create_at` INTEGER NOT NULL, `type` TEXT NOT NULL DEFAULT 'image_generation', `source_paths` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "path",
++            "columnName": "path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "modelId",
++            "columnName": "model_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createAt",
++            "columnName": "create_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'image_generation'"
++          },
++          {
++            "fieldPath": "sourcePaths",
++            "columnName": "source_paths",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "message_node",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `conversation_id` TEXT NOT NULL, `node_index` INTEGER NOT NULL, `messages` TEXT NOT NULL, `select_index` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`conversation_id`) REFERENCES `ConversationEntity`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversation_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "nodeIndex",
++            "columnName": "node_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "messages",
++            "columnName": "messages",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "selectIndex",
++            "columnName": "select_index",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_message_node_conversation_id",
++            "unique": false,
++            "columnNames": [
++              "conversation_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_message_node_conversation_id` ON `${TABLE_NAME}` (`conversation_id`)"
++          }
++        ],
++        "foreignKeys": [
++          {
++            "table": "ConversationEntity",
++            "onDelete": "CASCADE",
++            "onUpdate": "NO ACTION",
++            "columns": [
++              "conversation_id"
++            ],
++            "referencedColumns": [
++              "id"
++            ]
++          }
++        ]
++      },
++      {
++        "tableName": "managed_files",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `folder` TEXT NOT NULL, `relative_path` TEXT NOT NULL, `display_name` TEXT NOT NULL, `mime_type` TEXT NOT NULL, `size_bytes` INTEGER NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL)",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "folder",
++            "columnName": "folder",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "relativePath",
++            "columnName": "relative_path",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "displayName",
++            "columnName": "display_name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mimeType",
++            "columnName": "mime_type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "sizeBytes",
++            "columnName": "size_bytes",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_managed_files_relative_path",
++            "unique": true,
++            "columnNames": [
++              "relative_path"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_managed_files_relative_path` ON `${TABLE_NAME}` (`relative_path`)"
++          },
++          {
++            "name": "index_managed_files_folder",
++            "unique": false,
++            "columnNames": [
++              "folder"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_managed_files_folder` ON `${TABLE_NAME}` (`folder`)"
++          }
++        ]
++      },
++      {
++        "tableName": "favorites",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `type` TEXT NOT NULL, `ref_key` TEXT NOT NULL, `ref_json` TEXT NOT NULL, `snapshot_json` TEXT NOT NULL, `meta_json` TEXT, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "type",
++            "columnName": "type",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refKey",
++            "columnName": "ref_key",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "refJson",
++            "columnName": "ref_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "snapshotJson",
++            "columnName": "snapshot_json",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "metaJson",
++            "columnName": "meta_json",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAt",
++            "columnName": "created_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAt",
++            "columnName": "updated_at",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_favorites_ref_key",
++            "unique": true,
++            "columnNames": [
++              "ref_key"
++            ],
++            "orders": [],
++            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_favorites_ref_key` ON `${TABLE_NAME}` (`ref_key`)"
++          },
++          {
++            "name": "index_favorites_type",
++            "unique": false,
++            "columnNames": [
++              "type"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_type` ON `${TABLE_NAME}` (`type`)"
++          },
++          {
++            "name": "index_favorites_created_at",
++            "unique": false,
++            "columnNames": [
++              "created_at"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_favorites_created_at` ON `${TABLE_NAME}` (`created_at`)"
++          }
++        ]
++      },
++      {
++        "tableName": "scheduled_jobs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `prompt` TEXT, `assistantId` TEXT NOT NULL, `scheduleType` TEXT NOT NULL, `atUnixMs` INTEGER, `intervalSeconds` INTEGER, `enabled` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `nextRunAtMs` INTEGER, `mode` TEXT NOT NULL DEFAULT 'llm', `actionsJson` TEXT, `cronExpression` TEXT, `timezone` TEXT, `startAtUnixMs` INTEGER, `endAtUnixMs` INTEGER, `maxRuns` INTEGER, `runsSoFar` INTEGER NOT NULL DEFAULT 0, `catchup` TEXT NOT NULL DEFAULT 'fire_once', `description` TEXT, `tags` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "prompt",
++            "columnName": "prompt",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "assistantId",
++            "columnName": "assistantId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduleType",
++            "columnName": "scheduleType",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "atUnixMs",
++            "columnName": "atUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "intervalSeconds",
++            "columnName": "intervalSeconds",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "nextRunAtMs",
++            "columnName": "nextRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'llm'"
++          },
++          {
++            "fieldPath": "actionsJson",
++            "columnName": "actionsJson",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "cronExpression",
++            "columnName": "cronExpression",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "timezone",
++            "columnName": "timezone",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "startAtUnixMs",
++            "columnName": "startAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "endAtUnixMs",
++            "columnName": "endAtUnixMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "maxRuns",
++            "columnName": "maxRuns",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "runsSoFar",
++            "columnName": "runsSoFar",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "catchup",
++            "columnName": "catchup",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "'fire_once'"
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "tags",
++            "columnName": "tags",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "scheduled_job_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `jobId` TEXT NOT NULL, `mode` TEXT NOT NULL, `scheduledAtMs` INTEGER NOT NULL, `startedAtMs` INTEGER NOT NULL, `finishedAtMs` INTEGER, `outcome` TEXT NOT NULL, `conversationId` TEXT, `errorMessage` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "jobId",
++            "columnName": "jobId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "mode",
++            "columnName": "mode",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "scheduledAtMs",
++            "columnName": "scheduledAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startedAtMs",
++            "columnName": "startedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "finishedAtMs",
++            "columnName": "finishedAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "outcome",
++            "columnName": "outcome",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "ssh_hosts",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`name` TEXT NOT NULL, `host` TEXT NOT NULL, `port` INTEGER NOT NULL, `user` TEXT NOT NULL, `password` TEXT, `privateKey` TEXT, `passphrase` TEXT, `createdAtMs` INTEGER NOT NULL, PRIMARY KEY(`name`))",
++        "fields": [
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "host",
++            "columnName": "host",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "port",
++            "columnName": "port",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "user",
++            "columnName": "user",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "password",
++            "columnName": "password",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "privateKey",
++            "columnName": "privateKey",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "passphrase",
++            "columnName": "passphrase",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "name"
++          ]
++        }
++      },
++      {
++        "tableName": "telegram_chats",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`chatId` INTEGER NOT NULL, `conversationId` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `lastMessageAtMs` INTEGER NOT NULL, PRIMARY KEY(`chatId`))",
++        "fields": [
++          {
++            "fieldPath": "chatId",
++            "columnName": "chatId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "conversationId",
++            "columnName": "conversationId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastMessageAtMs",
++            "columnName": "lastMessageAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "chatId"
++          ]
++        }
++      },
++      {
++        "tableName": "workflows",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `description` TEXT, `enabled` INTEGER NOT NULL DEFAULT 1, `definitionJson` TEXT NOT NULL, `createdAtMs` INTEGER NOT NULL, `updatedAtMs` INTEGER NOT NULL, `lastRunAtMs` INTEGER, `lastRunStatus` TEXT, `lastRunError` TEXT, `runsTodayCount` INTEGER NOT NULL DEFAULT 0, `runsTodayDate` TEXT NOT NULL DEFAULT '', PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "name",
++            "columnName": "name",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "description",
++            "columnName": "description",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "enabled",
++            "columnName": "enabled",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "1"
++          },
++          {
++            "fieldPath": "definitionJson",
++            "columnName": "definitionJson",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "createdAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAtMs",
++            "columnName": "updatedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "lastRunAtMs",
++            "columnName": "lastRunAtMs",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "lastRunStatus",
++            "columnName": "lastRunStatus",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "lastRunError",
++            "columnName": "lastRunError",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "runsTodayCount",
++            "columnName": "runsTodayCount",
++            "affinity": "INTEGER",
++            "notNull": true,
++            "defaultValue": "0"
++          },
++          {
++            "fieldPath": "runsTodayDate",
++            "columnName": "runsTodayDate",
++            "affinity": "TEXT",
++            "notNull": true,
++            "defaultValue": "''"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        }
++      },
++      {
++        "tableName": "workflow_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`rowId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `workflowId` TEXT NOT NULL, `firedAtMs` INTEGER NOT NULL, `status` TEXT NOT NULL, `durationMs` INTEGER NOT NULL, `errorMessage` TEXT)",
++        "fields": [
++          {
++            "fieldPath": "rowId",
++            "columnName": "rowId",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "workflowId",
++            "columnName": "workflowId",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "firedAtMs",
++            "columnName": "firedAtMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "status",
++            "columnName": "status",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "durationMs",
++            "columnName": "durationMs",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "errorMessage",
++            "columnName": "errorMessage",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": true,
++          "columnNames": [
++            "rowId"
++          ]
++        },
++        "indices": [
++          {
++            "name": "index_workflow_runs_workflowId_firedAtMs",
++            "unique": false,
++            "columnNames": [
++              "workflowId",
++              "firedAtMs"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `index_workflow_runs_workflowId_firedAtMs` ON `${TABLE_NAME}` (`workflowId`, `firedAtMs`)"
++          }
++        ]
++      },
++      {
++        "tableName": "agent_runs",
++        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `kind` TEXT NOT NULL, `domain_id` TEXT NOT NULL, `parent_run_id` TEXT, `status` TEXT NOT NULL, `created_at_ms` INTEGER NOT NULL, `updated_at_ms` INTEGER NOT NULL, `started_at_ms` INTEGER, `finished_at_ms` INTEGER, `last_error` TEXT, `metadata_json` TEXT, PRIMARY KEY(`id`))",
++        "fields": [
++          {
++            "fieldPath": "id",
++            "columnName": "id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "kind",
++            "columnName": "kind",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "domainId",
++            "columnName": "domain_id",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "parentRunId",
++            "columnName": "parent_run_id",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "status",
++            "columnName": "status",
++            "affinity": "TEXT",
++            "notNull": true
++          },
++          {
++            "fieldPath": "createdAtMs",
++            "columnName": "created_at_ms",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "updatedAtMs",
++            "columnName": "updated_at_ms",
++            "affinity": "INTEGER",
++            "notNull": true
++          },
++          {
++            "fieldPath": "startedAtMs",
++            "columnName": "started_at_ms",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "finishedAtMs",
++            "columnName": "finished_at_ms",
++            "affinity": "INTEGER"
++          },
++          {
++            "fieldPath": "lastError",
++            "columnName": "last_error",
++            "affinity": "TEXT"
++          },
++          {
++            "fieldPath": "metadataJson",
++            "columnName": "metadata_json",
++            "affinity": "TEXT"
++          }
++        ],
++        "primaryKey": {
++          "autoGenerate": false,
++          "columnNames": [
++            "id"
++          ]
++        },
++        "indices": [
++          {
++            "name": "idx_runs_status",
++            "unique": false,
++            "columnNames": [
++              "status"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_status` ON `${TABLE_NAME}` (`status`)"
++          },
++          {
++            "name": "idx_runs_kind_dom",
++            "unique": false,
++            "columnNames": [
++              "kind",
++              "domain_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_kind_dom` ON `${TABLE_NAME}` (`kind`, `domain_id`)"
++          },
++          {
++            "name": "idx_runs_parent",
++            "unique": false,
++            "columnNames": [
++              "parent_run_id"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_parent` ON `${TABLE_NAME}` (`parent_run_id`)"
++          },
++          {
++            "name": "idx_runs_updated_at",
++            "unique": false,
++            "columnNames": [
++              "updated_at_ms"
++            ],
++            "orders": [],
++            "createSql": "CREATE INDEX IF NOT EXISTS `idx_runs_updated_at` ON `${TABLE_NAME}` (`updated_at_ms`)"
++          }
++        ]
++      }
++    ],
++    "setupQueries": [
++      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
++      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '9ffa1ab14738379852d10550ffdb2ee5')"
++    ]
++  }
++}
+\ No newline at end of file
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24.kt b/app/src/main/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24.kt
+index a94b0249c..a4a445399 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24.kt
+@@ -15,7 +15,7 @@ private const val TAG = "Migration_23_24"
+  * run after upgrade).
+  *
+  * Hand-written rather than an AutoMigration so the table shape is pinned in source and the
+- * `Migration_23_24_Test` can assert it directly. The `CREATE TABLE` / `CREATE INDEX`
++ * `Migration_23_24Test` can assert it directly. The `CREATE TABLE` / `CREATE INDEX`
+  * statements must match the schema Room generates from the [me.rerere.rikkahub.data.agentrun.AgentRun]
+  * `@Entity` exactly, or `runMigrationsAndValidate` fails the test.
+  */
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/agentrun/FakeAgentRunDao.kt b/app/src/test/java/me/rerere/rikkahub/data/agentrun/FakeAgentRunDao.kt
+index 10214d06d..b4f50c801 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/agentrun/FakeAgentRunDao.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/agentrun/FakeAgentRunDao.kt
+@@ -8,7 +8,7 @@ import java.util.concurrent.ConcurrentHashMap
+ /**
+  * In-memory [AgentRunDao] for JVM unit tests — no Room, no instrumentation.
+  *
+- * The real DAO is exercised by the instrumented `Migration_23_24_Test` (table shape) and
++ * The real DAO is exercised by the Robolectric `Migration_23_24Test` (table shape) and
+  * by live install testing; this fake lets the repository's Mutex serialisation,
+  * boot-recovery logic, and retention behaviour be unit-tested fast on the JVM.
+  *
+diff --git a/app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_11_12_Test.kt b/app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_11_12Test.kt
+similarity index 95%
+rename from app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_11_12_Test.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_11_12Test.kt
+index a67824e46..aa4525b7e 100644
+--- a/app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_11_12_Test.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_11_12Test.kt
+@@ -1,11 +1,11 @@
+ package me.rerere.rikkahub.data.db.migrations
+ 
++import android.app.Application
+ import android.content.ContentValues
+ import android.database.sqlite.SQLiteDatabase
+ import android.util.Log
+ import androidx.room.testing.MigrationTestHelper
+ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+-import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.platform.app.InstrumentationRegistry
+ import me.rerere.ai.core.MessageRole
+ import me.rerere.ai.core.TokenUsage
+@@ -20,11 +20,14 @@ import org.junit.Assert.assertTrue
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
+ import java.time.Instant
+ import kotlin.uuid.Uuid
+ 
+-@RunWith(AndroidJUnit4::class)
+-class Migration_11_12_Test {
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class Migration_11_12Test {
+     private val TEST_DB = "migration-test"
+ 
+     @get:Rule
+@@ -526,13 +529,17 @@ class Migration_11_12_Test {
+ 
+         // 如果超大对话被跳过，其 nodes 字段应该仍然保留原始数据
+         // 如果成功迁移，nodes 字段应该被清空为 "[]"
++        // 注意：不能直接 SELECT nodes 读出来判断——被跳过时它仍是约 2.5MB 的原始
++        // blob，读进 CursorWindow（2MB 上限）会抛 SQLiteBlobTooBigException（这正是
++        // 迁移跳过它的原因）。LENGTH() 只返回长度，不加载 blob。
+         val largeConvCursor = db.query(
+-            "SELECT nodes FROM conversationentity WHERE id = ?",
++            "SELECT LENGTH(nodes) FROM conversationentity WHERE id = ?",
+             arrayOf(largeConversationId)
+         )
+         assertTrue(largeConvCursor.moveToFirst())
+-        val largeConvNodes = largeConvCursor.getString(0)
++        val largeConvNodesLength = largeConvCursor.getInt(0)
+         largeConvCursor.close()
++        val largeConvCleared = largeConvNodesLength == 2 // "[]" 长度为 2
+ 
+         // 验证普通对话的 nodes 应该被清空
+         val normalConvCursor = db.query(
+@@ -545,8 +552,8 @@ class Migration_11_12_Test {
+         normalConvCursor.close()
+ 
+         Log.i(
+-            "Migration_11_12_Test",
+-            "Large conversation migration result: $largeNodesMigrated nodes migrated, nodes field: ${if (largeConvNodes == "[]") "cleared" else "preserved"}"
++            "Migration_11_12Test",
++            "Large conversation migration result: $largeNodesMigrated nodes migrated, nodes field: ${if (largeConvCleared) "cleared" else "preserved"} (length=$largeConvNodesLength)"
+         )
+ 
+         db.close()
+diff --git a/app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_20_21_Test.kt b/app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_20_21Test.kt
+similarity index 95%
+rename from app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_20_21_Test.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_20_21Test.kt
+index 30c3827d6..0c6da73b2 100644
+--- a/app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_20_21_Test.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_20_21Test.kt
+@@ -1,19 +1,21 @@
+ package me.rerere.rikkahub.data.db.migrations
+ 
++import android.app.Application
+ import android.content.ContentValues
+ import android.database.sqlite.SQLiteDatabase
+ import androidx.room.testing.MigrationTestHelper
+ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+-import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.platform.app.InstrumentationRegistry
+ import me.rerere.rikkahub.data.db.AppDatabase
+ import org.junit.Assert.assertEquals
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
+ 
+ /**
+- * Instrumented migration test for v20 → v21.
++ * Robolectric migration test for v20 → v21.
+  *
+  * Room handles this as an AutoMigration, so we do NOT pass the migration object to
+  * runMigrationsAndValidate. Instead we rely on the generated migration being registered
+@@ -22,8 +24,9 @@ import org.junit.runner.RunWith
+  * The post-migrate fixup (interval → cron translation) is tested by asserting the
+  * SQL UPDATE in Migration_20_21.onPostMigrate ran correctly.
+  */
+-@RunWith(AndroidJUnit4::class)
+-class Migration_20_21_Test {
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class Migration_20_21Test {
+ 
+     private val TEST_DB = "migration-20-21-test"
+ 
+diff --git a/app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24_Test.kt b/app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24Test.kt
+similarity index 93%
+rename from app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24_Test.kt
+rename to app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24Test.kt
+index 970614537..1ea9d21cb 100644
+--- a/app/src/androidTest/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24_Test.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/db/migrations/Migration_23_24Test.kt
+@@ -1,10 +1,10 @@
+ package me.rerere.rikkahub.data.db.migrations
+ 
++import android.app.Application
+ import android.content.ContentValues
+ import android.database.sqlite.SQLiteDatabase
+ import androidx.room.testing.MigrationTestHelper
+ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+-import androidx.test.ext.junit.runners.AndroidJUnit4
+ import androidx.test.platform.app.InstrumentationRegistry
+ import me.rerere.rikkahub.data.db.AppDatabase
+ import org.junit.Assert.assertEquals
+@@ -14,9 +14,11 @@ import org.junit.Assert.assertTrue
+ import org.junit.Rule
+ import org.junit.Test
+ import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
+ 
+ /**
+- * Phase 24 — instrumented migration test for v23 → v24 (`agent_runs` ledger table).
++ * Phase 24 — Robolectric migration test for v23 → v24 (`agent_runs` ledger table).
+  *
+  * Creates a v23 database with sample rows in pre-existing tables, runs [Migration_23_24],
+  * and asserts:
+@@ -25,8 +27,9 @@ import org.junit.runner.RunWith
+  *  - the migration is additive — sample rows inserted at v23 survive
+  *  - rows can be inserted into the new table after migration
+  */
+-@RunWith(AndroidJUnit4::class)
+-class Migration_23_24_Test {
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], manifest = Config.NONE, application = Application::class)
++class Migration_23_24Test {
+     private val TEST_DB = "migration-23-24-test"
+ 
+     @get:Rule
