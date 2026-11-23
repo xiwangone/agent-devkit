@@ -1,0 +1,279 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+index ece2d5c6b..7c96eae5e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+@@ -270,6 +270,29 @@ data class Settings(
+         return (s3Configs.firstOrNull() ?: s3Config).withLegacyExpanded()
+     }
+ 
++    /**
++     * 删除一个 S3 配置（保留至少一个）。
++     *
++     * @return 删除后的 Settings；删除后将无配置剩余时返回 null；id 不存在时返回原值。
++     * 删除当前生效配置时，生效配置顺延为剩余列表首个（与旧单配置槽保持同步）。
++     */
++    fun withoutS3Config(cfgId: String): Settings? {
++        if (s3Configs.isEmpty()) {
++            // 旧单配置模式：唯一配置在旧单配置槽里，删它会归零 → 拒绝；id 对不上则不做任何改动。
++            if (s3Config.id == cfgId) return null
++            return this
++        }
++        val remaining = s3Configs.filterNot { it.id == cfgId }
++        if (remaining.size == s3Configs.size) return this
++        if (remaining.isEmpty()) return null
++        val newActive = remaining.first()
++        return copy(
++            s3Configs = remaining,
++            activeS3ConfigId = newActive.id,
++            s3Config = newActive,
++        )
++    }
++
+     companion object {
+         // 构造一个用于初始化的settings, 但它不能用于保存，防止使用初始值存储
+         fun dummy() = Settings(init = true)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
+index 467241f7d..296449d05 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
+@@ -54,6 +54,7 @@ import com.dokar.sonner.ToastType
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withTimeoutOrNull
+ import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Delete01
+ import me.rerere.hugeicons.stroke.PlusSign
+ import me.rerere.hugeicons.stroke.Upload02
+ import me.rerere.rikkahub.R
+@@ -96,6 +97,7 @@ fun S3Tab(
+     var pendingPasswordError by remember { mutableStateOf<String?>(null) }
+     var isBackingUp by remember { mutableStateOf(false) }
+     var configMenuExpanded by remember { mutableStateOf(false) }
++    var showDeleteConfigConfirm by remember { mutableStateOf(false) }
+     // 备份缺口令：弹加密设置框；设好口令后自动重试备份
+     var showEncryptionDialog by remember { mutableStateOf(false) }
+     var pendingBackupRetryAfterPassword by remember { mutableStateOf(false) }
+@@ -208,6 +210,13 @@ fun S3Tab(
+         }
+     }
+ 
++    /** 删除配置（保留至少一个：删最后一个时 withoutS3Config 返回 null，不做改动）。 */
++    fun removeS3Config(cfgId: String) {
++        vm.updateSettings { current ->
++            current.withoutS3Config(cfgId) ?: current
++        }
++    }
++
+     val lastBackupText =
+         if (settings.backupReminderConfig.lastBackupTime == 0L) {
+             stringResource(R.string.backup_page_reminder_no_record)
+@@ -290,6 +299,13 @@ fun S3Tab(
+                             IconButton(onClick = { addS3Config() }) {
+                                 Icon(HugeIcons.PlusSign, contentDescription = stringResource(R.string.backup_page_add_config))
+                             }
++                            // 删除当前配置：先弹确认；仅剩一个时禁用（保留至少一个）。
++                            IconButton(
++                                onClick = { showDeleteConfigConfirm = true },
++                                enabled = allConfigs.size > 1,
++                            ) {
++                                Icon(HugeIcons.Delete01, contentDescription = stringResource(R.string.backup_page_delete_s3_config))
++                            }
+                         }
+                     },
+                 )
+@@ -635,6 +651,21 @@ fun S3Tab(
+         )
+     }
+ 
++    // 删除当前配置：与删除备份文件同一确认样式；仅剩一个时按钮已禁用，这里只作兜底。
++    RikkaDeleteConfirmDialog(
++        show = showDeleteConfigConfirm,
++        title = stringResource(R.string.backup_page_delete),
++        message = stringResource(
++            R.string.backup_delete_s3_config_confirm,
++            s3Config.displayName.ifBlank { stringResource(R.string.backup_config_unnamed) },
++        ),
++        onConfirm = {
++            showDeleteConfigConfirm = false
++            removeS3Config(s3Config.id)
++        },
++        onDismiss = { showDeleteConfigConfirm = false },
++    )
++
+     // 备份缺口令：弹加密设置框让用户设口令，设好后自动重试备份。
+     if (showEncryptionDialog) {
+         BackupEncryptionDialog(
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 2c8d7a1a8..4b135bdb5 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -353,6 +353,8 @@
+   <string name="backup_page_s3_backup">نسخ احتياطي S3</string>
+   <string name="backup_page_s3_backup_files">ملفات النسخ الاحتياطي S3</string>
+   <string name="backup_page_s3_bucket">الحاوية</string>
++  <string name="backup_page_delete_s3_config">حذف إعداد S3</string>
++  <string name="backup_delete_s3_config_confirm">هل تريد حذف إعداد S3 \"%1$s\"؟ لن تتأثر النسخ الاحتياطية المحفوظة في هذه الحاوية. لا يمكن التراجع عن هذا الإجراء.</string>
+   <string name="backup_page_s3_endpoint">نقطة النهاية</string>
+   <string name="backup_page_s3_region">المنطقة</string>
+   <string name="backup_page_s3_secret_access_key">مفتاح الوصول السري</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 15ba03192..9bc0ee127 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -230,6 +230,8 @@
+   <string name="backup_page_s3_backup">S3 備份</string>
+   <string name="backup_page_s3_backup_files">S3 備份檔案</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">刪除 S3 配置</string>
++  <string name="backup_delete_s3_config_confirm">刪除 S3 配置「%1$s」？已儲存在該 Bucket 中的備份不受影響。此操作無法復原。</string>
+   <string name="backup_page_s3_endpoint">端點</string>
+   <string name="backup_page_s3_region">區域</string>
+   <string name="backup_page_s3_secret_access_key">私密存取金鑰</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 83f8a08e4..8f8ab9006 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -234,6 +234,8 @@
+   <string name="backup_page_s3_backup">S3バックアップ</string>
+   <string name="backup_page_s3_backup_files">S3バックアップファイル</string>
+   <string name="backup_page_s3_bucket">バケット</string>
++  <string name="backup_page_delete_s3_config">S3 構成を削除</string>
++  <string name="backup_delete_s3_config_confirm">S3 構成「%1$s」を削除しますか？このバケットに保存済みのバックアップには影響しません。この操作は取り消せません。</string>
+   <string name="backup_page_s3_endpoint">エンドポイント</string>
+   <string name="backup_page_s3_region">リージョン</string>
+   <string name="backup_page_s3_secret_access_key">シークレットアクセスキー</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 0396c7a61..b8120e2a3 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -234,6 +234,8 @@
+   <string name="backup_page_s3_backup">S3 백업</string>
+   <string name="backup_page_s3_backup_files">S3 백업 파일</string>
+   <string name="backup_page_s3_bucket">버킷</string>
++  <string name="backup_page_delete_s3_config">S3 구성 삭제</string>
++  <string name="backup_delete_s3_config_confirm">S3 구성 \"%1$s\"을(를) 삭제하시겠습니까? 이 버킷에 이미 저장된 백업에는 영향을 주지 않습니다. 이 작업은 되돌릴 수 없습니다.</string>
+   <string name="backup_page_s3_endpoint">엔드포인트</string>
+   <string name="backup_page_s3_region">리전</string>
+   <string name="backup_page_s3_secret_access_key">비밀 액세스 키</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 1d2817891..234e3e451 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -234,6 +234,8 @@
+   <string name="backup_page_s3_backup">Резервное копирование S3</string>
+   <string name="backup_page_s3_backup_files">Файлы резервного копирования S3</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">Удалить профиль S3</string>
++  <string name="backup_delete_s3_config_confirm">Удалить профиль S3 «%1$s»? Резервные копии, уже сохранённые в этом Bucket, не будут затронуты. Это действие нельзя отменить.</string>
+   <string name="backup_page_s3_endpoint">Конечная точка</string>
+   <string name="backup_page_s3_region">Регион</string>
+   <string name="backup_page_s3_secret_access_key">Секретный ключ доступа</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 19aa2a081..c53eb98b2 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -373,6 +373,8 @@
+   <string name="backup_page_s3_backup_files">S3备份文件</string>
+   <string name="backup_page_s3_list_truncated">仅显示最近 1000 个备份</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">删除 S3 配置</string>
++  <string name="backup_delete_s3_config_confirm">删除 S3 配置“%1$s”？已保存在该 Bucket 中的备份不受影响。此操作无法撤销。</string>
+   <string name="backup_page_s3_endpoint">端点</string>
+   <string name="backup_page_s3_path_style">路径样式</string>
+   <string name="backup_page_s3_path_style_desc">使用 endpoint/bucket/object。关闭后使用 bucket.endpoint/object。</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 0a69a152b..f4bdd7fa5 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -373,6 +373,8 @@
+   <string name="backup_page_s3_backup_files">S3 Backup Files</string>
+   <string name="backup_page_s3_list_truncated">Only showing the most recent 1000 backups</string>
+   <string name="backup_page_s3_bucket">Bucket</string>
++  <string name="backup_page_delete_s3_config">Delete S3 profile</string>
++  <string name="backup_delete_s3_config_confirm">Delete S3 profile \"%1$s\"? Backups already stored in this bucket are not affected. This action cannot be undone.</string>
+   <string name="backup_page_s3_endpoint">Endpoint</string>
+   <string name="backup_page_s3_path_style">Path Style</string>
+   <string name="backup_page_s3_path_style_desc">Use endpoint/bucket/object. Turn off to use bucket.endpoint/object.</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/S3ConfigRemovalTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/S3ConfigRemovalTest.kt
+new file mode 100644
+index 000000000..629bf3ccd
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/S3ConfigRemovalTest.kt
+@@ -0,0 +1,78 @@
++package me.rerere.rikkahub.data.datastore
++
++import me.rerere.rikkahub.data.sync.s3.S3Config
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * S3 配置删除（Settings.withoutS3Config）的纯逻辑回归：
++ * 删当前生效配置时生效配置顺延为剩余首个；删最后一个（列表仅剩一个或旧单配置模式）
++ * 必须拒绝；不存在的 id 不做任何改动。
++ */
++class S3ConfigRemovalTest {
++
++    private fun config(id: String, name: String) = S3Config(id = id, name = name)
++
++    @Test
++    fun `deleting the active config promotes the remaining one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            s3Configs = listOf(first, second),
++            activeS3ConfigId = "b",
++            s3Config = second,
++        )
++        val result = settings.withoutS3Config("b")
++        assertEquals(listOf(first), result?.s3Configs)
++        assertEquals("a", result?.activeS3ConfigId)
++        assertEquals(first, result?.s3Config)
++    }
++
++    @Test
++    fun `deleting a non-active config keeps the active one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            s3Configs = listOf(first, second),
++            activeS3ConfigId = "a",
++            s3Config = first,
++        )
++        val result = settings.withoutS3Config("b")
++        assertEquals(listOf(first), result?.s3Configs)
++        assertEquals("a", result?.activeS3ConfigId)
++        assertEquals(first, result?.s3Config)
++    }
++
++    @Test
++    fun `deleting the only listed config is refused`() {
++        val only = config("a", "only")
++        val settings = Settings(
++            s3Configs = listOf(only),
++            activeS3ConfigId = "a",
++            s3Config = only,
++        )
++        assertNull(settings.withoutS3Config("a"))
++    }
++
++    @Test
++    fun `deleting the legacy single config is refused`() {
++        val legacy = config("legacy", "legacy")
++        val settings = Settings(s3Config = legacy)
++        assertNull(settings.withoutS3Config("legacy"))
++    }
++
++    @Test
++    fun `unknown id leaves settings unchanged`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            s3Configs = listOf(first, second),
++            activeS3ConfigId = "a",
++            s3Config = first,
++        )
++        assertEquals(settings, settings.withoutS3Config("missing"))
++        val legacySettings = Settings(s3Config = config("legacy", "legacy"))
++        assertEquals(legacySettings, legacySettings.withoutS3Config("missing"))
++    }
++}
