@@ -1,0 +1,570 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+index 83eff00f8..05bfc39b6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
++++ b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+@@ -114,6 +114,7 @@ import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesThemePage
+ import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesNotificationPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesGeneralPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingPreferencesUIPage
++import me.rerere.rikkahub.ui.pages.setting.SettingPrivacyPolicyPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingThemePage
+ import me.rerere.rikkahub.ui.pages.setting.SettingFilesPage
+ import me.rerere.rikkahub.ui.pages.setting.SettingUsagePricingPage
+@@ -562,6 +563,10 @@ class RouteActivity : ComponentActivity() {
+                                 SettingAboutPage()
+                             }
+ 
++                            entry<Screen.SettingPrivacyPolicy> {
++                                SettingPrivacyPolicyPage()
++                            }
++
+                             entry<Screen.SettingSearch> {
+                                 SettingSearchPage()
+                             }
+@@ -883,6 +888,9 @@ sealed interface Screen : NavKey {
+     @Serializable
+     data object SettingAbout : Screen
+ 
++    @Serializable
++    data object SettingPrivacyPolicy : Screen
++
+     @Serializable
+     data object SettingSearch : Screen
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt
+index c0ff0dcee..18b35ac9e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt
+@@ -19,7 +19,6 @@ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Surface
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.rememberCoroutineScope
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+@@ -34,7 +33,6 @@ import androidx.compose.ui.text.style.TextDecoration
+ import androidx.compose.ui.text.style.TextOverflow
+ import androidx.compose.ui.text.withLink
+ import androidx.compose.ui.unit.dp
+-import kotlinx.coroutines.delay
+ import kotlinx.coroutines.launch
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.Cancel01
+@@ -123,12 +121,7 @@ fun ErrorCard(
+         }
+     val linkColor = MaterialTheme.colorScheme.primary
+ 
+-    // 5 秒后自动消失
+-    LaunchedEffect(error.id) {
+-        delay(5000)
+-        onDismiss()
+-    }
+-
++    // 错误卡片不自动消失：保留到用户手动关闭或被清除，避免用户来不及读完错误内容。
+     Surface(
+         modifier = modifier.fillMaxWidth(),
+         shape = RoundedCornerShape(12.dp),
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAboutPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAboutPage.kt
+index 0b526eb66..556549a83 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAboutPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAboutPage.kt
+@@ -44,6 +44,7 @@ import me.rerere.hugeicons.stroke.Code
+ import me.rerere.hugeicons.stroke.Earth
+ import me.rerere.hugeicons.stroke.File02
+ import me.rerere.hugeicons.stroke.Github
++import me.rerere.hugeicons.stroke.Shield01
+ import me.rerere.hugeicons.stroke.SmartPhone01
+ import me.rerere.rikkahub.BuildConfig
+ import me.rerere.rikkahub.R
+@@ -223,6 +224,12 @@ fun SettingAboutPage() {
+                             supportingContent = { Text("https://github.com/xiwangone/rikkahub-agents/blob/master/LICENSE") },
+                             headlineContent = { Text(stringResource(R.string.about_page_license)) },
+                         )
++                        item(
++                            onClick = { navController.navigate(Screen.SettingPrivacyPolicy) },
++                            leadingContent = { CardGroupIcon(HugeIcons.Shield01, containerColor = containerColor, contentColor = contentColor) },
++                            supportingContent = { Text(stringResource(R.string.privacy_policy_desc)) },
++                            headlineContent = { Text(stringResource(R.string.privacy_policy_title)) },
++                        )
+                     }
+                 }
+             }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPrivacyPolicyPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPrivacyPolicyPage.kt
+new file mode 100644
+index 000000000..de03d809e
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPrivacyPolicyPage.kt
+@@ -0,0 +1,109 @@
++package me.rerere.rikkahub.ui.pages.setting
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBar
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import me.rerere.rikkahub.R
++import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.theme.CustomColors
++import me.rerere.rikkahub.utils.plus
++
++@Composable
++fun SettingPrivacyPolicyPage() {
++    val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
++    Scaffold(
++        topBar = {
++            TopAppBar(
++                title = {
++                    Text(stringResource(R.string.privacy_policy_title))
++                },
++                navigationIcon = {
++                    BackButton()
++                },
++                scrollBehavior = scrollBehavior,
++                colors = CustomColors.topBarColors,
++            )
++        },
++        modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection),
++        containerColor = CustomColors.topBarColors.containerColor,
++    ) { innerPadding ->
++        LazyColumn(
++            modifier = Modifier.fillMaxSize(),
++            contentPadding = innerPadding + PaddingValues(horizontal = 16.dp, vertical = 8.dp),
++            verticalArrangement = Arrangement.spacedBy(16.dp),
++        ) {
++            item {
++                Text(
++                    text = stringResource(R.string.privacy_policy_intro),
++                    style = MaterialTheme.typography.bodyLarge,
++                    color = MaterialTheme.colorScheme.onSurface,
++                )
++            }
++            item {
++                PrivacyPolicySection(
++                    titleRes = R.string.privacy_policy_data_title,
++                    bodyRes = R.string.privacy_policy_data_body,
++                )
++            }
++            item {
++                PrivacyPolicySection(
++                    titleRes = R.string.privacy_policy_network_title,
++                    bodyRes = R.string.privacy_policy_network_body,
++                )
++            }
++            item {
++                PrivacyPolicySection(
++                    titleRes = R.string.privacy_policy_storage_title,
++                    bodyRes = R.string.privacy_policy_storage_body,
++                )
++            }
++            item {
++                PrivacyPolicySection(
++                    titleRes = R.string.privacy_policy_permissions_title,
++                    bodyRes = R.string.privacy_policy_permissions_body,
++                )
++            }
++            item {
++                PrivacyPolicySection(
++                    titleRes = R.string.privacy_policy_source_title,
++                    bodyRes = R.string.privacy_policy_source_body,
++                )
++            }
++        }
++    }
++}
++
++@Composable
++private fun PrivacyPolicySection(
++    titleRes: Int,
++    bodyRes: Int,
++) {
++    Column(
++        modifier = Modifier.fillMaxWidth(),
++        verticalArrangement = Arrangement.spacedBy(4.dp),
++    ) {
++        Text(
++            text = stringResource(titleRes),
++            style = MaterialTheme.typography.titleMedium,
++            color = MaterialTheme.colorScheme.onSurface,
++        )
++        Text(
++            text = stringResource(bodyRes),
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++        )
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt
+index 2371eb63d..764670dcc 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingsSearchIndex.kt
+@@ -48,6 +48,13 @@ fun settingsSearchIndex(developerMode: Boolean): List<SettingsSearchEntry> {
+             route = Screen.SettingAbout,
+             searchTermsRes = listOf(R.string.about_page_title),
+         ),
++        SettingsSearchEntry(
++            titleRes = R.string.privacy_policy_title,
++            descriptionRes = R.string.privacy_policy_desc,
++            groupRes = R.string.setting_page_about,
++            route = Screen.SettingPrivacyPolicy,
++            searchTermsRes = listOf(R.string.about_page_title),
++        ),
+         SettingsSearchEntry(
+             titleRes = R.string.setting_page_preferences_theme,
+             descriptionRes = R.string.setting_page_preferences_theme_desc,
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 5b6565c40..a3ee67633 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -5,6 +5,19 @@
+   <string name="about_page_system">النظام</string>
+   <string name="about_page_title">حول</string>
+   <string name="about_page_version">الإصدار</string>
++  <string name="privacy_policy_title">سياسة الخصوصية</string>
++  <string name="privacy_policy_desc">كيف يتعامل هذا التطبيق مع بياناتك</string>
++  <string name="privacy_policy_intro">يعمل هذا التطبيق على جهازك. ليس لديه نظام حسابات ولا خادم خاص به يتلقى بياناتك.</string>
++  <string name="privacy_policy_data_title">ما البيانات التي يعالجها التطبيق</string>
++  <string name="privacy_policy_data_body">يتم حفظ المحادثات والإعدادات وبيانات اعتماد مقدمي الخدمة التي تدخلها على جهازك. لا يجمع التطبيق أي بيانات قياس عن بعد ولا يتضمن أي حزمة SDK للتحليلات أو الإبلاغ عن الأعطال.</string>
++  <string name="privacy_policy_network_title">إلى أين تُرسل البيانات</string>
++  <string name="privacy_policy_network_body">يتم إرسال محتوى المحادثات فقط إلى مقدم خدمة الذكاء الاصطناعي الذي تقوم بتكوينه، باستخدام بيانات الاعتماد التي تقدمها. كما أن ميزات الشبكة الاختيارية، مثل الوصول عن بعد والأنفاق، تتصل فقط وفقا لتكوينك.</string>
++  <string name="privacy_policy_storage_title">التخزين والحذف</string>
++  <string name="privacy_policy_storage_body">عند حذف محادثة، تتم إزالة رسائلها وفهرس البحث وملفات الدردشة من الجهاز أيضا. يتم إنشاء النسخ الاحتياطية فقط عندما تبدأها بنفسك، وتُحفظ في المكان الذي تختاره، وتكون محمية بكلمة المرور التي تحددها.</string>
++  <string name="privacy_policy_permissions_title">الأذونات والموافقات</string>
++  <string name="privacy_policy_permissions_body">تُستخدم الأذونات فقط عندما تقوم بتمكين الميزة التي تحتاج إليها. وتتطلب قراءة البيانات الحساسة على الجهاز، مثل جهات الاتصال والرسائل وسجل المكالمات، موافقتك أولا دائما.</string>
++  <string name="privacy_policy_source_title">المصدر المفتوح</string>
++  <string name="privacy_policy_source_body">الكود المصدري منشور بموجب ترخيص AGPLv3. ويمكنك التحقق من كيفية تعامل التطبيق مع بياناتك بدقة.</string>
+   <string name="add">إضافة</string>
+   <string name="app_name">Yao</string>
+   <string name="assistant_detail_basic_desc">تكوين الاسم والصورة الرمزية والنموذج والمعاملات</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index b5bbb2132..5678877d1 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -5,6 +5,19 @@
+   <string name="about_page_system">系統</string>
+   <string name="about_page_title">關於</string>
+   <string name="about_page_version">版本</string>
++  <string name="privacy_policy_title">隱私政策</string>
++  <string name="privacy_policy_desc">本應用程式如何處理您的資料</string>
++  <string name="privacy_policy_intro">本應用程式在您的裝置上執行，不設帳號，也沒有接收您資料的自有伺服器。</string>
++  <string name="privacy_policy_data_title">應用程式處理哪些資料</string>
++  <string name="privacy_policy_data_body">您輸入的對話、設定和服務商憑證都保存在您的裝置上。本應用程式不收集遙測資料，也不包含統計或當機回報 SDK。</string>
++  <string name="privacy_policy_network_title">資料傳送到哪裡</string>
++  <string name="privacy_policy_network_body">對話內容僅傳送到您自行設定的 AI 服務商，使用您提供的憑證。遠端存取、通道等可選網路功能也只按您的設定連線。</string>
++  <string name="privacy_policy_storage_title">儲存與刪除</string>
++  <string name="privacy_policy_storage_body">刪除對話會同時刪除其訊息、搜尋索引和聊天檔案。備份僅在您主動發起時建立，儲存到您選擇的位置，並以您設定的密碼保護。</string>
++  <string name="privacy_policy_permissions_title">權限與審批</string>
++  <string name="privacy_policy_permissions_body">權限僅在您啟用需要它的功能時使用。讀取通訊錄、簡訊、通話記錄等裝置敏感資料時，總會先徵得您的同意。</string>
++  <string name="privacy_policy_source_title">開源</string>
++  <string name="privacy_policy_source_body">原始碼以 AGPLv3 授權公開，您可以檢查本應用程式如何處理您的資料。</string>
+   <string name="add">添加</string>
+   <string name="app_name">Yao</string>
+   <string name="asr_button_content_description">語音辨識</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 575f4190d..f2217850b 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -5,6 +5,19 @@
+   <string name="about_page_system">システム</string>
+   <string name="about_page_title">アプリについて</string>
+   <string name="about_page_version">バージョン</string>
++  <string name="privacy_policy_title">プライバシーポリシー</string>
++  <string name="privacy_policy_desc">このアプリがあなたのデータをどのように扱うか</string>
++  <string name="privacy_policy_intro">このアプリはあなたのデバイス上で動作します。アカウントはなく、あなたのデータを受け取る自社サーバーもありません。</string>
++  <string name="privacy_policy_data_title">アプリが扱うデータ</string>
++  <string name="privacy_policy_data_body">入力した会話、設定、プロバイダーの認証情報は、あなたのデバイス上に保存されます。このアプリはテレメトリを収集せず、分析やクラッシュ報告の SDK も含みません。</string>
++  <string name="privacy_policy_network_title">データの送信先</string>
++  <string name="privacy_policy_network_body">会話の内容は、あなたが設定した AI プロバイダーにのみ、あなたが提供した認証情報を使って送信されます。リモートアクセスやトンネルなどの任意のネットワーク機能も、あなたの設定に従ってのみ接続します。</string>
++  <string name="privacy_policy_storage_title">保存と削除</string>
++  <string name="privacy_policy_storage_body">会話を削除すると、そのメッセージ、検索インデックス、チャットファイルもデバイスから削除されます。バックアップはあなたが開始したときにのみ作成され、あなたが選んだ場所に保存され、あなたが設定したパスワードで保護されます。</string>
++  <string name="privacy_policy_permissions_title">権限と承認</string>
++  <string name="privacy_policy_permissions_body">権限は、それを必要とする機能をあなたが有効にした場合にのみ使用されます。連絡先、メッセージ、通話履歴などのデバイス上の機密データの読み取りは、必ず事前にあなたの承認を求めます。</string>
++  <string name="privacy_policy_source_title">オープンソース</string>
++  <string name="privacy_policy_source_body">ソースコードは AGPLv3 ライセンスで公開されています。このアプリがあなたのデータをどのように扱うかを確認できます。</string>
+   <string name="add">追加</string>
+   <string name="app_name">Yao</string>
+   <string name="asr_button_content_description">音声認識</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 1c39b7065..707425019 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -5,6 +5,19 @@
+   <string name="about_page_system">시스템</string>
+   <string name="about_page_title">정보</string>
+   <string name="about_page_version">버전</string>
++  <string name="privacy_policy_title">개인정보 처리방침</string>
++  <string name="privacy_policy_desc">이 앱이 사용자의 데이터를 처리하는 방법</string>
++  <string name="privacy_policy_intro">이 앱은 사용자의 기기에서 실행됩니다. 계정 시스템이 없으며 사용자의 데이터를 받는 자체 서버도 없습니다.</string>
++  <string name="privacy_policy_data_title">앱이 처리하는 데이터</string>
++  <string name="privacy_policy_data_body">입력한 대화, 설정, 제공업체 인증 정보는 사용자의 기기에 저장됩니다. 이 앱은 텔레메트리를 수집하지 않으며 분석 또는 충돌 보고 SDK를 포함하지 않습니다.</string>
++  <string name="privacy_policy_network_title">데이터 전송 위치</string>
++  <string name="privacy_policy_network_body">대화 내용은 사용자가 구성한 AI 제공업체에만 사용자가 제공한 인증 정보를 사용해 전송됩니다. 원격 액세스나 터널링 같은 선택적 네트워크 기능도 사용자가 구성한 대로만 연결됩니다.</string>
++  <string name="privacy_policy_storage_title">저장 및 삭제</string>
++  <string name="privacy_policy_storage_body">대화를 삭제하면 해당 메시지, 검색 색인, 채팅 파일도 기기에서 삭제됩니다. 백업은 사용자가 시작할 때만 생성되며 사용자가 선택한 위치에 저장되고 사용자가 설정한 비밀번호로 보호됩니다.</string>
++  <string name="privacy_policy_permissions_title">권한 및 승인</string>
++  <string name="privacy_policy_permissions_body">권한은 해당 권한이 필요한 기능을 사용자가 활성화한 경우에만 사용됩니다. 연락처, 메시지, 통화 기록 등 기기의 민감한 데이터를 읽을 때는 항상 먼저 사용자의 승인을 요청합니다.</string>
++  <string name="privacy_policy_source_title">오픈 소스</string>
++  <string name="privacy_policy_source_body">소스 코드는 AGPLv3 라이선스로 공개되어 있습니다. 이 앱이 사용자의 데이터를 어떻게 처리하는지 직접 확인할 수 있습니다.</string>
+   <string name="add">추가</string>
+   <string name="app_name">Yao</string>
+   <string name="asr_button_content_description">음성 인식</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index dae6e4c37..42384c83f 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -5,6 +5,19 @@
+   <string name="about_page_system">Система</string>
+   <string name="about_page_title">О приложении</string>
+   <string name="about_page_version">Версия</string>
++  <string name="privacy_policy_title">Политика конфиденциальности</string>
++  <string name="privacy_policy_desc">Как это приложение обрабатывает ваши данные</string>
++  <string name="privacy_policy_intro">Это приложение работает на вашем устройстве. В нём нет системы учётных записей и нет собственного сервера, который получал бы ваши данные.</string>
++  <string name="privacy_policy_data_title">Какие данные обрабатывает приложение</string>
++  <string name="privacy_policy_data_body">Введённые вами беседы, настройки и учётные данные поставщиков хранятся на вашем устройстве. Приложение не собирает телеметрию и не содержит SDK аналитики или отчётов о сбоях.</string>
++  <string name="privacy_policy_network_title">Куда отправляются данные</string>
++  <string name="privacy_policy_network_body">Содержание бесед отправляется только тому поставщику ИИ, которого вы настроили, с использованием предоставленных вами учётных данных. Дополнительные сетевые функции, такие как удалённый доступ и туннелирование, подключаются только так, как вы их настроили.</string>
++  <string name="privacy_policy_storage_title">Хранение и удаление</string>
++  <string name="privacy_policy_storage_body">При удалении беседы её сообщения, поисковый индекс и файлы чата также удаляются с устройства. Резервные копии создаются только когда вы сами их запускаете, сохраняются в выбранное вами место и защищаются установленным вами паролем.</string>
++  <string name="privacy_policy_permissions_title">Разрешения и подтверждения</string>
++  <string name="privacy_policy_permissions_body">Разрешения используются только когда вы включаете функцию, которой они нужны. Чтение конфиденциальных данных на устройстве, таких как контакты, сообщения или журнал вызовов, всегда сначала запрашивает ваше подтверждение.</string>
++  <string name="privacy_policy_source_title">Открытый исходный код</string>
++  <string name="privacy_policy_source_body">Исходный код опубликован по лицензии AGPLv3. Вы можете проверить, как именно приложение обрабатывает ваши данные.</string>
+   <string name="add">Добавить</string>
+   <string name="app_name">Yao</string>
+   <string name="asr_button_content_description">Распознавание речи</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index d94ae98ed..de030bb81 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -68,6 +68,19 @@
+   <string name="about_page_system">系统</string>
+   <string name="about_page_title">关于</string>
+   <string name="about_page_version">版本</string>
++  <string name="privacy_policy_title">隐私政策</string>
++  <string name="privacy_policy_desc">本应用如何处理您的数据</string>
++  <string name="privacy_policy_intro">本应用运行在您的设备上，不设账号，也没有接收您数据的自有服务器。</string>
++  <string name="privacy_policy_data_title">应用处理哪些数据</string>
++  <string name="privacy_policy_data_body">您输入的对话、设置和服务商凭证都保存在您的设备上。本应用不收集遥测数据，也不包含统计或崩溃上报 SDK。</string>
++  <string name="privacy_policy_network_title">数据发送到哪里</string>
++  <string name="privacy_policy_network_body">对话内容仅发送到您自行配置的 AI 服务商，使用您提供的凭证。远程访问、隧道等可选网络功能也只按您的配置连接。</string>
++  <string name="privacy_policy_storage_title">存储与删除</string>
++  <string name="privacy_policy_storage_body">删除会话会同时删除其消息、搜索索引和聊天文件。备份仅在您主动发起时创建，保存到您选择的位置，并用您设置的密码保护。</string>
++  <string name="privacy_policy_permissions_title">权限与审批</string>
++  <string name="privacy_policy_permissions_body">权限仅在您启用需要它的功能时使用。读取通讯录、短信、通话记录等设备敏感数据时，总会先征得您的同意。</string>
++  <string name="privacy_policy_source_title">开源</string>
++  <string name="privacy_policy_source_body">源代码以 AGPLv3 协议公开，您可以检查本应用如何处理您的数据。</string>
+   <string name="add">添加</string>
+   <string name="app_name">Yao</string>
+   <string name="asr_button_content_description">语音识别</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 11d4d5f3c..22cf6ddda 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -68,6 +68,19 @@
+   <string name="about_page_system">System</string>
+   <string name="about_page_title">About</string>
+   <string name="about_page_version">Version</string>
++  <string name="privacy_policy_title">Privacy Policy</string>
++  <string name="privacy_policy_desc">How this app handles your data</string>
++  <string name="privacy_policy_intro">This app runs on your device. It has no account system and no first-party server that receives your data.</string>
++  <string name="privacy_policy_data_title">What data the app handles</string>
++  <string name="privacy_policy_data_body">Conversations, settings, and provider credentials you enter are stored on your device. The app collects no telemetry and includes no analytics or crash-reporting SDK.</string>
++  <string name="privacy_policy_network_title">Where your data goes</string>
++  <string name="privacy_policy_network_body">Chat content is sent only to the AI provider you configure, using the credentials you provide. Optional network features, such as remote access and tunneling, connect only as you configure them.</string>
++  <string name="privacy_policy_storage_title">Storage and deletion</string>
++  <string name="privacy_policy_storage_body">Deleting a conversation removes its messages, search index, and chat files from the device. Backups are created only when you start one, to a destination you choose, protected by a password you set.</string>
++  <string name="privacy_policy_permissions_title">Permissions and approvals</string>
++  <string name="privacy_policy_permissions_body">Permissions are used only when you enable the feature that needs them. Reading sensitive on-device data, such as contacts, messages, or call history, always asks for your approval first.</string>
++  <string name="privacy_policy_source_title">Open source</string>
++  <string name="privacy_policy_source_body">The source code is public under the AGPLv3 license. You can inspect exactly what the app does with your data.</string>
+   <string name="add">Add</string>
+   <string name="app_name">Yao</string>
+   <string name="asr_button_content_description">Speech Recognition</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/components/ui/ErrorCardPersistenceTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/ui/ErrorCardPersistenceTest.kt
+new file mode 100644
+index 000000000..983cd7b80
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/components/ui/ErrorCardPersistenceTest.kt
+@@ -0,0 +1,65 @@
++package me.rerere.rikkahub.ui.components.ui
++
++import android.app.Application
++import androidx.compose.ui.test.assertIsDisplayed
++import androidx.compose.ui.test.junit4.createComposeRule
++import androidx.compose.ui.test.onNodeWithContentDescription
++import androidx.compose.ui.test.onNodeWithText
++import androidx.compose.ui.test.performClick
++import me.rerere.rikkahub.service.ChatError
++import org.junit.Assert.assertTrue
++import org.junit.Rule
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++import org.robolectric.annotation.GraphicsMode
++
++/**
++ * 错误卡片不自动消失回归：卡片只应由用户手动关闭或被清除，不应在 5 秒后自行消失。
++ *
++ * 旧实现在 [ErrorCard] 内用 `LaunchedEffect(error.id) { delay(5000); onDismiss() }`，
++ * 用户来不及读完错误内容卡片就没了。本用例渲染卡片后把虚拟时钟推进 10 秒，
++ * 断言错误文案仍可见；再点关闭按钮，断言手动关闭仍可用。
++ *
++ * 单 @Test：RikkaHubApp.onCreate 里 startKoin，Robolectric 每个 @Test 都新建
++ * Application，拆成多个方法时后几个在 onCreate 即抛
++ * KoinApplicationAlreadyStartedException（同类情况见 ChatInputIconSizeTest）。
++ *
++ * @Config(application = Application::class) 是承重的：全量单测里别的
++ * Robolectric 测试类可能已在共享沙箱里启动过 Koin，用真实 Application
++ * 会在 onCreate 的 startKoin 处抛 KoinApplicationAlreadyStartedException
++ *（CI run 45247073462 实测：仅本用例失败，ChatInputIconSizeTest 先跑通过，
++ * 本用例 0.041 秒即在 Application 创建时抛错）。 plain Application 完全避开
++ * Koin；本用例的 ErrorCard 不碰 Koin。注意不能加 manifest = Config.NONE——
++ * 卡片组合时要读 stringResource，需要正常 manifest 提供的资源。
++ *（同款做法见 WorkspaceApplyEditsAtomicityTest 的注释。）
++ */
++@RunWith(RobolectricTestRunner::class)
++@GraphicsMode(GraphicsMode.Mode.NATIVE)
++@Config(sdk = [34], application = Application::class)
++class ErrorCardPersistenceTest {
++
++    @get:Rule
++    val composeRule = createComposeRule()
++
++    @Test
++    fun `error card stays visible after 10 seconds and dismiss button still works`() {
++        var dismissed = false
++        composeRule.setContent {
++            ErrorCard(
++                error = ChatError(error = RuntimeException("Test error message")),
++                onDismiss = { dismissed = true },
++            )
++        }
++        composeRule.onNodeWithText("Test error message").assertIsDisplayed()
++        // 推进虚拟时钟 10 秒：旧实现在 5 秒时调 onDismiss，卡片会消失
++        composeRule.mainClock.advanceTimeBy(10_000L)
++        composeRule.waitForIdle()
++        composeRule.onNodeWithText("Test error message").assertIsDisplayed()
++        // 手动关闭仍可用
++        composeRule.onNodeWithContentDescription("Dismiss error").performClick()
++        composeRule.waitForIdle()
++        assertTrue("dismiss button must still call onDismiss", dismissed)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/PrivacyPolicyTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/PrivacyPolicyTest.kt
+new file mode 100644
+index 000000000..d2943397d
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/ui/pages/setting/PrivacyPolicyTest.kt
+@@ -0,0 +1,100 @@
++package me.rerere.rikkahub.ui.pages.setting
++
++import me.rerere.rikkahub.R
++import me.rerere.rikkahub.Screen
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.File
++import javax.xml.parsers.DocumentBuilderFactory
++
++/**
++ * 隐私政策页可达性与七语言文案回归：设置搜索索引必须登记隐私政策路由，
++ * 13 条 `privacy_policy_*` 字符串必须在 7 个语言的 strings.xml 里齐全，
++ * 且占位符集合一致。
++ *
++ * 纯 JVM 测试：[settingsSearchIndex] 只拼数据类与 R 常量，不碰 Android 框架；
++ * 字符串校验直接解析源码树下的 strings.xml（Gradle 单测工作目录为模块目录，
++ * 从 user.dir 向上找 src/main/res 亦可覆盖 IDE 以工程根目录运行的情况）。
++ */
++class PrivacyPolicyTest {
++
++    @Test
++    fun `privacy policy is reachable from settings search`() {
++        val entry = settingsSearchIndex(developerMode = false)
++            .firstOrNull { it.route == Screen.SettingPrivacyPolicy }
++        assertTrue("settings search index must contain the privacy policy page", entry != null)
++        assertEquals(R.string.privacy_policy_title, entry!!.titleRes)
++    }
++
++    @Test
++    fun `privacy policy strings exist in all seven languages with matching placeholders`() {
++        val keys = listOf(
++            "privacy_policy_title",
++            "privacy_policy_desc",
++            "privacy_policy_intro",
++            "privacy_policy_data_title",
++            "privacy_policy_data_body",
++            "privacy_policy_network_title",
++            "privacy_policy_network_body",
++            "privacy_policy_storage_title",
++            "privacy_policy_storage_body",
++            "privacy_policy_permissions_title",
++            "privacy_policy_permissions_body",
++            "privacy_policy_source_title",
++            "privacy_policy_source_body",
++        )
++        val langDirs = listOf(
++            "values",
++            "values-zh",
++            "values-b+zh+Hant",
++            "values-ja",
++            "values-ko-rKR",
++            "values-ru",
++            "values-ar",
++        )
++        val resDir = findResDir()
++        val byLang = langDirs.associateWith { dir ->
++            parseStrings(File(resDir, "$dir/strings.xml"))
++        }
++        for (key in keys) {
++            val placeholderSets = byLang.mapValues { (dir, map) ->
++                val text = map[key]
++                assertTrue("$key missing in $dir/strings.xml", text != null)
++                PLACEHOLDER_REGEX.findAll(text!!).map { it.value }.toSet()
++            }
++            assertEquals(
++                "placeholder mismatch for $key: $placeholderSets",
++                1,
++                placeholderSets.values.distinct().size,
++            )
++        }
++    }
++
++    private fun findResDir(): File {
++        var dir: File? = File(System.getProperty("user.dir"))
++        while (dir != null) {
++            val candidate = File(dir, "src/main/res/values/strings.xml")
++            if (candidate.isFile) return File(dir, "src/main/res")
++            dir = dir.parentFile
++        }
++        error("cannot locate src/main/res from user.dir=${System.getProperty("user.dir")}")
++    }
++
++    private fun parseStrings(file: File): Map<String, String> {
++        val doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(file)
++        val map = mutableMapOf<String, String>()
++        val nodes = doc.getElementsByTagName("string")
++        for (i in 0 until nodes.length) {
++            val el = nodes.item(i)
++            val name = el.attributes.getNamedItem("name")?.nodeValue
++                ?: error("string without name in $file")
++            map[name] = el.textContent
++        }
++        return map
++    }
++
++    private companion object {
++        val PLACEHOLDER_REGEX = Regex("%\\d*\\$[sd]|%[sd]")
++    }
++}
