@@ -1,0 +1,1086 @@
+diff --git a/ai/src/main/java/me/rerere/ai/provider/Model.kt b/ai/src/main/java/me/rerere/ai/provider/Model.kt
+index 6839eba3a..b28cbbcb5 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/Model.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/Model.kt
+@@ -43,6 +43,7 @@ fun List<Model>.filterByKeywords(query: String): List<Model> {
+ enum class ModelType {
+     CHAT,
+     IMAGE,
++    VIDEO,
+     EMBEDDING,
+ }
+ 
+@@ -50,6 +51,7 @@ enum class ModelType {
+ enum class Modality {
+     TEXT,
+     IMAGE,
++    VIDEO,
+ }
+ 
+ @Serializable
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt
+index 4feb8e79a..26c547be0 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt
+@@ -112,9 +112,10 @@ class OpenAIProvider(
+             val shortClient = client.shortRequestClient()
+             val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+             // OpenRouter's /models returns text-output models only by default, which hides the
+-            // image-only models (FLUX, Recraft, Seedream, ...). Ask for text and image explicitly.
++            // image-only models (FLUX, Recraft, Seedream, ...) and the video-only models
++            // (Sora, Veo, ...). Ask for text, image and video explicitly.
+             val modelsUrl = if (providerSetting.baseUrl.contains("openrouter.ai")) {
+-                "${providerSetting.baseUrl}/models?output_modalities=text,image"
++                "${providerSetting.baseUrl}/models?output_modalities=text,image,video"
+             } else {
+                 "${providerSetting.baseUrl}/models"
+             }
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt
+index 1688d1f47..bff955c85 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenRouterRequestBuilder.kt
+@@ -106,6 +106,7 @@ private fun unionModalities(raw: List<String>, known: List<Modality>): List<Moda
+     buildList {
+         add(Modality.TEXT)
+         if ("image" in raw || Modality.IMAGE in known) add(Modality.IMAGE)
++        if ("video" in raw || Modality.VIDEO in known) add(Modality.VIDEO)
+     }.distinct()
+ 
+ /**
+@@ -137,7 +138,14 @@ fun openRouterModelFromJson(modelObj: JsonObject): Model? {
+     // model picker (which filters strictly by ModelType.IMAGE); others stay CHAT. Recraft's
+     // *-vector models only output SVG, which Android can't rasterize, so they're excluded
+     // from the image picker even though OpenRouter lists "image" in their output_modalities.
+-    val type = if ("image" in outMods && !isSvgOnlyImageModel(id)) ModelType.IMAGE else ModelType.CHAT
++    // Video mirrors this: a model listing "video" (and not "image") is typed VIDEO so it
++    // appears in the video picker. A model listing both keeps IMAGE and still reaches the
++    // video picker through the output-modality fallback in matchesPickerType.
++    val type = when {
++        "image" in outMods && !isSvgOnlyImageModel(id) -> ModelType.IMAGE
++        "video" in outMods -> ModelType.VIDEO
++        else -> ModelType.CHAT
++    }
+ 
+     return Model(
+         modelId = id,
+diff --git a/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt b/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
+index dbc73f50f..2f122e726 100644
+--- a/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
++++ b/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
+@@ -716,6 +716,81 @@ object ModelRegistry {
+         toolReasoningAbility()
+     }
+ 
++    // 视频生成模型：只按家族名匹配，不按提供商名一刀切。名字里带 video 但未必输出视频的
++    // 模型（如视频理解）不在这里，避免错挂；未命中的模型走表单手动设置或外置能力表。
++    private val SORA_VIDEO = defineModel {
++        tokens("sora")
++        videoOutput()
++    }
++
++    private val VEO_VIDEO = defineModel {
++        tokens("veo")
++        videoOutput()
++    }
++
++    private val KLING_VIDEO = defineModel {
++        tokens("kling")
++        videoOutput()
++    }
++
++    private val HAILUO_VIDEO = defineModel {
++        tokens("hailuo")
++        videoOutput()
++    }
++
++    private val LUMA_VIDEO = defineModel {
++        tokens("luma")
++        videoOutput()
++    }
++
++    private val RUNWAY_VIDEO = defineModel {
++        tokens("runway")
++        videoOutput()
++    }
++
++    private val PIKA_VIDEO = defineModel {
++        tokens("pika")
++        videoOutput()
++    }
++
++    private val COGVIDEO_VIDEO = defineModel {
++        tokens("cogvideo|cogvideox")
++        videoOutput()
++    }
++
++    private val VIDU_VIDEO = defineModel {
++        tokens("vidu")
++        videoOutput()
++    }
++
++    private val SEEDANCE_VIDEO = defineModel {
++        tokens("seedance")
++        videoOutput()
++    }
++
++    private val HUNYUAN_VIDEO = defineModel {
++        tokens("hunyuan", "video")
++        videoOutput()
++    }
++
++    private val MINIMAX_VIDEO = defineModel {
++        tokens("minimax", "video")
++        videoOutput()
++    }
++
++    // Wan 视频模型分两种命名：wan*-video（完整 video token）与 wan*-t2v/i2v/s2v。
++    // 分词器按字母/数字边界切分，t2v 会切成 t、2、v 三个 token，单 token 匹配不到，
++    // 所以第二种形态要拆成三个 token 的序列另写一条规则。
++    private val WAN_VIDEO = defineModel {
++        tokens("wan|wanx", "video")
++        videoOutput()
++    }
++
++    private val WAN_VIDEO_T2V = defineModel {
++        tokens("wan|wanx", "t|i|s", "2", "v")
++        videoOutput()
++    }
++
+     private val ALL_MODELS = listOf(
+         GPT4O,
+         GPT_4_1,
+@@ -830,7 +905,21 @@ object ModelRegistry {
+         LONGCAT_2,
+         MUSE_SPARK,
+         MUSE_GLIMMER,
+-        QWEN_MT
++        QWEN_MT,
++        SORA_VIDEO,
++        VEO_VIDEO,
++        KLING_VIDEO,
++        HAILUO_VIDEO,
++        LUMA_VIDEO,
++        RUNWAY_VIDEO,
++        PIKA_VIDEO,
++        COGVIDEO_VIDEO,
++        VIDU_VIDEO,
++        SEEDANCE_VIDEO,
++        HUNYUAN_VIDEO,
++        MINIMAX_VIDEO,
++        WAN_VIDEO,
++        WAN_VIDEO_T2V,
+     )
+ 
+     @Volatile
+@@ -854,28 +943,28 @@ object ModelRegistry {
+         val override = ModelCatalogBridge.overrideInputModalities(modelId)
+         if (override != null) {
+             // 外置表（人工可编辑）命中：直接采用 —— 并集只能"补"，覆盖才能"纠错"
+-            listOf(Modality.TEXT, Modality.IMAGE).filter { it in override }
++            listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO).filter { it in override }
+         } else {
+             val merged = buildSet {
+                 addAll(resolveModalities(modelId) { it.inputModalities })
+                 addAll(ModelCatalogBridge.inputModalities(modelId).orEmpty())
+                 addAll(modelsDevCatalog?.find(modelId)?.inputModalities.orEmpty())
+             }
+-            listOf(Modality.TEXT, Modality.IMAGE).filter { it in merged }
++            listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO).filter { it in merged }
+         }
+     }
+ 
+     val MODEL_OUTPUT_MODALITIES = ModelData { modelId ->
+         val override = ModelCatalogBridge.overrideOutputModalities(modelId)
+         if (override != null) {
+-            listOf(Modality.TEXT, Modality.IMAGE).filter { it in override }
++            listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO).filter { it in override }
+         } else {
+             val merged = buildSet {
+                 addAll(resolveModalities(modelId) { it.outputModalities })
+                 addAll(ModelCatalogBridge.outputModalities(modelId).orEmpty())
+                 addAll(modelsDevCatalog?.find(modelId)?.outputModalities.orEmpty())
+             }
+-            listOf(Modality.TEXT, Modality.IMAGE).filter { it in merged }
++            listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO).filter { it in merged }
+         }
+     }
+ 
+@@ -927,7 +1016,7 @@ object ModelRegistry {
+         return if (modalities.isEmpty()) {
+             listOf(Modality.TEXT)
+         } else {
+-            listOf(Modality.TEXT, Modality.IMAGE).filter { it in modalities }
++            listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO).filter { it in modalities }
+         }
+     }
+ 
+@@ -939,6 +1028,10 @@ object ModelRegistry {
+         output(Modality.TEXT, Modality.IMAGE)
+     }
+ 
++    private fun ModelDefinitionBuilder.videoOutput() {
++        output(Modality.TEXT, Modality.VIDEO)
++    }
++
+     private fun ModelDefinitionBuilder.toolAbility() {
+         ability(ModelAbility.TOOL)
+     }
+diff --git a/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt b/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt
+index 4e445e5fb..8879d9e8b 100644
+--- a/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt
++++ b/ai/src/test/java/me/rerere/ai/provider/providers/openai/OpenRouterModelParseTest.kt
+@@ -80,4 +80,44 @@ class OpenRouterModelParseTest {
+         assertTrue(Modality.IMAGE in m.outputModalities)
+         assertEquals(ModelType.IMAGE, m.type)
+     }
++
++    @Test
++    fun video_model_from_endpoint_metadata_is_typed_video() {
++        val json = """
++            {"id":"openai/sora-2","name":"Sora 2",
++             "architecture":{"input_modalities":["text"],"output_modalities":["video","text"]},
++             "supported_parameters":[]}
++        """.trimIndent()
++        val m = openRouterModelFromJson(Json.parseToJsonElement(json).jsonObject)!!
++        assertEquals(ModelType.VIDEO, m.type)
++        assertTrue(Modality.VIDEO in m.outputModalities)
++        assertTrue(Modality.IMAGE !in m.outputModalities)
++    }
++
++    @Test
++    fun `registry name match adds video output when endpoint metadata is silent`() {
++        // 端点只给了 text，但注册表按名字认出 veo 是视频家族：类型仍是 CHAT（类型只认端点
++        // 元数据），输出模态里补上 VIDEO，选择器兜底会把它放进视频选择器。
++        val json = """
++            {"id":"google/veo-3.1","name":"Veo 3.1",
++             "architecture":{"input_modalities":["text"],"output_modalities":["text"]},
++             "supported_parameters":[]}
++        """.trimIndent()
++        val m = openRouterModelFromJson(Json.parseToJsonElement(json).jsonObject)!!
++        assertEquals(ModelType.CHAT, m.type)
++        assertTrue(Modality.VIDEO in m.outputModalities)
++    }
++
++    @Test
++    fun dual_image_video_model_keeps_image_type_but_lists_video_output() {
++        val json = """
++            {"id":"acme/omni-gen","name":"Omni Gen",
++             "architecture":{"input_modalities":["text"],"output_modalities":["image","video","text"]},
++             "supported_parameters":[]}
++        """.trimIndent()
++        val m = openRouterModelFromJson(Json.parseToJsonElement(json).jsonObject)!!
++        assertEquals(ModelType.IMAGE, m.type)
++        assertTrue(Modality.IMAGE in m.outputModalities)
++        assertTrue(Modality.VIDEO in m.outputModalities)
++    }
+ }
+diff --git a/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt b/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
+index 5b4eb6fe7..a90b94f65 100644
+--- a/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
++++ b/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
+@@ -201,6 +201,34 @@ class ModelRegistryTest {
+         assertEquals(toolReasoning, ModelRegistry.MODEL_ABILITIES.getData("mimo-v2-pro"))
+     }
+ 
++    @Test
++    fun testVideoModels() {
++        installEmptyCatalog()
++        val videoOutput = listOf(Modality.TEXT, Modality.VIDEO)
++        // 主流视频家族：按名字匹配到 VIDEO 输出
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("openai/sora-2"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("openai/sora-2-pro"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("google/veo-3.1"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("klingai/kling-v2.1-master"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("minimax/hailuo-02"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("luma/ray-2"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("doubao-seedance-1-0-pro-250528"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("hunyuan-video"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("minimax-video-01"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("wan3.0-video"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("wan2.6-t2v"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("wanx2.1-i2v-plus"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("cogvideox-5b"))
++        // 文本同门不挂视频：混元文本模型、MiniMax 文本模型
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("hunyuan-a13b"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("minimax-m2.5"))
++        // 图像同门不挂视频：Wan 图像模型、Seedream 图像模型
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("wan2.7-image"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("doubao-seedream-4-0-250828"))
++        // 视频模型不带工具/推理能力
++        assertEquals(emptyList<ModelAbility>(), ModelRegistry.MODEL_ABILITIES.getData("openai/sora-2"))
++    }
++
+     /** 把外部目录的来源换成空实现，供用例在 finally 里还原全局单例。 */
+     private fun installEmptyCatalog() {
+         ModelCatalogBridge.install(
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/grok/GrokProvider.kt b/app/src/main/java/me/rerere/rikkahub/data/grok/GrokProvider.kt
+index 313224b56..0309d9796 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/grok/GrokProvider.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/grok/GrokProvider.kt
+@@ -70,6 +70,7 @@ class GrokProvider(
+                 // image-generation picker (which filters strictly by ModelType.IMAGE), the same
+                 // way an image-capable OpenRouter model does. Classified by name off the live
+                 // list, so new Imagine image releases surface automatically with no pinned list.
++                // Video mirrors this: Imagine video models are tagged ModelType.VIDEO.
+                 if (isGrokImageModel(id)) {
+                     Model(
+                         modelId = id,
+@@ -78,6 +79,14 @@ class GrokProvider(
+                         inputModalities = listOf(Modality.TEXT),
+                         outputModalities = listOf(Modality.IMAGE),
+                     )
++                } else if (isGrokVideoModel(id)) {
++                    Model(
++                        modelId = id,
++                        displayName = id,
++                        type = ModelType.VIDEO,
++                        inputModalities = listOf(Modality.TEXT),
++                        outputModalities = listOf(Modality.VIDEO),
++                    )
+                 } else {
+                     Model(
+                         modelId = id,
+@@ -263,6 +272,8 @@ class GrokProvider(
+ // substring, so the video-generation models are naturally excluded.
+ internal fun isGrokImageModel(id: String): Boolean = id.contains("image", ignoreCase = true)
+ 
++internal fun isGrokVideoModel(id: String): Boolean = id.contains("video", ignoreCase = true)
++
+ internal fun grokImageAspectRatio(ratio: ImageAspectRatio): String = when (ratio) {
+     ImageAspectRatio.SQUARE -> "1:1"
+     ImageAspectRatio.LANDSCAPE -> "16:9"
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporter.kt b/app/src/main/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporter.kt
+index 4c644a0f2..555a82f05 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporter.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporter.kt
+@@ -240,6 +240,7 @@ object ChatboxImporter {
+                 displayName = model["nickname"]?.asString?.takeIf { it.isNotBlank() } ?: modelId,
+                 type = when (model["type"]?.asString?.lowercase()) {
+                     "image" -> ModelType.IMAGE
++                    "video" -> ModelType.VIDEO
+                     "embedding", "embeddings" -> ModelType.EMBEDDING
+                     else -> ModelType.CHAT
+                 },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt
+index 711192273..7ba30715d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ModelList.kt
+@@ -83,6 +83,7 @@ import me.rerere.hugeicons.stroke.Image03
+ import me.rerere.hugeicons.stroke.Search01
+ import me.rerere.hugeicons.stroke.Text
+ import me.rerere.hugeicons.stroke.Tools
++import me.rerere.hugeicons.stroke.Video01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.data.datastore.DEFAULT_AUTO_MODEL_ID
+@@ -105,10 +106,12 @@ import kotlin.uuid.Uuid
+ 
+ // The image-generation picker should surface any model that can OUTPUT images, not only ones
+ // explicitly typed IMAGE: a model added before its type was known, or one the user tagged with an
+-// image output modality by hand, still belongs there. Chat/embedding pickers stay an exact match.
++// image output modality by hand, still belongs there. The video picker mirrors this.
++// Chat/embedding pickers stay an exact match.
+ internal fun Model.matchesPickerType(pickerType: ModelType): Boolean =
+     type == pickerType ||
+-        (pickerType == ModelType.IMAGE && Modality.IMAGE in outputModalities)
++        (pickerType == ModelType.IMAGE && Modality.IMAGE in outputModalities) ||
++        (pickerType == ModelType.VIDEO && Modality.VIDEO in outputModalities)
+ 
+ class ModelListState internal constructor(
+     modelId: Uuid?,
+@@ -957,6 +960,7 @@ fun ModelTypeTag(model: Model) {
+                         ModelType.CHAT -> R.string.setting_provider_page_chat_model
+                         ModelType.EMBEDDING -> R.string.setting_provider_page_embedding_model
+                         ModelType.IMAGE -> R.string.setting_provider_page_image_model
++                        ModelType.VIDEO -> R.string.setting_provider_page_video_model
+                     },
+                 ),
+         )
+@@ -974,6 +978,7 @@ fun ModelModalityTag(model: Model) {
+                     when (modality) {
+                         Modality.TEXT -> HugeIcons.Text
+                         Modality.IMAGE -> HugeIcons.Image03
++                        Modality.VIDEO -> HugeIcons.Video01
+                     },
+                 contentDescription = null,
+                 modifier =
+@@ -993,6 +998,7 @@ fun ModelModalityTag(model: Model) {
+                     when (modality) {
+                         Modality.TEXT -> HugeIcons.Text
+                         Modality.IMAGE -> HugeIcons.Image03
++                        Modality.VIDEO -> HugeIcons.Video01
+                     },
+                 contentDescription = null,
+                 modifier =
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
+index c1c2145e9..0f4986a36 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingProviderModelForm.kt
+@@ -705,6 +705,7 @@ private fun ModelTypeSelector(
+                         ModelType.CHAT -> R.string.setting_provider_page_chat_model
+                         ModelType.EMBEDDING -> R.string.setting_provider_page_embedding_model
+                         ModelType.IMAGE -> R.string.setting_provider_page_image_model
++                        ModelType.VIDEO -> R.string.setting_provider_page_video_model
+                     },
+                 ),
+             selected = selected,
+@@ -738,6 +739,7 @@ private fun ModelModalitySelector(
+                         when (modality) {
+                             Modality.TEXT -> R.string.setting_provider_page_text
+                             Modality.IMAGE -> R.string.setting_provider_page_image
++                            Modality.VIDEO -> R.string.video
+                         },
+                     ),
+                 selected = selected,
+@@ -762,6 +764,7 @@ private fun ModelModalitySelector(
+                         when (modality) {
+                             Modality.TEXT -> R.string.setting_provider_page_text
+                             Modality.IMAGE -> R.string.setting_provider_page_image
++                            Modality.VIDEO -> R.string.video
+                         },
+                     ),
+                 selected = selected,
+@@ -830,13 +833,23 @@ fun ModalAbilitySelector(
+     }
+ }
+ 
++/**
++ * 没有端点元数据时用注册表（名字匹配）补能力。名字匹配认不出小厂模型时，文本模型默认勾上
++ * 工具与推理：厂商侧能力通常已开，只是名字对不上登记表；用户在表单里确认或取消即可。
++ * 只影响新添加的模型（添加流程与选择器标签展示调用这里），已存模型编辑时不走这里。
++ */
+ private fun Model.enrichCapabilities(): Model =
+     if (supportedParameters.isNotEmpty()) {
+         this
+     } else {
++        val abilities = ModelRegistry.MODEL_ABILITIES.getData(modelId)
+         copy(
+             inputModalities = ModelRegistry.MODEL_INPUT_MODALITIES.getData(modelId),
+             outputModalities = ModelRegistry.MODEL_OUTPUT_MODALITIES.getData(modelId),
+-            abilities = ModelRegistry.MODEL_ABILITIES.getData(modelId),
++            abilities = if (abilities.isEmpty() && type == ModelType.CHAT) {
++                listOf(ModelAbility.TOOL, ModelAbility.REASONING)
++            } else {
++                abilities
++            },
+         )
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/MediaGenerationProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/MediaGenerationProviderConfigure.kt
+index 81617f2d5..a806a182b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/MediaGenerationProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/MediaGenerationProviderConfigure.kt
+@@ -571,6 +571,8 @@ internal fun presetMediaModelsFor(setting: MediaGenerationProviderSetting): List
+                 MediaGenerationModel("flux-dev", MediaKind.IMAGE, "FLUX.1 Dev"),
+                 MediaGenerationModel("flux-schnell", MediaKind.IMAGE, "FLUX.1 Schnell"),
+                 MediaGenerationModel("kolors", MediaKind.IMAGE, "Kolors"),
++                MediaGenerationModel("sora-2", MediaKind.VIDEO, "Sora 2"),
++                MediaGenerationModel("sora-2-pro", MediaKind.VIDEO, "Sora 2 Pro"),
+             )
+ 
+         is MediaGenerationProviderSetting.Aliyun ->
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index e7150373d..723e256e6 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -1103,6 +1103,7 @@
+   <string name="setting_provider_page_filter_placeholder">أدخل اسم النموذج للتصفية</string>
+   <string name="setting_provider_page_image">صورة</string>
+   <string name="setting_provider_page_image_model">صورة</string>
++  <string name="setting_provider_page_video_model">فيديو</string>
+   <string name="setting_provider_page_image_qr_decode_failed">فشل تحليل رمز QR من الصورة: %s</string>
+   <string name="setting_provider_page_import_dialog_message">من فضلك اختر طريقة الاستيراد:</string>
+   <string name="setting_provider_page_import_dialog_title">استيراد تكوين المزوّد</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 782749a7a..143e6c505 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -1067,6 +1067,7 @@
+   <string name="setting_provider_page_filter_placeholder">輸入模型名稱篩選</string>
+   <string name="setting_provider_page_image">圖片</string>
+   <string name="setting_provider_page_image_model">圖像</string>
++  <string name="setting_provider_page_video_model">影片</string>
+   <string name="setting_provider_page_image_qr_decode_failed">解析圖片中的二維碼失敗：%s</string>
+   <string name="setting_provider_page_import_dialog_message">請選擇匯入方式：</string>
+   <string name="setting_provider_page_import_dialog_title">匯入供應商配置</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 605e08151..70f6de315 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -1065,6 +1065,7 @@
+   <string name="setting_provider_page_filter_placeholder">モデル名を入力してフィルタ</string>
+   <string name="setting_provider_page_image">画像</string>
+   <string name="setting_provider_page_image_model">画像</string>
++  <string name="setting_provider_page_video_model">動画</string>
+   <string name="setting_provider_page_image_qr_decode_failed">画像からのQRコード解析に失敗しました：%s</string>
+   <string name="setting_provider_page_import_dialog_message">インポート方法を選択してください：</string>
+   <string name="setting_provider_page_import_dialog_title">プロバイダー設定をインポート</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index ee0129f7e..e5d9fb3ef 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -1065,6 +1065,7 @@
+   <string name="setting_provider_page_filter_placeholder">모델 이름 입력하여 필터링</string>
+   <string name="setting_provider_page_image">이미지</string>
+   <string name="setting_provider_page_image_model">이미지</string>
++  <string name="setting_provider_page_video_model">동영상</string>
+   <string name="setting_provider_page_image_qr_decode_failed">이미지에서 QR 코드 파싱 실패: %s</string>
+   <string name="setting_provider_page_import_dialog_message">가져오기 방법을 선택하세요:</string>
+   <string name="setting_provider_page_import_dialog_title">제공업체 구성 가져오기</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 402f09146..7e03178c0 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -1060,6 +1060,7 @@
+   <string name="setting_provider_page_filter_placeholder">Введите название модели для фильтрации</string>
+   <string name="setting_provider_page_image">Изображение</string>
+   <string name="setting_provider_page_image_model">Изображение</string>
++  <string name="setting_provider_page_video_model">Видео</string>
+   <string name="setting_provider_page_image_qr_decode_failed">Не удалось распознать QR-код с изображения: %s</string>
+   <string name="setting_provider_page_import_dialog_message">Выберите способ импорта:</string>
+   <string name="setting_provider_page_import_dialog_title">Импортировать конфигурацию поставщика</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 376acc2be..c8203ab32 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1263,6 +1263,7 @@
+   <string name="setting_provider_page_filter_placeholder">输入模型名称筛选</string>
+   <string name="setting_provider_page_image">图片</string>
+   <string name="setting_provider_page_image_model">图像</string>
++  <string name="setting_provider_page_video_model">视频</string>
+   <string name="setting_provider_page_image_qr_decode_failed">解析图片中的二维码失败：%s</string>
+   <string name="setting_provider_page_import_dialog_message">请选择导入方式：</string>
+   <string name="setting_provider_page_import_dialog_title">导入供应商配置</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index e255fe7af..4291ad256 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1309,6 +1309,7 @@
+   <string name="setting_provider_page_filter_placeholder">Enter model name to filter</string>
+   <string name="setting_provider_page_image">Image</string>
+   <string name="setting_provider_page_image_model">Image</string>
++  <string name="setting_provider_page_video_model">Video</string>
+   <string name="setting_provider_page_image_qr_decode_failed">Failed to parse QR code from image: %s</string>
+   <string name="setting_provider_page_import_dialog_message">Please select import method:</string>
+   <string name="setting_provider_page_import_dialog_title">Import Provider Configuration</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/grok/GrokProviderTest.kt b/app/src/test/java/me/rerere/rikkahub/data/grok/GrokProviderTest.kt
+new file mode 100644
+index 000000000..9cb1befe4
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/grok/GrokProviderTest.kt
+@@ -0,0 +1,20 @@
++package me.rerere.rikkahub.data.grok
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class GrokProviderTest {
++    @Test
++    fun `video model ids are detected`() {
++        assertTrue(isGrokVideoModel("grok-imagine-video"))
++        assertTrue(isGrokVideoModel("GROK-VIDEO-1"))
++    }
++
++    @Test
++    fun `non-video model ids are not video`() {
++        assertFalse(isGrokVideoModel("grok-imagine"))
++        assertFalse(isGrokVideoModel("grok-image"))
++        assertFalse(isGrokVideoModel("grok-4"))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporterTest.kt b/app/src/test/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporterTest.kt
+index ba8d9004a..4b3ca642f 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporterTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/sync/importer/ChatboxImporterTest.kt
+@@ -1,6 +1,8 @@
+ package me.rerere.rikkahub.data.sync.importer
+ 
+ import kotlinx.coroutines.runBlocking
++import me.rerere.ai.provider.ModelType
++import me.rerere.ai.provider.ProviderSetting
+ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.rikkahub.data.model.Conversation
+ import org.junit.Assert.assertArrayEquals
+@@ -56,6 +58,10 @@ class ChatboxImporterTest {
+                         "modelId": "deepseek-test",
+                         "nickname": "DeepSeek Test",
+                         "capabilities": ["vision", "tool_use", "reasoning"]
++                      }, {
++                        "modelId": "sora-2-test",
++                        "nickname": "Sora 2 Test",
++                        "type": "video"
+                       }]
+                     }
+                   }
+@@ -114,6 +120,11 @@ class ChatboxImporterTest {
+         assertEquals(0, result.skippedImageParts)
+         assertArrayEquals(imageBytes, savedImage?.bytes)
+ 
++        // type 字段映射：video 模型进 VIDEO，缺省进 CHAT
++        val openAI = result.providers.single() as ProviderSetting.OpenAI
++        assertEquals(ModelType.VIDEO, openAI.models.single { it.modelId == "sora-2-test" }.type)
++        assertEquals(ModelType.CHAT, openAI.models.single { it.modelId == "deepseek-test" }.type)
++
+         val conversation = assertNotNull(importedConversation).let { importedConversation!! }
+         assertEquals("Thread title", conversation.title)
+         assertEquals("Be helpful", conversation.customSystemPrompt)
+diff --git a/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationCapabilities.kt b/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationCapabilities.kt
+index 8d1a962c8..53eb5d458 100644
+--- a/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationCapabilities.kt
++++ b/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationCapabilities.kt
+@@ -57,7 +57,7 @@ fun MediaGenerationProviderSetting.capabilities(kind: MediaKind): MediaGeneratio
+     when (this) {
+         is MediaGenerationProviderSetting.OpenAI -> when (kind) {
+             MediaKind.IMAGE -> OPENAI_IMAGE
+-            MediaKind.VIDEO -> null
++            MediaKind.VIDEO -> OPENAI_VIDEO
+         }
+ 
+         is MediaGenerationProviderSetting.Aliyun -> when (kind) {
+@@ -91,6 +91,19 @@ private val OPENAI_IMAGE = MediaGenerationCapabilities(
+     requiresPrompt = true,
+ )
+ 
++// OpenAI 兼容的视频接口（Sora 协议，POST /videos + 轮询）：文生视频为主，时长、清晰度、
++// 画幅与种子由服务端给默认值；图片输入暂不支持，带图生成的模型走 Aliyun / Volcengine / MiniMax。
++private val OPENAI_VIDEO = MediaGenerationCapabilities(
++    parameters = setOf(
++        MediaGenerationParameter.RESOLUTION,
++        MediaGenerationParameter.ASPECT_RATIO,
++        MediaGenerationParameter.DURATION,
++        MediaGenerationParameter.SEED,
++    ),
++    imageRoles = emptySet(),
++    requiresPrompt = true,
++)
++
+ private val ALIYUN_IMAGE = MediaGenerationCapabilities(
+     parameters = setOf(
+         MediaGenerationParameter.COUNT,
+diff --git a/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationProviderSetting.kt b/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationProviderSetting.kt
+index 604c9a2a0..2316a2c5e 100644
+--- a/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationProviderSetting.kt
++++ b/mediagen/src/main/java/me/rerere/mediagen/provider/MediaGenerationProviderSetting.kt
+@@ -52,10 +52,15 @@ sealed class MediaGenerationProviderSetting {
+         override val baseUrl: String = "https://api.openai.com/v1",
+         override val models: List<MediaGenerationModel> = listOf(
+             MediaGenerationModel(modelId = "gpt-image-2", kind = MediaKind.IMAGE),
++            MediaGenerationModel(modelId = "sora-2", kind = MediaKind.VIDEO),
++            MediaGenerationModel(modelId = "sora-2-pro", kind = MediaKind.VIDEO),
+         ),
+     ) : MediaGenerationProviderSetting() {
+         override val supportedKinds: Set<MediaKind>
+-            get() = setOf(MediaKind.IMAGE)
++            get() = setOf(MediaKind.IMAGE, MediaKind.VIDEO)
++
++        // 视频完成态地址是同源的 /videos/{id}/content，下载时要带 API Key
++        override fun downloadHeaders(url: String): Map<String, String> = sameOriginBearer(url)
+ 
+         override fun copyProvider(
+             id: Uuid,
+diff --git a/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProvider.kt b/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProvider.kt
+index 2a4fe2bb4..bb3c8873a 100644
+--- a/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProvider.kt
++++ b/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProvider.kt
+@@ -14,6 +14,7 @@ import me.rerere.mediagen.model.MediaGenerationRequest
+ import me.rerere.mediagen.model.MediaGenerationStatus
+ import me.rerere.mediagen.model.MediaGenerationTask
+ import me.rerere.mediagen.model.MediaGenerationUsage
++import me.rerere.mediagen.model.MediaKind
+ import me.rerere.mediagen.provider.MediaGenerationProvider
+ import me.rerere.mediagen.provider.MediaGenerationProviderSetting
+ import me.rerere.mediagen.provider.providers.executeJson
+@@ -33,18 +34,41 @@ import kotlin.io.encoding.Base64
+ import kotlin.uuid.Uuid
+ 
+ /**
+- * 目前只实现了图像：接口同步返回结果，[create] 直接得到终态任务。请求里带图片输入时走编辑接口，否则走生成接口。
++ * 图像接口同步返回结果，[create] 直接得到终态任务；视频是 Sora 协议的异步任务，
++ * 提交后轮询 [query] 到完成。请求里带图片输入时图像走编辑接口，否则走生成接口。
+  */
+ class OpenAIMediaGenerationProvider(
+     private val client: OkHttpClient,
+ ) : MediaGenerationProvider<MediaGenerationProviderSetting.OpenAI> {
+     override val id: String = PROVIDER_ID
+ 
++    private val video = OpenAIVideoGeneration(client)
++
+     override suspend fun create(
+         setting: MediaGenerationProviderSetting.OpenAI,
+         model: MediaGenerationModel,
+         request: MediaGenerationRequest,
+     ): Result<MediaGenerationTask> = runCatching {
++        when (model.kind) {
++            MediaKind.IMAGE -> createImage(setting, model, request)
++            MediaKind.VIDEO -> video.create(setting, model, request)
++        }
++    }
++
++    override suspend fun query(
++        setting: MediaGenerationProviderSetting.OpenAI,
++        model: MediaGenerationModel,
++        taskId: String,
++    ): Result<MediaGenerationTask> = when (model.kind) {
++        MediaKind.IMAGE -> super.query(setting, model, taskId)
++        MediaKind.VIDEO -> runCatching { video.query(setting, model, taskId) }
++    }
++
++    private suspend fun createImage(
++        setting: MediaGenerationProviderSetting.OpenAI,
++        model: MediaGenerationModel,
++        request: MediaGenerationRequest,
++    ): MediaGenerationTask {
+         val baseUrl = setting.baseUrl.trimEnd('/')
+         val builder = Request.Builder().addHeader("Authorization", "Bearer ${setting.apiKey}")
+         val httpRequest = if (request.inputs.isEmpty()) {
+@@ -52,7 +76,7 @@ class OpenAIMediaGenerationProvider(
+         } else {
+             builder.url("$baseUrl/images/edits").post(buildEditBody(setting, model, request))
+         }.build()
+-        parseTask(client.executeJson(httpRequest, id), model.modelId)
++        return parseTask(client.executeJson(httpRequest, id), model.modelId)
+     }
+ 
+     internal fun buildGenerationBody(
+@@ -159,7 +183,7 @@ class OpenAIMediaGenerationProvider(
+         return host == "x.ai" || host?.endsWith(".x.ai") == true || model.modelId.contains("grok", ignoreCase = true)
+     }
+ 
+-    private companion object {
++    internal companion object {
+         const val PROVIDER_ID = "openai"
+         val EDIT_IMAGE_MEDIA_TYPES = mapOf(
+             "png" to "image/png",
+diff --git a/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIVideoGeneration.kt b/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIVideoGeneration.kt
+new file mode 100644
+index 000000000..1360cd554
+--- /dev/null
++++ b/mediagen/src/main/java/me/rerere/mediagen/provider/providers/openai/OpenAIVideoGeneration.kt
+@@ -0,0 +1,127 @@
++package me.rerere.mediagen.provider.providers.openai
++
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.JsonPrimitive
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.contentOrNull
++import kotlinx.serialization.json.put
++import me.rerere.mediagen.model.MediaGenerationError
++import me.rerere.mediagen.model.MediaGenerationModel
++import me.rerere.mediagen.model.MediaGenerationOutput
++import me.rerere.mediagen.model.MediaGenerationRequest
++import me.rerere.mediagen.model.MediaGenerationStatus
++import me.rerere.mediagen.model.MediaGenerationTask
++import me.rerere.mediagen.provider.MediaGenerationProviderSetting
++import me.rerere.mediagen.provider.providers.bearerRequest
++import me.rerere.mediagen.provider.providers.executeJson
++import me.rerere.mediagen.provider.providers.long
++import me.rerere.mediagen.provider.providers.postJson
++import me.rerere.mediagen.provider.providers.string
++import okhttp3.OkHttpClient
++
++/**
++ * OpenAI 兼容的视频接口（Sora 协议）：提交后得到任务 ID，轮询到 `completed` 再从
++ * `{baseUrl}/videos/{id}/content` 取视频字节。完成态地址与 baseUrl 同源，下载时要带
++ * [MediaGenerationProviderSetting.downloadHeaders]。
++ */
++internal class OpenAIVideoGeneration(
++    private val client: OkHttpClient,
++) {
++    private val id = OpenAIMediaGenerationProvider.PROVIDER_ID
++
++    suspend fun create(
++        setting: MediaGenerationProviderSetting.OpenAI,
++        model: MediaGenerationModel,
++        request: MediaGenerationRequest,
++    ): MediaGenerationTask {
++        val baseUrl = setting.baseUrl.trimEnd('/')
++        val httpRequest = bearerRequest("$baseUrl/videos", setting.apiKey)
++            .postJson(buildCreateBody(model, request))
++            .build()
++        return parseTask(setting, client.executeJson(httpRequest, id), model.modelId)
++    }
++
++    suspend fun query(
++        setting: MediaGenerationProviderSetting.OpenAI,
++        model: MediaGenerationModel,
++        taskId: String,
++    ): MediaGenerationTask {
++        val baseUrl = setting.baseUrl.trimEnd('/')
++        val httpRequest = bearerRequest("$baseUrl/videos/$taskId", setting.apiKey).get().build()
++        return parseTask(setting, client.executeJson(httpRequest, id), model.modelId)
++    }
++
++    internal fun buildCreateBody(
++        model: MediaGenerationModel,
++        request: MediaGenerationRequest,
++    ): JsonObject = buildJsonObject {
++        val prompt = requireNotNull(request.prompt?.takeIf(String::isNotBlank)) {
++            "OpenAI video generation requires a non-empty prompt"
++        }
++        request.extraParameters.forEach { (key, value) -> put(key, value) }
++        put("model", model.modelId)
++        put("prompt", prompt)
++        // Sora 兼容端点用 mode 区分生成方式：agnes 2.5 系列是 text / keyframe / reference，
++        // 文生视频为 text。本适配器目前只做文生视频。
++        put("mode", "text")
++        // durationSeconds 为 -1 时交给模型决定，不发字段；Sora 协议里 seconds 是字符串档位
++        request.durationSeconds?.takeIf { it >= 0 }?.let { put("seconds", it.toString()) }
++        request.resolution?.takeIf(String::isNotBlank)?.let { put("size", it) }
++        request.aspectRatio?.takeIf(String::isNotBlank)?.let { put("aspect_ratio", it) }
++        request.seed?.let { put("seed", it) }
++        require(request.count == null || request.count == 1) { "OpenAI generates one video per job" }
++        require(request.inputs.isEmpty()) { "OpenAI video generation does not support image inputs yet" }
++        require(request.generateAudio == null) { "OpenAI video generation does not expose generateAudio" }
++        require(request.watermark == null) { "OpenAI video generation does not expose watermark" }
++        require(request.promptEnhancement == null) {
++            "OpenAI video generation does not expose prompt enhancement"
++        }
++        require(request.callbackUrl == null) { "OpenAI video generation does not expose callbackUrl" }
++    }
++
++    internal fun parseTask(
++        setting: MediaGenerationProviderSetting.OpenAI,
++        root: JsonObject,
++        fallbackModel: String? = null,
++    ): MediaGenerationTask {
++        val baseUrl = setting.baseUrl.trimEnd('/')
++        // Sora 协议返回 id；agnes 2.5 系列也可能只给 video_id / task_id
++        val taskId = root.string("id") ?: root.string("video_id") ?: root.string("task_id")
++            ?: error("OpenAI response does not contain id")
++        val status = mapStatus(root.string("status"))
++        val errorMessage = when (val failure = root["error"]) {
++            is JsonObject -> failure.string("message")
++            is JsonPrimitive -> failure.contentOrNull
++            else -> null
++        }
++        return MediaGenerationTask(
++            id = taskId,
++            provider = id,
++            model = fallbackModel,
++            status = status,
++            outputs = if (status == MediaGenerationStatus.SUCCEEDED) {
++                listOf(
++                    MediaGenerationOutput(
++                        url = "$baseUrl/videos/$taskId/content",
++                        mimeType = "video/mp4",
++                    ),
++                )
++            } else {
++                emptyList()
++            },
++            error = errorMessage?.let { MediaGenerationError(message = it) },
++            createdAtEpochSeconds = root.long("created_at"),
++            metadata = root,
++        )
++    }
++
++    private fun mapStatus(status: String?): MediaGenerationStatus = when (status?.lowercase()) {
++        "queued", "pending" -> MediaGenerationStatus.QUEUED
++        "in_progress" -> MediaGenerationStatus.RUNNING
++        "completed" -> MediaGenerationStatus.SUCCEEDED
++        "failed" -> MediaGenerationStatus.FAILED
++        "cancelled", "canceled" -> MediaGenerationStatus.CANCELLED
++        "expired" -> MediaGenerationStatus.EXPIRED
++        else -> MediaGenerationStatus.UNKNOWN
++    }
++}
+diff --git a/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationCapabilitiesTest.kt b/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationCapabilitiesTest.kt
+index 6df5a41f3..1b17d6e10 100644
+--- a/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationCapabilitiesTest.kt
++++ b/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationCapabilitiesTest.kt
+@@ -7,6 +7,7 @@ import me.rerere.mediagen.provider.providers.aliyun.AliyunImageGeneration
+ import me.rerere.mediagen.provider.providers.aliyun.AliyunVideoGeneration
+ import me.rerere.mediagen.provider.providers.minimax.MiniMaxMediaGenerationProvider
+ import me.rerere.mediagen.provider.providers.openai.OpenAIMediaGenerationProvider
++import me.rerere.mediagen.provider.providers.openai.OpenAIVideoGeneration
+ import me.rerere.mediagen.provider.providers.openrouter.OpenRouterImageGeneration
+ import me.rerere.mediagen.provider.providers.openrouter.OpenRouterVideoGeneration
+ import me.rerere.mediagen.provider.providers.volcengine.VolcengineImageGeneration
+@@ -33,8 +34,13 @@ class MediaGenerationCapabilitiesTest {
+     private fun buildBody(setting: MediaGenerationProviderSetting, kind: MediaKind, request: MediaGenerationRequest) {
+         val model = MediaGenerationModel(modelId = "model", kind = kind)
+         when (setting) {
+-            is MediaGenerationProviderSetting.OpenAI ->
+-                OpenAIMediaGenerationProvider(client).buildGenerationBody(setting, model, request)
++            is MediaGenerationProviderSetting.OpenAI -> when (kind) {
++                MediaKind.IMAGE ->
++                    OpenAIMediaGenerationProvider(client).buildGenerationBody(setting, model, request)
++
++                MediaKind.VIDEO ->
++                    OpenAIVideoGeneration(client).buildCreateBody(model, request)
++            }
+ 
+             is MediaGenerationProviderSetting.Aliyun -> when (kind) {
+                 MediaKind.IMAGE -> AliyunImageGeneration(client).buildBody(model, request)
+diff --git a/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationProviderSettingTest.kt b/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationProviderSettingTest.kt
+index 25efc9229..98b47fa2b 100644
+--- a/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationProviderSettingTest.kt
++++ b/mediagen/src/test/java/me/rerere/mediagen/provider/MediaGenerationProviderSettingTest.kt
+@@ -40,7 +40,7 @@ class MediaGenerationProviderSettingTest {
+         assertEquals(setting.id, copy.id)
+         assertEquals("sk-test", copy.apiKey)
+         assertEquals("中转", copy.name)
+-        assertEquals(listOf("gpt-image-2", "gpt-image-1"), copy.models.map { it.modelId })
++        assertEquals(listOf("gpt-image-2", "sora-2", "sora-2-pro", "gpt-image-1"), copy.models.map { it.modelId })
+     }
+ 
+     @Test
+diff --git a/mediagen/src/test/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProviderTest.kt b/mediagen/src/test/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProviderTest.kt
+index 360ebf0ef..033e7d513 100644
+--- a/mediagen/src/test/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProviderTest.kt
++++ b/mediagen/src/test/java/me/rerere/mediagen/provider/providers/openai/OpenAIMediaGenerationProviderTest.kt
+@@ -249,13 +249,148 @@ class OpenAIMediaGenerationProviderTest {
+     }
+ 
+     @Test
+-    fun kindWithoutAdapterIsRejectedBeforeHittingTheNetwork() = runBlocking {
+-        val manager = MediaGenerationManager(fakeClient { error("unsupported kind must not hit the network") })
++    fun videoKindIsSupported() {
++        assertEquals(setOf(MediaKind.IMAGE, MediaKind.VIDEO), setting.supportedKinds)
++    }
++
++    @Test
++    fun videoCreateBodySendsSoraFields() {
++        val video = MediaGenerationModel(modelId = "sora-2", kind = MediaKind.VIDEO)
++        val body = OpenAIVideoGeneration(OkHttpClient()).buildCreateBody(
++            model = video,
++            request = MediaGenerationRequest(
++                prompt = "a cat sailing",
++                durationSeconds = 4,
++                resolution = "720P",
++                aspectRatio = "16:9",
++                seed = 7,
++            ),
++        )
++
++        assertEquals(JsonPrimitive("sora-2"), body["model"])
++        assertEquals(JsonPrimitive("a cat sailing"), body["prompt"])
++        assertEquals(JsonPrimitive("text"), body["mode"])
++        assertEquals(JsonPrimitive("4"), body["seconds"])
++        assertEquals(JsonPrimitive("720P"), body["size"])
++        assertEquals(JsonPrimitive("16:9"), body["aspect_ratio"])
++        assertEquals(JsonPrimitive(7), body["seed"])
++    }
++
++    @Test
++    fun videoCreateBodyOmitsDurationWhenModelDecides() {
+         val video = MediaGenerationModel(modelId = "sora-2", kind = MediaKind.VIDEO)
++        val body = OpenAIVideoGeneration(OkHttpClient()).buildCreateBody(
++            model = video,
++            request = MediaGenerationRequest(prompt = "cat", durationSeconds = -1),
++        )
++
++        assertNull(body["seconds"])
++        assertNull(body["size"])
++    }
++
++    @Test
++    fun videoCreateBodyRejectsFieldsTheVideoApiDoesNotExpose() {
++        val video = MediaGenerationModel(modelId = "sora-2", kind = MediaKind.VIDEO)
++        val generator = OpenAIVideoGeneration(OkHttpClient())
++
++        assertThrows(IllegalArgumentException::class.java) {
++            generator.buildCreateBody(video, MediaGenerationRequest(prompt = ""))
++        }
++        assertThrows(IllegalArgumentException::class.java) {
++            generator.buildCreateBody(video, MediaGenerationRequest(prompt = "cat", count = 2))
++        }
++        assertThrows(IllegalArgumentException::class.java) {
++            generator.buildCreateBody(video, MediaGenerationRequest(prompt = "cat", generateAudio = true))
++        }
++        assertThrows(IllegalArgumentException::class.java) {
++            generator.buildCreateBody(
++                video,
++                MediaGenerationRequest(
++                    prompt = "cat",
++                    inputs = listOf(MediaGenerationInput.Image("/tmp/a.png")),
++                ),
++            )
++        }
++    }
++
++    @Test
++    fun videoCreatePostsToVideosEndpointAndQueryPollsToContentUrl() = runBlocking {
++        val video = MediaGenerationModel(modelId = "sora-2", kind = MediaKind.VIDEO)
++        val requests = mutableListOf<Request>()
++        val manager = MediaGenerationManager(fakeClient(requests) {
++            when {
++                it.url.toString().endsWith("/videos") -> jsonResponse(
++                    request = it,
++                    body = """{"id":"video_123","status":"queued","created_at":1785125529}""",
++                )
++
++                else -> jsonResponse(
++                    request = it,
++                    body = """{"id":"video_123","status":"completed","created_at":1785125529}""",
++                )
++            }
++        })
++
++        val created = manager.create(
++            setting,
++            video,
++            MediaGenerationRequest(prompt = "a cat sailing", durationSeconds = 4),
++        ).getOrThrow()
++        assertEquals("video_123", created.id)
++        assertEquals(MediaGenerationStatus.QUEUED, created.status)
++        assertTrue(created.outputs.isEmpty())
++
++        val queried = manager.query(setting, video, "video_123").getOrThrow()
++        assertEquals(MediaGenerationStatus.SUCCEEDED, queried.status)
++        val output = queried.outputs.single()
++        assertEquals("https://example.com/v1/videos/video_123/content", output.url)
++        assertEquals("video/mp4", output.mimeType)
++
++        assertEquals(2, requests.size)
++        val createRequest = requests[0]
++        assertEquals("https://example.com/v1/videos", createRequest.url.toString())
++        assertEquals("Bearer sk-test", createRequest.header("Authorization"))
++        val sent = mediaGenerationJson.parseToJsonElement(createRequest.bodyAsString()).jsonObject
++        assertEquals(JsonPrimitive("sora-2"), sent["model"])
++        assertEquals(JsonPrimitive("text"), sent["mode"])
++        assertEquals(JsonPrimitive("4"), sent["seconds"])
++        assertEquals("https://example.com/v1/videos/video_123", requests[1].url.toString())
++    }
++
++    @Test
++    fun videoParseTaskMapsSoraStatuses() {
++        val generator = OpenAIVideoGeneration(OkHttpClient())
++        val setting = MediaGenerationProviderSetting.OpenAI(baseUrl = "https://example.com/v1")
++
++        fun parse(status: String) = generator.parseTask(
++            setting,
++            mediaGenerationJson.parseToJsonElement(
++                """{"id":"video_123","status":"$status","created_at":1785125529}""",
++            ).jsonObject,
++        )
++
++        assertEquals(MediaGenerationStatus.QUEUED, parse("queued").status)
++        assertEquals(MediaGenerationStatus.RUNNING, parse("in_progress").status)
++        assertEquals(MediaGenerationStatus.FAILED, parse("failed").status)
++        assertEquals(MediaGenerationStatus.UNKNOWN, parse("bogus").status)
++
++        val completed = parse("completed")
++        assertEquals(MediaGenerationStatus.SUCCEEDED, completed.status)
++        assertEquals(1785125529L, completed.createdAtEpochSeconds)
++        assertEquals("https://example.com/v1/videos/video_123/content", completed.outputs.single().url)
++    }
++
++    @Test
++    fun videoParseTaskSurfacesErrorMessage() {
++        val root = mediaGenerationJson.parseToJsonElement(
++            """{"id":"video_123","status":"failed","error":{"message":"Prompt was rejected"}}""",
++        ).jsonObject
++        val task = OpenAIVideoGeneration(OkHttpClient()).parseTask(
++            MediaGenerationProviderSetting.OpenAI(baseUrl = "https://example.com/v1"),
++            root,
++        )
+ 
+-        assertEquals(setOf(MediaKind.IMAGE), setting.supportedKinds)
+-        val error = manager.create(setting, video, MediaGenerationRequest(prompt = "cat")).exceptionOrNull()
+-        assertTrue(error is UnsupportedOperationException)
+-        assertEquals("openai does not support VIDEO generation", error!!.message)
++        assertEquals(MediaGenerationStatus.FAILED, task.status)
++        assertEquals("Prompt was rejected", task.error?.message)
+     }
+ }
