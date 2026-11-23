@@ -1,0 +1,997 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/LocalMcpProfile.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/LocalMcpProfile.kt
+index 57a7eac31..8ee6d0955 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/LocalMcpProfile.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/LocalMcpProfile.kt
+@@ -16,7 +16,11 @@ data class LocalMcpProfile(
+     val id: String,
+     val name: String,
+     val port: Int = 8788,
+-    /** 暴露的工具子集；默认空——用户自填。为空时启动后暴露 0 个工具。 */
++    /**
++     * 暴露的工具子集；新建 profile 时设置页默认填精选子集，保存后按此集暴露。
++     * 为空时启动后暴露 0 个工具。启动时还会按精选子集钳制（见 LocalMcpServerManager），
++     * 旧 profile 里保存的高风险工具不会实际暴露。
++     */
+     @Serializable(with = LenientLocalToolListSerializer::class)
+     val allowedTools: List<LocalToolOption> = emptyList(),
+     /** 监听范围：loopback（仅本机，默认）/ lan / any（所有接口） */
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManager.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManager.kt
+index 56a28d844..32f14bd3d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManager.kt
+@@ -5,6 +5,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ import me.rerere.rikkahub.data.ai.mcp.LocalMcpProfile
++import me.rerere.rikkahub.data.ai.tools.LocalToolCatalog
+ import me.rerere.rikkahub.data.ai.tools.LocalToolOption
+ import me.rerere.rikkahub.data.ai.tools.LocalTools
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+@@ -18,7 +19,10 @@ import me.rerere.rikkahub.data.log.AppLog
+ data class LocalMcpServerState(
+     val isRunning: Boolean = false,
+     val toolCount: Int = 0,
++    /** 当前实际暴露的工具选项（注册表上次同步的结果；能力编辑器读同一份状态展示）。 */
++    val exposedTools: List<LocalToolOption> = emptyList(),
+     val port: Int = LocalMcpServerManager.DEFAULT_PORT,
++    val host: String = "127.0.0.1",
+     val error: String? = null,
+ )
+ 
+@@ -27,6 +31,8 @@ data class LocalMcpServerState(
+  *
+  * 启动时把 [LocalTools] 的设备工具注册为 MCP 工具，绑定 127.0.0.1 供 Backend serve
+  * 经 `[[plugins]] type="http"` 挂载。开关见 [SettingsStore.localMcpServerEnabled]。
++ * 暴露集恒钳制在 [LocalToolCatalog.mcpExposed] 内；运行中改 profile 时只改工具
++ * 走热重同步，改端口/监听范围/令牌/白名单走重启。
+  */
+ class LocalMcpServerManager(
+     private val context: Context,
+@@ -40,53 +46,23 @@ class LocalMcpServerManager(
+         private const val TAG = "LocalMcpServerManager"
+         const val DEFAULT_PORT = 8788
+ 
++        /** 暴露集钳制：只保留安全子集内工具，顺序按入参。 */
++        fun clampExposedTools(tools: List<LocalToolOption>): List<LocalToolOption> =
++            tools.filter { it in LocalToolCatalog.mcpExposed }
++
+         /**
+-         * 暴露给 Backend 的设备工具子集：覆盖设备操作、文件、媒体、通信与自动化基础。
++         * 新旧 profile 是否需要重启服务才生效。
+          *
+-         * 有意排除需要交互界面/会话归属/高风险的组（ask_user、javascript_engine、
+-         * telegram_bot、cron_jobs、workflows、sub_agents、vault_tools、mcp_control、
+-         * shizuku、js_skills 等）——它们要么在无 UI 的 MCP 上下文无意义，要么与
+-         * 现有对话/后台会话冲突。所有 needsApproval 工具仍会走审批桥兜底。
++         * 只有绑定参数变化才需重启（端口/监听范围/令牌引用/白名单）；仅工具集变化
++         * 走热重同步。任一为 null（无 profile）视为绑定参数未知，一律重启。
+          */
+-        val MCP_EXPOSED_TOOLS = listOf(
+-            LocalToolOption.TimeInfo,
+-            LocalToolOption.Clipboard,
+-            LocalToolOption.DeviceInfo,
+-            LocalToolOption.Toast,
+-            LocalToolOption.Notification,
+-            LocalToolOption.Share,
+-            LocalToolOption.Torch,
+-            LocalToolOption.Vibrate,
+-            LocalToolOption.Brightness,
+-            LocalToolOption.Volume,
+-            LocalToolOption.MediaPlayer,
+-            LocalToolOption.MediaScanner,
+-            LocalToolOption.Download,
+-            LocalToolOption.Location,
+-            LocalToolOption.Contacts,
+-            LocalToolOption.CallLog,
+-            LocalToolOption.SmsInbox,
+-            LocalToolOption.CameraPhoto,
+-            LocalToolOption.MicRecorder,
+-            LocalToolOption.SpeechToText,
+-            LocalToolOption.Fingerprint,
+-            LocalToolOption.Ssh,
+-            LocalToolOption.ScreenAutomation,
+-            LocalToolOption.NotificationListener,
+-            LocalToolOption.Files,
+-            LocalToolOption.WebFetch,
+-            LocalToolOption.Browser,
+-            LocalToolOption.ExternalStorage,
+-            LocalToolOption.Archive,
+-            LocalToolOption.Nfc,
+-            LocalToolOption.AppLauncher,
+-            LocalToolOption.SystemIntents,
+-            LocalToolOption.Termux,
+-            LocalToolOption.SmsSend,
+-            LocalToolOption.Wallpaper,
+-            LocalToolOption.Keystore,
+-            LocalToolOption.KeyboardControl,
+-        )
++        fun requiresRestart(old: LocalMcpProfile?, new: LocalMcpProfile?): Boolean {
++            if (old == null || new == null) return true
++            return old.port != new.port ||
++                !old.listenScope.equals(new.listenScope, ignoreCase = true) ||
++                old.authTokenRef.trim() != new.authTokenRef.trim() ||
++                old.allowedNetworks != new.allowedNetworks
++        }
+     }
+ 
+     private val registry = LocalToolRegistry(localTools)
+@@ -108,7 +84,7 @@ class LocalMcpServerManager(
+ 
+     fun start(
+         port: Int = DEFAULT_PORT,
+-        tools: List<LocalToolOption> = MCP_EXPOSED_TOOLS,
++        tools: List<LocalToolOption> = LocalToolCatalog.mcpExposed,
+         host: String = "127.0.0.1",
+         authTokenProvider: (suspend () -> String?)? = null,
+         allowedNetworks: String = "",
+@@ -117,7 +93,8 @@ class LocalMcpServerManager(
+             AppLog.w(TAG, "MCP server already running")
+             return
+         }
+-        registry.sync(tools)
++        val exposed = clampExposedTools(tools)
++        registry.sync(exposed)
+         val toolCount = registry.size()
+         val candidate =
+             LocalMcpServer(
+@@ -132,11 +109,25 @@ class LocalMcpServerManager(
+             candidate.start()
+         }.onFailure { e ->
+             AppLog.e(TAG, "Failed to start MCP server", e)
+-            _state.value = LocalMcpServerState(isRunning = false, toolCount = toolCount, port = port, error = e.message)
++            _state.value = LocalMcpServerState(
++                isRunning = false,
++                toolCount = toolCount,
++                exposedTools = registry.syncedOptions,
++                port = port,
++                host = host,
++                error = e.message,
++            )
+             return
+         }
+         server = candidate
+-        _state.value = LocalMcpServerState(isRunning = true, toolCount = toolCount, port = port, error = null)
++        _state.value = LocalMcpServerState(
++            isRunning = true,
++            toolCount = toolCount,
++            exposedTools = registry.syncedOptions,
++            port = port,
++            host = host,
++            error = null,
++        )
+         AppLog.i(TAG, "MCP server started on $host:$port with $toolCount tools")
+     }
+ 
+@@ -181,13 +172,44 @@ class LocalMcpServerManager(
+         AppLog.i(TAG, "MCP server stopped")
+     }
+ 
+-    fun restart(port: Int = _state.value.port) {
+-        val profile = currentProfile
++    /**
++     * 运行中应用新 profile：仅工具集变化时热重同步（不重启服务），
++     * 绑定参数变化或无 profile 时重启。服务未运行时只记下 profile，
++     * 下次启动仍以设置里的活动 profile 为准。
++     */
++    fun applyProfile(profile: LocalMcpProfile?) {
++        val prev = currentProfile
++        currentProfile = profile
++        if (server == null) return
++        if (profile == null) {
++            restart()
++            return
++        }
++        if (requiresRestart(prev, profile)) {
++            restart(profile)
++        } else {
++            resyncTools(profile.allowedTools)
++        }
++    }
++
++    /**
++     * 热重同步工具集：注册表按新工具集重建，运行中的 server 下一次
++     * tools/list 与 tools/call 即见新集。端口/监听地址/令牌/白名单不变。
++     */
++    fun resyncTools(tools: List<LocalToolOption>) {
++        if (server == null) return
++        val exposed = clampExposedTools(tools)
++        registry.sync(exposed)
++        _state.value = _state.value.copy(toolCount = registry.size(), exposedTools = registry.syncedOptions)
++        AppLog.i(TAG, "MCP tools resynced: ${registry.size()} tools")
++    }
++
++    fun restart(profile: LocalMcpProfile? = currentProfile) {
+         stop()
+         if (profile != null) {
+-            start(profile.copy(port = port))
++            start(profile)
+         } else {
+-            start(port)
++            start()
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalToolRegistry.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalToolRegistry.kt
+index 546d98106..db3d8f8fe 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalToolRegistry.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalToolRegistry.kt
+@@ -8,8 +8,10 @@ import me.rerere.rikkahub.data.log.AppLog
+ /**
+  * MCP 工具注册表：按名称索引 [LocalTools] 聚合的设备工具。
+  *
+- * 工具集在 server 启动时同步一次（静态）；个别工具工厂依赖缺失时整体构建失败会
+- * 自动退化为核心子集，保证 tools/list 至少返回可用工具。
++ * 工具集在 server 启动时同步一次；运行中改工具集时 [sync] 可再次调用，
++ * server 每次 tools/list 与 tools/call 都实时读本表，无需重启服务。
++ * 个别工具工厂依赖缺失时整体构建失败会自动退化为核心子集，
++ * 保证 tools/list 至少返回可用工具。
+  */
+ class LocalToolRegistry(private val localTools: LocalTools) {
+ 
+@@ -26,13 +28,28 @@ class LocalToolRegistry(private val localTools: LocalTools) {
+         )
+     }
+ 
++    @Volatile
+     private var tools: Map<String, Tool> = emptyMap()
+ 
++    /** 上次同步实际采用的选项集（构建失败退化时为核心子集）。 */
++    @Volatile
++    var syncedOptions: List<LocalToolOption> = emptyList()
++        private set
++
+     fun sync(options: List<LocalToolOption>) {
+-        tools = runCatching { localTools.getTools(options) }.getOrElse { e ->
+-            AppLog.w(TAG, "full tool build failed (${e.message}); falling back to core subset")
+-            runCatching { localTools.getTools(FALLBACK_CORE) }.getOrDefault(emptyList())
+-        }.associateBy { it.name }
++        val first = runCatching { localTools.getTools(options) }
++        val used: List<Tool>
++        val effective: List<LocalToolOption>
++        if (first.isSuccess) {
++            used = first.getOrDefault(emptyList())
++            effective = options
++        } else {
++            AppLog.w(TAG, "full tool build failed (${first.exceptionOrNull()?.message}); falling back to core subset")
++            used = runCatching { localTools.getTools(FALLBACK_CORE) }.getOrDefault(emptyList())
++            effective = FALLBACK_CORE
++        }
++        tools = used.associateBy { it.name }
++        syncedOptions = effective
+         AppLog.i(TAG, "registry synced: ${tools.size} tools")
+     }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt
+index cb4c07704..4e7380078 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalToolCatalog.kt
+@@ -158,6 +158,62 @@ object LocalToolCatalog {
+     /** 全量列表（按分类顺序展开） */
+     val all: List<LocalToolOption> = LocalToolCategory.entries.flatMap { byCategory[it].orEmpty() }
+ 
++    /**
++     * 可暴露给本地 MCP Server 的设备工具子集：覆盖设备操作、文件、媒体、通信与自动化基础。
++     *
++     * 有意排除需要交互界面/会话归属/高风险的组（ask_user、javascript_engine、
++     * telegram_bot、cron_jobs、workflows、sub_agents、vault_tools、mcp_control、
++     * shizuku、js_skills 等）——它们要么在无 UI 的 MCP 上下文无意义，要么与
++     * 现有对话/后台会话冲突。新建 profile 默认勾选本子集；[me.rerere.rikkahub.data.ai.mcp.server.LocalMcpServerManager]
++     * 启动时也会按本子集钳制 profile 里保存的工具。
++     */
++    val mcpExposed: List<LocalToolOption> =
++        listOf(
++            LocalToolOption.TimeInfo,
++            LocalToolOption.Clipboard,
++            LocalToolOption.DeviceInfo,
++            LocalToolOption.Toast,
++            LocalToolOption.Notification,
++            LocalToolOption.Share,
++            LocalToolOption.Torch,
++            LocalToolOption.Vibrate,
++            LocalToolOption.Brightness,
++            LocalToolOption.Volume,
++            LocalToolOption.MediaPlayer,
++            LocalToolOption.MediaScanner,
++            LocalToolOption.Download,
++            LocalToolOption.Location,
++            LocalToolOption.Contacts,
++            LocalToolOption.CallLog,
++            LocalToolOption.SmsInbox,
++            LocalToolOption.CameraPhoto,
++            LocalToolOption.MicRecorder,
++            LocalToolOption.SpeechToText,
++            LocalToolOption.Fingerprint,
++            LocalToolOption.Ssh,
++            LocalToolOption.ScreenAutomation,
++            LocalToolOption.NotificationListener,
++            LocalToolOption.Files,
++            LocalToolOption.WebFetch,
++            LocalToolOption.Browser,
++            LocalToolOption.ExternalStorage,
++            LocalToolOption.Archive,
++            LocalToolOption.Nfc,
++            LocalToolOption.AppLauncher,
++            LocalToolOption.SystemIntents,
++            LocalToolOption.Termux,
++            LocalToolOption.SmsSend,
++            LocalToolOption.Wallpaper,
++            LocalToolOption.Keystore,
++            LocalToolOption.KeyboardControl,
++        )
++
++    /** 给定选项集合内的非空分组，供界面按类别渲染（不在集合内的工具不出现）。 */
++    fun groups(options: List<LocalToolOption>): List<Pair<LocalToolCategory, List<LocalToolOption>>> =
++        LocalToolCategory.entries.map { category ->
++            category to byCategory[category].orEmpty().filter { it in options }
++        }.filter { it.second.isNotEmpty() }
++
+     /** 工具的展示名资源 id（界面显示功能名，而不是类名）。 */
+     fun labelRes(tool: LocalToolOption): Int =
+         when (tool) {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
+index c81a8bc3e..aa8aae6d2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
+@@ -260,7 +260,7 @@ Entry("browser_back", "browser/BrowserToolDefaults.kt#ALL_TOOLS", "LocalToolOpti
+         Entry("transcribe_audio_file", "local/TranscribeAudioTool.kt#transcribeAudioFileTool", "LocalToolOption.Termux", "REMOTE", null, InvocationKind.STANDARD),
+         Entry("trigger_job_now", "local/CronJobTool.kt#triggerJobNowTool", "LocalToolOption.CronJobs", "AUTOMATION", null, InvocationKind.STANDARD),
+         Entry("unzip_file", "local/ArchiveTools.kt#unzipFileTool", "LocalToolOption.Archive", "FILES", "UnzipFileToolUI", InvocationKind.STANDARD),
+-        Entry("update_provider_icon", "local/ProviderIconTool.kt#updateProviderIconTool", "LocalToolOption.ProviderIcon", "DEVICE_INFO", null, InvocationKind.STANDARD),
++        Entry("update_provider_icon", "local/ProviderIconTool.kt#updateProviderIconTool", "LocalToolOption.ProviderIcon", "DEVICE_INFO", "ProviderIconToolUI", InvocationKind.STANDARD),
+         Entry("use_skill", "SkillsTools.kt#createSkillTools", "ChatToolFactory.workspaceAndSkillTools", "—", "UseSkillToolUI", InvocationKind.STANDARD),
+         Entry("vault_compare_loadcreds", "data/vault/VaultSyncTools.kt#vaultCompareLoadCredsTool", "LocalToolOption.VaultExportEnv", "VAULT", null, InvocationKind.STANDARD),
+         Entry("vault_credential_audit", "data/vault/VaultCrudTools.kt#vaultCredentialAuditTool", "LocalToolOption.VaultTools", "VAULT", null, InvocationKind.STANDARD),
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/LocalMcpServerService.kt b/app/src/main/java/me/rerere/rikkahub/service/LocalMcpServerService.kt
+index 08c134797..5a731f1b3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/LocalMcpServerService.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/LocalMcpServerService.kt
+@@ -18,7 +18,9 @@ import kotlinx.coroutines.cancel
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.launch
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.ai.mcp.LocalMcpProfile
+ import me.rerere.rikkahub.data.ai.mcp.server.LocalMcpServerManager
++import me.rerere.rikkahub.data.datastore.Settings
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import org.koin.android.ext.android.inject
+ import me.rerere.rikkahub.data.log.AppLog
+@@ -37,6 +39,8 @@ class LocalMcpServerService : Service() {
+     companion object {
+         const val ACTION_START = "me.rerere.rikkahub.action.MCP_SERVER_START"
+         const val ACTION_STOP = "me.rerere.rikkahub.action.MCP_SERVER_STOP"
++        /** 设置改动后应用活动 profile：仅改工具走热重同步，改绑定参数走重启。 */
++        const val ACTION_APPLY = "me.rerere.rikkahub.action.MCP_SERVER_APPLY"
+         const val NOTIFICATION_ID = 2007
+         const val CHANNEL_ID = "mcp_server"
+     }
+@@ -71,6 +75,12 @@ class LocalMcpServerService : Service() {
+                 // 开关由设置页/启动链维护；服务只负责生命周期，停止后由状态流触发 stopSelf
+             }
+ 
++            ACTION_APPLY -> {
++                serviceScope.launch {
++                    applyActiveProfile()
++                }
++            }
++
+             null -> {
+                 // 兜底：intent 为 null（系统重启重投）时按设置决定
+                 if (!startForegroundCompat()) {
+@@ -92,11 +102,37 @@ class LocalMcpServerService : Service() {
+     }
+ 
+     private suspend fun startWithActiveProfile() {
+-        val s = settingsStore.settingsFlowRaw.first()
+-        val profile = s.activeLocalMcpProfileId?.let { id -> s.localMcpProfiles.firstOrNull { it.id == id } }
++        val profile = resolveActiveProfile(settingsStore.settingsFlowRaw.first())
+         if (profile != null) manager.start(profile) else manager.start()
+     }
+ 
++    /**
++     * 应用设置里的活动 profile：总开关关着时不动；服务已在跑则按 profile
++     * 热重同步或重启；服务没在跑则按 ACTION_START 的流程拉起来。
++     */
++    private suspend fun applyActiveProfile() {
++        val settings = settingsStore.settingsFlowRaw.first()
++        if (!settings.localMcpServerEnabled) return
++        val profile = resolveActiveProfile(settings)
++        if (manager.state.value.isRunning) {
++            manager.applyProfile(profile)
++        } else {
++            if (!startForegroundCompat()) {
++                stopSelf()
++                return
++            }
++            startObservingState()
++            if (profile != null) manager.start(profile) else manager.start()
++        }
++    }
++
++    private fun resolveActiveProfile(
++        settings: Settings,
++    ): LocalMcpProfile? {
++        val id = settings.activeLocalMcpProfileId ?: return null
++        return settings.localMcpProfiles.firstOrNull { it.id == id }
++    }
++
+     override fun onDestroy() {
+         super.onDestroy()
+         serviceScope.cancel()
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt
+index 72f465da1..30a81a0d4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt
+@@ -68,12 +68,17 @@ import me.rerere.hugeicons.stroke.McpServer
+ import me.rerere.hugeicons.stroke.MessageBlocked
+ import me.rerere.hugeicons.stroke.Settings03
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.Screen
+ import me.rerere.rikkahub.data.ai.mcp.McpManager
+ import me.rerere.rikkahub.data.ai.mcp.LocalMcpProfile
+ import me.rerere.rikkahub.data.ai.mcp.McpServerConfig
+ import me.rerere.rikkahub.data.ai.mcp.McpStatus
++import me.rerere.rikkahub.data.ai.mcp.server.LocalMcpServerManager
++import me.rerere.rikkahub.data.ai.mcp.server.LocalMcpServerState
++import me.rerere.rikkahub.data.ai.tools.LocalToolCatalog
+ import me.rerere.rikkahub.ui.components.ai.ExtensionEmptyState
+ import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.context.LocalNavController
+ import me.rerere.rikkahub.ui.components.ui.RikkaDeleteConfirmDialog
+ import me.rerere.rikkahub.ui.components.ui.Tag
+ import me.rerere.rikkahub.ui.components.ui.TagType
+@@ -87,6 +92,17 @@ import org.koin.compose.koinInject
+ @Composable
+ fun SettingMcpPage(vm: SettingVM = koinViewModel()) {
+     val settings by vm.settings.collectAsStateWithLifecycle()
++    val ctx = LocalContext.current
++    // profile 改动后通知服务应用新配置（总开关关着时不发，服务本就没在跑）。
++    val applyLocalMcpProfile: () -> Unit = {
++        if (settings.localMcpServerEnabled) {
++            ctx.startService(
++                Intent(ctx, LocalMcpServerService::class.java).apply {
++                    action = LocalMcpServerService.ACTION_APPLY
++                },
++            )
++        }
++    }
+     val mcpConfigs = settings.mcpServers
+     val creationState =
+         useEditState<McpServerConfig> {
+@@ -178,11 +194,15 @@ fun SettingMcpPage(vm: SettingVM = koinViewModel()) {
+                     ),
+             ) {
+                 item(key = "local_mcp") {
+-                    val ctx = LocalContext.current
++                    val navController = LocalNavController.current
++                    val mcpServerManager = koinInject<LocalMcpServerManager>()
++                    val mcpServerState by mcpServerManager.state.collectAsStateWithLifecycle()
+                     LocalMcpServerSection(
+                         profiles = localMcpProfiles,
+                         activeId = settings.activeLocalMcpProfileId,
+                         enabled = settings.localMcpServerEnabled,
++                        serverState = mcpServerState,
++                        onOpenCapabilityEditor = { navController.navigate(Screen.SettingModels) },
+                         onEnable = { en ->
+                             ctx.startService(
+                                 Intent(ctx, LocalMcpServerService::class.java).apply {
+@@ -191,14 +211,21 @@ fun SettingMcpPage(vm: SettingVM = koinViewModel()) {
+                             )
+                             vm.updateSettings { current -> current.copy(localMcpServerEnabled = en) }
+                         },
+-                        onAdd = { editingProfile = LocalMcpProfile(id = "local-mcp-${System.currentTimeMillis()}", name = ""); showProfileDialog = true },
++                        onAdd = {
++                            editingProfile = LocalMcpProfile(
++                                id = "local-mcp-${System.currentTimeMillis()}",
++                                name = "",
++                                allowedTools = LocalToolCatalog.mcpExposed,
++                            )
++                            showProfileDialog = true
++                        },
+                         onEdit = { p -> editingProfile = p; showProfileDialog = true },
+                         onDelete = { p -> vm.updateSettings { current ->
+             current.copy(localMcpProfiles = current.localMcpProfiles.filter { it.id != p.id })
+-        } },
++        }; applyLocalMcpProfile() },
+                         onSetActive = { p -> vm.updateSettings { current ->
+             current.copy(activeLocalMcpProfileId = p.id)
+-        } },
++        }; applyLocalMcpProfile() },
+                     )
+                 }
+ 
+@@ -247,6 +274,7 @@ fun SettingMcpPage(vm: SettingVM = koinViewModel()) {
+                     val updated = if (profiles.any { it.id == p.id }) profiles.map { if (it.id == p.id) p else it } else profiles + p
+                     current.copy(localMcpProfiles = updated, activeLocalMcpProfileId = current.activeLocalMcpProfileId ?: p.id)
+                 }
++                applyLocalMcpProfile()
+                 showProfileDialog = false
+             },
+             onDismiss = { showProfileDialog = false },
+@@ -272,6 +300,8 @@ private fun LocalMcpServerSection(
+     profiles: List<LocalMcpProfile>,
+     activeId: String?,
+     enabled: Boolean,
++    serverState: LocalMcpServerState,
++    onOpenCapabilityEditor: () -> Unit,
+     onEnable: (Boolean) -> Unit,
+     onAdd: () -> Unit,
+     onEdit: (LocalMcpProfile) -> Unit,
+@@ -279,12 +309,50 @@ private fun LocalMcpServerSection(
+     onSetActive: (LocalMcpProfile) -> Unit,
+ ) {
+     var profileToDelete by remember { mutableStateOf<LocalMcpProfile?>(null) }
++    var toolsExpanded by remember { mutableStateOf(false) }
++    val exposedToolNames = mutableListOf<String>()
++    for (tool in serverState.exposedTools) {
++        exposedToolNames += stringResource(LocalToolCatalog.labelRes(tool))
++    }
+     CardGroup {
+         switchItem(
+             checked = enabled,
+             onCheckedChange = onEnable,
+             headlineContent = { Text(stringResource(R.string.mcp_page_local_server_title)) },
+-            supportingContent = { Text(stringResource(R.string.mcp_page_local_server_desc)) },
++            supportingContent = {
++                Text(
++                    when {
++                        serverState.error != null && !serverState.isRunning ->
++                            stringResource(R.string.mcp_page_local_server_error, serverState.error)
++
++                        serverState.isRunning ->
++                            stringResource(
++                                R.string.mcp_page_local_server_running,
++                                serverState.host,
++                                serverState.port,
++                                serverState.toolCount,
++                            )
++
++                        else -> stringResource(R.string.mcp_page_local_server_stopped)
++                    },
++                )
++            },
++        )
++        if (serverState.isRunning && serverState.exposedTools.isNotEmpty()) {
++            item(
++                onClick = { toolsExpanded = !toolsExpanded },
++                headlineContent = { Text(stringResource(R.string.mcp_page_exposed_tools, serverState.exposedTools.size)) },
++                supportingContent = {
++                    Text(
++                        if (toolsExpanded) exposedToolNames.joinToString(", ") else stringResource(R.string.mcp_page_exposed_tools_hint),
++                    )
++                },
++            )
++        }
++        item(
++            onClick = onOpenCapabilityEditor,
++            headlineContent = { Text(stringResource(R.string.mcp_page_capability_editor_title)) },
++            supportingContent = { Text(stringResource(R.string.mcp_page_capability_editor_desc)) },
+         )
+         profiles.forEach { p ->
+             val displayName = p.name.ifBlank { stringResource(R.string.mcp_page_unnamed) }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt
+index 8240b024b..5f8bdea57 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpProfileModal.kt
+@@ -38,7 +38,8 @@ import me.rerere.rikkahub.ui.components.setting.SettingTextField
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
+ import me.rerere.rikkahub.ui.components.vault.SecretRefField
+ 
+-private val ALL_LOCAL_TOOLS: List<LocalToolOption> = LocalToolCatalog.all
++/** 本地 MCP 可暴露的安全子集（新建默认全选；高风险工具不在此列，也不提供勾选）。 */
++private val SAFE_LOCAL_TOOLS: List<LocalToolOption> = LocalToolCatalog.mcpExposed
+ 
+ @Composable
+ internal fun LocalMcpProfileModal(
+@@ -50,7 +51,9 @@ internal fun LocalMcpProfileModal(
+ ) {
+     var name by remember { mutableStateOf(initial?.name ?: "") }
+     var port by remember { mutableStateOf(initial?.port?.toString() ?: "8788") }
+-    var selected by remember { mutableStateOf(initial?.allowedTools ?: emptyList()) }
++    var selected by remember {
++        mutableStateOf((initial?.allowedTools ?: SAFE_LOCAL_TOOLS).filter { it in SAFE_LOCAL_TOOLS })
++    }
+     var expandedCategories by remember { mutableStateOf(setOf<LocalToolCategory>()) }
+     var listenScope by remember { mutableStateOf(initial?.listenScope ?: "loopback") }
+     var allowedNetworks by remember { mutableStateOf(initial?.allowedNetworks ?: "") }
+@@ -107,11 +110,11 @@ internal fun LocalMcpProfileModal(
+                     ) {
+                         Text(stringResource(R.string.mcp_page_tools_header), style = MaterialTheme.typography.labelLarge)
+                         Row {
+-                            TextButton(onClick = { selected = ALL_LOCAL_TOOLS }) { Text(stringResource(R.string.mcp_page_select_all)) }
++                            TextButton(onClick = { selected = SAFE_LOCAL_TOOLS }) { Text(stringResource(R.string.mcp_page_select_all)) }
+                             TextButton(onClick = { selected = emptyList() }) { Text(stringResource(R.string.mcp_page_clear)) }
+                         }
+                     }
+-                LocalToolCatalog.groups().forEach { (category, tools) ->
++                LocalToolCatalog.groups(SAFE_LOCAL_TOOLS).forEach { (category, tools) ->
+                     val expanded = category in expandedCategories
+                     val pickedCount = tools.count { it in selected }
+                     Surface(
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 84b7caa48..8951305bd 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -2274,7 +2274,13 @@
+   <string name="backend_service_auth_ref_label">مرجع بيانات Vault (اختياري)</string>
+   <string name="backend_service_vault_empty_hint">(خزنة البيانات فارغة، ويمكن إدخال الاسم يدويًا)</string>
+   <string name="mcp_page_local_server_title">خادم MCP المحلي</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · لواجهة Backend</string>
++  <string name="mcp_page_local_server_running">قيد التشغيل · %1$s:%2$d · %3$d أدوات</string>
++  <string name="mcp_page_local_server_stopped">متوقف</string>
++  <string name="mcp_page_local_server_error">تعذّر التشغيل: %1$s</string>
++  <string name="mcp_page_exposed_tools">الأدوات المكشوفة (%1$d)</string>
++  <string name="mcp_page_exposed_tools_hint">انقر للعرض</string>
++  <string name="mcp_page_capability_editor_title">محرر قدرات النموذج</string>
++  <string name="mcp_page_capability_editor_desc">اعرض حالة كشف MCP المحلي في محرر قدرات النموذج</string>
+   <string name="mcp_page_unnamed">بلا اسم</string>
+   <string name="mcp_page_current_prefix">الحالي · %1$s</string>
+   <string name="mcp_page_port_tools">المنفذ %1$d · %2$d أداة</string>
+@@ -2284,7 +2290,7 @@
+   <string name="mcp_page_dialog_edit_title">تعديل إعداد MCP المحلي</string>
+   <string name="mcp_page_name_label">الاسم</string>
+   <string name="mcp_page_port_label">المنفذ</string>
+-  <string name="mcp_page_tools_header">الأدوات المكشوفة (غير محددة افتراضيًا)</string>
++  <string name="mcp_page_tools_header">الأدوات المكشوفة (يتم تحديد المجموعة المختارة افتراضيًا)</string>
+   <string name="mcp_page_select_all">تحديد الكل</string>
+   <string name="mcp_category_device_info">معلومات الجهاز</string>
+   <string name="mcp_tool_javascript_engine">محرك JS</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 0f539b105..ae296e630 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -3315,7 +3315,13 @@
+   <string name="backend_service_auth_ref_label">Vault 憑證引用（可選）</string>
+   <string name="backend_service_vault_empty_hint">（憑證庫為空，可手動輸入憑證名）</string>
+   <string name="mcp_page_local_server_title">本地 MCP Server</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · 供 Backend 使用</string>
++  <string name="mcp_page_local_server_running">執行中 · %1$s:%2$d · %3$d 個工具</string>
++  <string name="mcp_page_local_server_stopped">未執行</string>
++  <string name="mcp_page_local_server_error">啟動失敗：%1$s</string>
++  <string name="mcp_page_exposed_tools">已公開工具（%1$d 個）</string>
++  <string name="mcp_page_exposed_tools_hint">點按查看</string>
++  <string name="mcp_page_capability_editor_title">模型能力編輯器</string>
++  <string name="mcp_page_capability_editor_desc">在模型能力編輯器中查看本地 MCP 的公開狀態</string>
+   <string name="mcp_page_unnamed">未命名</string>
+   <string name="mcp_page_current_prefix">當前 · %1$s</string>
+   <string name="mcp_page_port_tools">端口 %1$d · %2$d 工具</string>
+@@ -3325,7 +3331,7 @@
+   <string name="mcp_page_dialog_edit_title">編輯本地 MCP 配置</string>
+   <string name="mcp_page_name_label">名稱</string>
+   <string name="mcp_page_port_label">端口</string>
+-  <string name="mcp_page_tools_header">暴露的工具（默認全部未選）</string>
++  <string name="mcp_page_tools_header">暴露的工具（預設勾選精選集）</string>
+   <string name="mcp_page_select_all">全選</string>
+   <string name="mcp_category_device_info">裝置資訊</string>
+   <string name="mcp_tool_javascript_engine">JS 引擎</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 9d5af6c1b..8348d93e2 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -2753,7 +2753,13 @@
+   <string name="backend_service_auth_ref_label">Vault 資格情報参照（任意）</string>
+   <string name="backend_service_vault_empty_hint">（資格情報庫が空です。手動で名前を入力できます）</string>
+   <string name="mcp_page_local_server_title">ローカル MCP サーバー</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · Backend 用</string>
++  <string name="mcp_page_local_server_running">実行中 · %1$s:%2$d · %3$d 個のツール</string>
++  <string name="mcp_page_local_server_stopped">停止中</string>
++  <string name="mcp_page_local_server_error">起動に失敗しました：%1$s</string>
++  <string name="mcp_page_exposed_tools">公開中のツール（%1$d 個）</string>
++  <string name="mcp_page_exposed_tools_hint">タップして表示</string>
++  <string name="mcp_page_capability_editor_title">モデル能力エディタ</string>
++  <string name="mcp_page_capability_editor_desc">モデル能力エディタでローカル MCP の公開状態を確認</string>
+   <string name="mcp_page_unnamed">名称未設定</string>
+   <string name="mcp_page_current_prefix">現在 · %1$s</string>
+   <string name="mcp_page_port_tools">ポート %1$d · %2$d ツール</string>
+@@ -2763,7 +2769,7 @@
+   <string name="mcp_page_dialog_edit_title">ローカル MCP 設定を編集</string>
+   <string name="mcp_page_name_label">名前</string>
+   <string name="mcp_page_port_label">ポート</string>
+-  <string name="mcp_page_tools_header">公開するツール（既定はすべて未選択）</string>
++  <string name="mcp_page_tools_header">公開するツール（既定は精選セットを選択）</string>
+   <string name="mcp_page_select_all">すべて選択</string>
+   <string name="mcp_category_device_info">デバイス情報</string>
+   <string name="mcp_tool_javascript_engine">JS エンジン</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 9b710aacf..aa5cb2d25 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -2753,7 +2753,13 @@
+   <string name="backend_service_auth_ref_label">Vault 자격 증명 참조(선택)</string>
+   <string name="backend_service_vault_empty_hint">(자격 증명 보관소가 비어 있습니다. 이름을 직접 입력할 수 있습니다)</string>
+   <string name="mcp_page_local_server_title">로컬 MCP 서버</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · Backend용</string>
++  <string name="mcp_page_local_server_running">실행 중 · %1$s:%2$d · 도구 %3$d개</string>
++  <string name="mcp_page_local_server_stopped">중지됨</string>
++  <string name="mcp_page_local_server_error">시작 실패: %1$s</string>
++  <string name="mcp_page_exposed_tools">노출된 도구(%1$d개)</string>
++  <string name="mcp_page_exposed_tools_hint">탭하여 보기</string>
++  <string name="mcp_page_capability_editor_title">모델 기능 편집기</string>
++  <string name="mcp_page_capability_editor_desc">모델 기능 편집기에서 로컬 MCP 노출 상태 보기</string>
+   <string name="mcp_page_unnamed">이름 없음</string>
+   <string name="mcp_page_current_prefix">현재 · %1$s</string>
+   <string name="mcp_page_port_tools">포트 %1$d · 도구 %2$d개</string>
+@@ -2763,7 +2769,7 @@
+   <string name="mcp_page_dialog_edit_title">로컬 MCP 구성 편집</string>
+   <string name="mcp_page_name_label">이름</string>
+   <string name="mcp_page_port_label">포트</string>
+-  <string name="mcp_page_tools_header">노출할 도구(기본은 모두 미선택)</string>
++  <string name="mcp_page_tools_header">노출할 도구(기본은 엄선된 집합 선택)</string>
+   <string name="mcp_page_select_all">전체 선택</string>
+   <string name="mcp_category_device_info">기기 정보</string>
+   <string name="mcp_tool_javascript_engine">JS 엔진</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index f041fb08d..2a3387e32 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -2748,7 +2748,13 @@
+   <string name="backend_service_auth_ref_label">Ссылка на данные в Vault (необязательно)</string>
+   <string name="backend_service_vault_empty_hint">(Хранилище пусто, можно ввести имя вручную)</string>
+   <string name="mcp_page_local_server_title">Локальный MCP-сервер</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · для бэкенда</string>
++  <string name="mcp_page_local_server_running">Работает · %1$s:%2$d · инструментов: %3$d</string>
++  <string name="mcp_page_local_server_stopped">Остановлен</string>
++  <string name="mcp_page_local_server_error">Не удалось запустить: %1$s</string>
++  <string name="mcp_page_exposed_tools">Открытые инструменты (%1$d)</string>
++  <string name="mcp_page_exposed_tools_hint">Нажмите, чтобы посмотреть</string>
++  <string name="mcp_page_capability_editor_title">Редактор возможностей модели</string>
++  <string name="mcp_page_capability_editor_desc">Посмотреть состояние локального MCP в редакторе возможностей модели</string>
+   <string name="mcp_page_unnamed">Без имени</string>
+   <string name="mcp_page_current_prefix">Текущий · %1$s</string>
+   <string name="mcp_page_port_tools">Порт %1$d · инструментов: %2$d</string>
+@@ -2758,7 +2764,7 @@
+   <string name="mcp_page_dialog_edit_title">Изменить локальную конфигурацию MCP</string>
+   <string name="mcp_page_name_label">Имя</string>
+   <string name="mcp_page_port_label">Порт</string>
+-  <string name="mcp_page_tools_header">Открываемые инструменты (по умолчанию ничего не выбрано)</string>
++  <string name="mcp_page_tools_header">Открываемые инструменты (по умолчанию выбрана подборка)</string>
+   <string name="mcp_page_select_all">Выбрать все</string>
+   <string name="mcp_category_device_info">Информация об устройстве</string>
+   <string name="mcp_tool_javascript_engine">JS-движок</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 93ba883fb..0a3f64486 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -3437,7 +3437,13 @@
+   <string name="backend_service_auth_ref_label">Vault 凭证引用（可选）</string>
+   <string name="backend_service_vault_empty_hint">（凭证库为空，可手动输入凭证名）</string>
+   <string name="mcp_page_local_server_title">本地 MCP Server</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · 供 Backend 使用</string>
++  <string name="mcp_page_local_server_running">运行中 · %1$s:%2$d · %3$d 个工具</string>
++  <string name="mcp_page_local_server_stopped">未运行</string>
++  <string name="mcp_page_local_server_error">启动失败：%1$s</string>
++  <string name="mcp_page_exposed_tools">已暴露工具（%1$d 个）</string>
++  <string name="mcp_page_exposed_tools_hint">点按查看</string>
++  <string name="mcp_page_capability_editor_title">模型能力编辑器</string>
++  <string name="mcp_page_capability_editor_desc">在模型能力编辑器中查看本地 MCP 的暴露状态</string>
+   <string name="mcp_page_unnamed">未命名</string>
+   <string name="mcp_delete_config_confirm">删除 MCP 配置“%1$s”？此操作无法撤销。</string>
+   <string name="mcp_delete_server_confirm">删除 MCP 服务器“%1$s”？此操作无法撤销。</string>
+@@ -3449,7 +3455,7 @@
+   <string name="mcp_page_dialog_edit_title">编辑本地 MCP 配置</string>
+   <string name="mcp_page_name_label">名称</string>
+   <string name="mcp_page_port_label">端口</string>
+-  <string name="mcp_page_tools_header">暴露的工具（默认全部未选）</string>
++  <string name="mcp_page_tools_header">暴露的工具（默认勾选精选集）</string>
+   <string name="mcp_page_select_all">全选</string>
+   <string name="mcp_category_device_info">设备信息</string>
+   <string name="mcp_tool_javascript_engine">JS 引擎</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c77ec096a..e8ba13337 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3404,7 +3404,13 @@
+   <string name="backend_service_auth_ref_label">Vault credential reference (optional)</string>
+   <string name="backend_service_vault_empty_hint">(Vault is empty — type a credential name manually)</string>
+   <string name="mcp_page_local_server_title">Local MCP Server</string>
+-  <string name="mcp_page_local_server_desc">127.0.0.1:8788 · for Backend use</string>
++  <string name="mcp_page_local_server_running">Running · %1$s:%2$d · %3$d tools</string>
++  <string name="mcp_page_local_server_stopped">Stopped</string>
++  <string name="mcp_page_local_server_error">Failed to start: %1$s</string>
++  <string name="mcp_page_exposed_tools">Exposed tools (%1$d)</string>
++  <string name="mcp_page_exposed_tools_hint">Tap to view</string>
++  <string name="mcp_page_capability_editor_title">Model capability editor</string>
++  <string name="mcp_page_capability_editor_desc">View local MCP exposure in the model capability editor</string>
+   <string name="mcp_page_unnamed">Unnamed</string>
+   <string name="mcp_delete_config_confirm">Delete MCP configuration \"%1$s\"? This action cannot be undone.</string>
+   <string name="mcp_delete_server_confirm">Delete MCP server \"%1$s\"? This action cannot be undone.</string>
+@@ -3416,7 +3422,7 @@
+   <string name="mcp_page_dialog_edit_title">Edit local MCP config</string>
+   <string name="mcp_page_name_label">Name</string>
+   <string name="mcp_page_port_label">Port</string>
+-  <string name="mcp_page_tools_header">Exposed tools (none selected by default)</string>
++  <string name="mcp_page_tools_header">Exposed tools (curated subset by default)</string>
+   <string name="mcp_page_select_all">Select all</string>
+   <string name="mcp_category_device_info">Device info</string>
+   <string name="mcp_tool_javascript_engine">JS engine</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManagerTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManagerTest.kt
+new file mode 100644
+index 000000000..0fd829db1
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/server/LocalMcpServerManagerTest.kt
+@@ -0,0 +1,162 @@
++package me.rerere.rikkahub.data.ai.mcp.server
++
++import me.rerere.rikkahub.data.ai.mcp.LocalMcpProfile
++import me.rerere.rikkahub.data.ai.tools.LocalToolCatalog
++import me.rerere.rikkahub.data.ai.tools.LocalToolOption
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * 本地 MCP 暴露集钳制与热重同步判定回归测试（纯函数，不含 IO 与 Android）。
++ *
++ * 关键性质：高风险工具永不进入暴露集；仅工具集变化时不重启服务。
++ */
++class LocalMcpServerManagerTest {
++
++    private fun profile(
++        port: Int = 8788,
++        listenScope: String = "loopback",
++        authTokenRef: String = "",
++        allowedNetworks: String = "",
++        allowedTools: List<LocalToolOption> = LocalToolCatalog.mcpExposed,
++        name: String = "test",
++    ) = LocalMcpProfile(
++        id = "p1",
++        name = name,
++        port = port,
++        allowedTools = allowedTools,
++        listenScope = listenScope,
++        allowedNetworks = allowedNetworks,
++        authTokenRef = authTokenRef,
++    )
++
++    @Test
++    fun clampKeepsSafeToolsInOrder() {
++        val input = listOf(LocalToolOption.Files, LocalToolOption.TimeInfo, LocalToolOption.Toast)
++        assertEquals(input, LocalMcpServerManager.clampExposedTools(input))
++    }
++
++    @Test
++    fun clampDropsHighRiskTools() {
++        val input =
++            listOf(
++                LocalToolOption.Files,
++                LocalToolOption.VaultTools,
++                LocalToolOption.VaultExportEnv,
++                LocalToolOption.Shizuku,
++                LocalToolOption.McpControl,
++                LocalToolOption.CronJobs,
++                LocalToolOption.Workflows,
++                LocalToolOption.SubAgents,
++                LocalToolOption.JsSkills,
++                LocalToolOption.JavascriptEngine,
++                LocalToolOption.AskUser,
++                LocalToolOption.TelegramBot,
++                LocalToolOption.TimeInfo,
++            )
++        assertEquals(
++            listOf(LocalToolOption.Files, LocalToolOption.TimeInfo),
++            LocalMcpServerManager.clampExposedTools(input),
++        )
++    }
++
++    @Test
++    fun clampEmptyStaysEmpty() {
++        assertEquals(emptyList<LocalToolOption>(), LocalMcpServerManager.clampExposedTools(emptyList()))
++    }
++
++    @Test
++    fun requiresRestart_sameProfile() {
++        assertFalse(LocalMcpServerManager.requiresRestart(profile(), profile()))
++    }
++
++    @Test
++    fun requiresRestart_toolsOnlyChange() {
++        assertFalse(
++            LocalMcpServerManager.requiresRestart(
++                profile(),
++                profile(allowedTools = listOf(LocalToolOption.Files)),
++            ),
++        )
++    }
++
++    @Test
++    fun requiresRestart_nameOnlyChange() {
++        assertFalse(LocalMcpServerManager.requiresRestart(profile(), profile(name = "renamed")))
++    }
++
++    @Test
++    fun requiresRestart_portChange() {
++        assertTrue(LocalMcpServerManager.requiresRestart(profile(), profile(port = 8799)))
++    }
++
++    @Test
++    fun requiresRestart_listenScopeChange() {
++        assertTrue(LocalMcpServerManager.requiresRestart(profile(), profile(listenScope = "lan")))
++    }
++
++    @Test
++    fun requiresRestart_tokenChange() {
++        assertTrue(
++            LocalMcpServerManager.requiresRestart(
++                profile(),
++                profile(authTokenRef = "MCP_AUTH_TOKEN"),
++            ),
++        )
++    }
++
++    @Test
++    fun requiresRestart_networksChange() {
++        assertTrue(
++            LocalMcpServerManager.requiresRestart(
++                profile(),
++                profile(allowedNetworks = "192.168.0.0/16"),
++            ),
++        )
++    }
++
++    @Test
++    fun requiresRestart_nullEitherSide() {
++        assertTrue(LocalMcpServerManager.requiresRestart(null, profile()))
++        assertTrue(LocalMcpServerManager.requiresRestart(profile(), null))
++        assertTrue(LocalMcpServerManager.requiresRestart(null, null))
++    }
++
++    @Test
++    fun mcpExposedIsNonEmptySafeSubset() {
++        val exposed = LocalToolCatalog.mcpExposed
++        assertTrue(exposed.isNotEmpty())
++        assertTrue(LocalToolCatalog.all.containsAll(exposed))
++        assertEquals(exposed.distinct().size, exposed.size)
++        val forbidden =
++            setOf(
++                LocalToolOption.VaultTools,
++                LocalToolOption.VaultExportEnv,
++                LocalToolOption.Shizuku,
++                LocalToolOption.McpControl,
++                LocalToolOption.CronJobs,
++                LocalToolOption.Workflows,
++                LocalToolOption.SubAgents,
++                LocalToolOption.JsSkills,
++                LocalToolOption.JavascriptEngine,
++                LocalToolOption.AskUser,
++                LocalToolOption.TelegramBot,
++            )
++        assertTrue(exposed.none { it in forbidden })
++    }
++
++    @Test
++    fun groupsRestrictedToGivenOptions() {
++        val groups = LocalToolCatalog.groups(LocalToolCatalog.mcpExposed)
++        assertTrue(groups.isNotEmpty())
++        assertTrue(groups.all { (_, tools) -> tools.isNotEmpty() })
++        assertTrue(groups.all { (_, tools) -> tools.all { it in LocalToolCatalog.mcpExposed } })
++        assertEquals(
++            LocalToolCatalog.mcpExposed.toSet(),
++            groups.flatMap { (_, tools) -> tools }.toSet(),
++        )
++        assertTrue(LocalToolCatalog.groups(emptyList()).isEmpty())
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt
+index 6cce05a65..d4f95d76c 100644
+--- a/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt
+@@ -12,7 +12,7 @@ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+ /**
+- * 图标着色覆盖自检：110 个 ToolUI 渲染器与 59 个 LocalToolOption 必须全部落在
++ * 图标着色覆盖自检：111 个 ToolUI 渲染器与 59 个 LocalToolOption 必须全部落在
+  * 8 个家族色组内（不回退默认单色），且 LocalToolOption 的图标在去重后互不相同。
+  *
+  * 颜色决策是纯函数（[ToolUIRenderer.iconColorKey] / [colorForLocalToolOption]），
+@@ -38,7 +38,7 @@ class ToolIconColorTest {
+ 
+     @Test
+     fun `all registered renderers have a family color`() {
+-        assertEquals(110, ToolUIRegistry.rendererMap.size)
++        assertEquals(111, ToolUIRegistry.rendererMap.size)
+         for ((toolName, renderer) in ToolUIRegistry.rendererMap) {
+             val key = renderer.iconColorKey(contextFor(toolName))
+             assertTrue("渲染器无家族色（回退默认单色）: $toolName", key in familyGroups)
