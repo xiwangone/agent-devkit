@@ -1,0 +1,1671 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+index 37017586a..1c9c5c7d7 100644
+--- a/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
++++ b/app/src/main/java/me/rerere/rikkahub/RouteActivity.kt
+@@ -646,6 +646,9 @@ class RouteActivity : ComponentActivity() {
+                             entry<Screen.SettingNetworkTunnel> {
+                                 me.rerere.rikkahub.ui.pages.setting.SettingNetworkTunnelPage()
+                             }
++                            entry<Screen.SettingNetworkRouting> {
++                                me.rerere.rikkahub.ui.pages.setting.SettingNetworkRoutingPage()
++                            }
+                             entry<Screen.TunnelDiagnostics> {
+                                 me.rerere.rikkahub.ui.pages.setting.TunnelDiagnosticsPage()
+                             }
+@@ -939,6 +942,8 @@ sealed interface Screen : NavKey {
+     @Serializable
+     data object SettingNetworkTunnel : Screen
+     @Serializable
++    data object SettingNetworkRouting : Screen
++    @Serializable
+     data object TunnelDiagnostics : Screen
+     @Serializable
+     data object SettingSshHosts : Screen
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
+index 1a665bba2..c62fd31c6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
+@@ -51,6 +51,9 @@ import me.rerere.rikkahub.data.files.saveUploadFromBytes
+ import me.rerere.rikkahub.utils.JsonInstant
+ import me.rerere.rikkahub.utils.checkDifferent
+ import me.rerere.rikkahub.data.ai.LoggedOkHttpClients
++import me.rerere.rikkahub.data.network.NetworkScope
++import me.rerere.rikkahub.data.network.routingProxySelectorForScope
++import me.rerere.rikkahub.data.tunnel.TsnetSocketFactory
+ import okhttp3.OkHttpClient
+ import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.TimeUnit
+@@ -74,6 +77,13 @@ class McpManager(
+     private val filesManager: FilesManager,
+ ) {
+     private val okHttpClient: OkHttpClient = LoggedOkHttpClients.builder()
++        // MCP route: MCP servers (and their OAuth flows, which share this client)
++        // follow the MCP scope's route. The tunnel socket factory lets tailnet
++        // MCP servers connect; previously this client had neither a proxy
++        // selector nor a tunnel socket factory, so MCP traffic ignored both
++        // the configured proxy and the tunnel entirely.
++        .proxySelector(routingProxySelectorForScope(settingsStore, NetworkScope.MCP))
++        .socketFactory(TsnetSocketFactory())
+         .connectTimeout(20, TimeUnit.SECONDS)
+         .readTimeout(10, TimeUnit.MINUTES)
+         .writeTimeout(120, TimeUnit.SECONDS)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+index 43030873e..ece2d5c6b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+@@ -27,6 +27,7 @@ import me.rerere.rikkahub.data.model.Lorebook
+ import me.rerere.rikkahub.data.model.PromptInjection
+ import me.rerere.rikkahub.data.model.QuickMessage
+ import me.rerere.rikkahub.data.model.Tag
++import me.rerere.rikkahub.data.network.NetworkRoutingSettings
+ import me.rerere.rikkahub.data.sync.s3.S3Config
+ import me.rerere.rikkahub.ui.theme.CustomTheme
+ import me.rerere.rikkahub.ui.theme.PresetThemes
+@@ -361,6 +362,9 @@ data class NetworkSetting(
+     val dnsEnableIpv6: Boolean = false,
+     /** 「测试连接」用的域名（用户可自定义并保存；默认用 IANA 保留域名，全球可解析且带 AAAA）。 */
+     val dnsTestDomain: String = DEFAULT_DNS_TEST_DOMAIN,
++    // ── 网络路由（默认路由 + 按范围/按提供商 + 一键恢复直连；见 NetworkRouting.kt）──
++    /** 路由设置；默认 defaultRoute=PROXY 以保留旧版全局代理行为（见 NetworkRoutingSettings）。 */
++    val routing: NetworkRoutingSettings = NetworkRoutingSettings(),
+ ) {
+     companion object {
+         const val DNS_MODE_SYSTEM = "system"
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+new file mode 100644
+index 000000000..dcf1ed1de
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+@@ -0,0 +1,217 @@
++package me.rerere.rikkahub.data.network
++
++import kotlinx.serialization.SerialName
++import kotlinx.serialization.Serializable
++import me.rerere.ai.provider.ProviderSetting
++import java.net.URI
++
++/**
++ * Network route value, borrowed from the Minis "Network Route" settings page
++ * (interaction model only — no Minis code is used here).
++ *
++ * - [DIRECT]: direct connection, no HTTP proxy.
++ * - [TAILSCALE]: via the in-process Tailscale tunnel. Tailnet destinations always
++ *   go through the tunnel when it is running (the socket factory enforces this for
++ *   every route, because a tailnet address cannot be dialled directly). Public
++ *   destinations currently go direct: the app has no exit-node dial path, so a
++ *   "tailscale" route behaves like "direct" for public hosts. That gap is a known
++ *   limitation, not a silent fallback — see [NetworkRoutingSettings].
++ * - [PROXY]: via the configured HTTP proxy ([me.rerere.rikkahub.data.datastore.NetworkSetting.proxyUrl]).
++ *   When no proxy is configured the route falls back to direct (missing-proxy rule:
++ *   never fail, never error).
++ * - [FOLLOW_DEFAULT]: follow the default route (only meaningful for a scope or
++ *   provider entry; the default route itself never uses it).
++ */
++@Serializable
++enum class NetworkRoute {
++    @SerialName("direct")
++    DIRECT,
++
++    @SerialName("tailscale")
++    TAILSCALE,
++
++    @SerialName("proxy")
++    PROXY,
++
++    @SerialName("default")
++    FOLLOW_DEFAULT,
++}
++
++/**
++ * Traffic scope a route can be attached to. Mirrors the four Minis scopes.
++ * The [key] is the stable string stored in [NetworkRoutingSettings.scopeRoutes].
++ */
++@Serializable
++enum class NetworkScope(val key: String) {
++    @SerialName("shell")
++    SHELL("shell"),
++
++    @SerialName("browser")
++    BROWSER("browser"),
++
++    @SerialName("mcp")
++    MCP("mcp"),
++
++    @SerialName("backup")
++    BACKUP("backup"),
++}
++
++/**
++ * Network routing settings (the "Network Route" settings page).
++ *
++ * Stored inside [me.rerere.rikkahub.data.datastore.NetworkSetting] so it rides the
++ * existing DataStore flow; every field has a default, so old stored settings keep
++ * working.
++ *
++ * Default route is [NetworkRoute.PROXY] on purpose: the proxy used to be a single
++ * global setting applied to all shared-client traffic, and PROXY with the
++ * missing-proxy fallback reproduces that legacy behaviour exactly (proxy
++ * configured → traffic via proxy; none configured → direct). A fresh user without
++ * a proxy therefore sees no behaviour change, and an existing proxy user keeps
++ * working after this lands. Set the default to DIRECT explicitly to stop using
++ * the proxy by default.
++ *
++ * Known limitation: a [TAILSCALE] route does not change anything for public
++ * destinations (no exit-node dial path in the app yet). It is still the correct
++ * setting for a tailnet-hosted endpoint, and it documents intent for the future
++ * exit-node path.
++ */
++@Serializable
++data class NetworkRoutingSettings(
++    val defaultRoute: NetworkRoute = NetworkRoute.PROXY,
++    /** Per-scope routes, keyed by [NetworkScope.key]; absent = follow the default. */
++    val scopeRoutes: Map<String, NetworkRoute> = emptyMap(),
++    /** Per-provider routes, keyed by [ProviderSetting.id] string; absent = follow the default. */
++    val providerRoutes: Map<String, NetworkRoute> = emptyMap(),
++    /**
++     * One-click restore direct: when true every route resolves to [NetworkRoute.DIRECT].
++     * All settings are kept and can be resumed by turning this off again.
++     */
++    val forceDirect: Boolean = false,
++) {
++    /**
++     * Resolve the effective route. Decision order (same as Minis): provider tag →
++     * scope tag → default route → direct. A [NetworkRoute.FOLLOW_DEFAULT] entry is
++     * skipped as if it were absent.
++     */
++    fun resolveRoute(scope: NetworkScope? = null, providerId: String? = null): NetworkRoute {
++        if (forceDirect) return NetworkRoute.DIRECT
++        providerId?.let { id ->
++            providerRoutes[id]?.takeIf { it != NetworkRoute.FOLLOW_DEFAULT }?.let { return it }
++        }
++        scope?.let { s ->
++            scopeRoutes[s.key]?.takeIf { it != NetworkRoute.FOLLOW_DEFAULT }?.let { return it }
++        }
++        return if (defaultRoute == NetworkRoute.FOLLOW_DEFAULT) NetworkRoute.DIRECT else defaultRoute
++    }
++
++    /** True when the user changed anything from the defaults (i.e. the module is in use). */
++    fun isConfigured(): Boolean =
++        defaultRoute != NetworkRoute.PROXY || scopeRoutes.isNotEmpty() ||
++            providerRoutes.isNotEmpty() || forceDirect
++}
++
++/**
++ * Endpoint hosts a provider talks to, used to map a request host back to its
++ * provider for route resolution. An entry is either an exact host
++ * (e.g. `api.openai.com`) or a suffix pattern starting with `.`
++ * (e.g. `.googleapis.com`, matching any subdomain). Local providers
++ * (on-device inference) return an empty list: they make no network requests.
++ */
++fun providerEndpointHosts(provider: ProviderSetting): List<String> = when (provider) {
++    is ProviderSetting.OpenAI -> listOfNotNull(provider.baseUrl.toHostOrNull())
++    is ProviderSetting.Google -> listOfNotNull(
++        provider.baseUrl.toHostOrNull(),
++        // Vertex AI and the OAuth token endpoint share the googleapis.com suffix.
++        ".googleapis.com",
++    )
++    is ProviderSetting.Claude -> listOfNotNull(provider.baseUrl.toHostOrNull())
++    is ProviderSetting.Backend -> listOfNotNull(provider.baseUrl.toHostOrNull())
++    // Account-based providers use fixed SaaS domains (no user-configurable baseUrl).
++    is ProviderSetting.Codex -> listOf("chatgpt.com", "api.openai.com")
++    is ProviderSetting.Grok -> listOf("api.x.ai")
++    is ProviderSetting.GeminiOAuth -> listOf(".googleapis.com")
++    // On-device providers: no network endpoint.
++    is ProviderSetting.AICore,
++    is ProviderSetting.LiteRtLocal,
++    is ProviderSetting.LlamaCppLocal,
++    -> emptyList()
++}
++
++private fun String.toHostOrNull(): String? {
++    val value = trim()
++    if (value.isEmpty()) return null
++    val normalized = if ("://" in value) value else "https://$value"
++    return runCatching { URI(normalized).host }.getOrNull()
++        ?.takeIf { it.isNotBlank() }?.lowercase()
++}
++
++private fun String.matchesHostPattern(pattern: String): Boolean {
++    val host = lowercase().removeSurrounding("[", "]")
++    val normalized = pattern.lowercase().removeSurrounding("[", "]")
++    return if (normalized.startsWith(".")) {
++        host == normalized.removePrefix(".") || host.endsWith(normalized)
++    } else {
++        host == normalized
++    }
++}
++
++/**
++ * Find the provider id whose endpoint hosts match [host], or null when no
++ * provider matches. Providers are checked in list order; when two providers
++ * share a host (e.g. Codex and an OpenAI provider both on api.openai.com) the
++ * first one wins and both get the same route — a documented limitation of
++ * host-based matching.
++ */
++fun findProviderIdByHost(providers: List<ProviderSetting>, host: String): String? {
++    val needle = host.trim()
++    if (needle.isEmpty()) return null
++    for (provider in providers) {
++        if (providerEndpointHosts(provider).any { needle.matchesHostPattern(it) }) {
++            return provider.id.toString()
++        }
++    }
++    return null
++}
++
++/**
++ * Shell proxy environment variables for the terminal scope, following the Minis
++ * layout: SOCKS5 uses `socks5h` (remote DNS, MagicDNS resolves through the
++ * route), HTTP(S) uses `http`. Credentials are embedded when configured
++ * (the shell is the user's own process, same as Minis' per-process password).
++ * Returns an empty map when the route is not [NetworkRoute.PROXY] or no proxy
++ * is configured. `NO_PROXY` always covers loopback so local services are
++ * never sent to the proxy.
++ */
++fun proxyShellEnvVars(
++    route: NetworkRoute,
++    proxyUrl: String,
++    proxyUsername: String,
++    proxyPassword: String?,
++): Map<String, String> {
++    if (route != NetworkRoute.PROXY) return emptyMap()
++    val proxy = proxyUrl.toProxyOrNull() ?: return emptyMap()
++    val address = (proxy.address() as? java.net.InetSocketAddress)?.let { addr ->
++        val host = addr.hostString
++        val port = addr.port
++        val credentials = if (proxyUsername.isNotBlank() && !proxyPassword.isNullOrEmpty()) {
++            "${proxyUsername}:${proxyPassword}@"
++        } else {
++            ""
++        }
++        when (proxy.type()) {
++            java.net.Proxy.Type.SOCKS -> "socks5h://$credentials$host:$port"
++            else -> "http://$credentials$host:$port"
++        }
++    } ?: return emptyMap()
++    return mapOf(
++        "ALL_PROXY" to address,
++        "all_proxy" to address,
++        "HTTP_PROXY" to address,
++        "http_proxy" to address,
++        "HTTPS_PROXY" to address,
++        "https_proxy" to address,
++        "NO_PROXY" to "localhost,127.0.0.1,::1",
++        "no_proxy" to "localhost,127.0.0.1,::1",
++    )
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/ProxyConfig.kt b/app/src/main/java/me/rerere/rikkahub/data/network/ProxyConfig.kt
+index dd00908a3..53d923df1 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/network/ProxyConfig.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/ProxyConfig.kt
+@@ -2,12 +2,9 @@ package me.rerere.rikkahub.data.network
+ 
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
+-import java.io.IOException
+ import java.net.InetSocketAddress
+ import java.net.PasswordAuthentication
+ import java.net.Proxy
+-import java.net.ProxySelector
+-import java.net.SocketAddress
+ import java.net.URI
+ import okhttp3.Authenticator as OkHttpAuthenticator
+ import okhttp3.Credentials
+@@ -79,24 +76,3 @@ class SettingsSocks5Authenticator(
+         return PasswordAuthentication(setting.proxyUsername, password.toCharArray())
+     }
+ }
+-
+-class SettingsProxySelector(
+-    private val settingsStore: SettingsStore,
+-    private val systemProxySelector: ProxySelector? = ProxySelector.getDefault(),
+-) : ProxySelector() {
+-    override fun select(uri: URI): List<Proxy> {
+-        settingsStore.settingsFlow.value.networkSetting.proxyUrl.toProxyOrNull()?.let { proxy ->
+-            return listOf(proxy)
+-        }
+-        return runCatching { systemProxySelector?.select(uri) }
+-            .getOrNull()
+-            .orEmpty()
+-            .ifEmpty { listOf(Proxy.NO_PROXY) }
+-    }
+-
+-    override fun connectFailed(uri: URI, socketAddress: SocketAddress, exception: IOException) {
+-        if (settingsStore.settingsFlow.value.networkSetting.proxyUrl.toProxyOrNull() == null) {
+-            systemProxySelector?.connectFailed(uri, socketAddress, exception)
+-        }
+-    }
+-}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/RoutingProxySelector.kt b/app/src/main/java/me/rerere/rikkahub/data/network/RoutingProxySelector.kt
+new file mode 100644
+index 000000000..fe01c7d59
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/RoutingProxySelector.kt
+@@ -0,0 +1,91 @@
++package me.rerere.rikkahub.data.network
++
++import me.rerere.rikkahub.data.datastore.SettingsStore
++import java.io.IOException
++import java.net.Proxy
++import java.net.ProxySelector
++import java.net.SocketAddress
++import java.net.URI
++
++/**
++ * Route-aware [ProxySelector]: every connection asks the current routing
++ * settings which route applies, then returns the configured HTTP proxy or
++ * [Proxy.NO_PROXY].
++ *
++ * The route is resolved per URI, so one shared client can serve providers with
++ * different routes: the resolver maps the request host back to its provider
++ * (see [findProviderIdByHost]) and falls back to the default route when no
++ * provider matches. A scope-bound selector (MCP / backup) resolves every URI
++ * to its scope's route instead.
++ *
++ * Behaviour notes, all deliberate:
++ * - `PROXY` with no proxy configured falls back to the system selector
++ *   (effectively direct on Android) — the missing-proxy rule: never fail.
++ * - `DIRECT` / `TAILSCALE` return [Proxy.NO_PROXY] outright and never consult
++ *   the system selector: explicit direct means direct.
++ * - The tunnel is not decided here. Tailnet targets are handled by
++ *   [me.rerere.rikkahub.data.tunnel.TsnetSocketFactory] on every client, so a
++ *   tailnet address always goes through the tunnel when it is running,
++ *   whatever the route says.
++ * - Reads [SettingsStore.settingsFlow] live, so a route change applies to the
++ *   next connection without rebuilding the client. The existing pool-eviction
++ *   interceptor in the DI client still drops pooled connections on any
++ *   network-setting change.
++ */
++class RoutingProxySelector(
++    private val resolveRoute: (URI) -> NetworkRoute,
++    private val configuredProxy: () -> Proxy?,
++    private val systemProxySelector: ProxySelector? = ProxySelector.getDefault(),
++) : ProxySelector() {
++    override fun select(uri: URI): List<Proxy> {
++        val route = runCatching { resolveRoute(uri) }.getOrNull() ?: NetworkRoute.DIRECT
++        if (route == NetworkRoute.PROXY) {
++            configuredProxy()?.let { return listOf(it) }
++            // No proxy configured: fall through to the system selector, which is
++            // effectively direct on Android. Never fail the request here.
++        } else {
++            return listOf(Proxy.NO_PROXY)
++        }
++        return runCatching { systemProxySelector?.select(uri) }
++            .getOrNull()
++            .orEmpty()
++            .ifEmpty { listOf(Proxy.NO_PROXY) }
++    }
++
++    override fun connectFailed(uri: URI, socketAddress: SocketAddress, exception: IOException) {
++        if (configuredProxy() == null) {
++            systemProxySelector?.connectFailed(uri, socketAddress, exception)
++        }
++    }
++}
++
++/**
++ * Selector for the shared client: the route is resolved per request host.
++ * A host belonging to a provider uses that provider's route; any other host
++ * (model catalog, token endpoints, ...) uses the default route.
++ */
++fun routingProxySelectorForProviders(settingsStore: SettingsStore): RoutingProxySelector =
++    RoutingProxySelector(
++        resolveRoute = { uri ->
++            val settings = settingsStore.settingsFlow.value
++            val providerId = uri.host?.let { findProviderIdByHost(settings.providers, it) }
++            settings.networkSetting.routing.resolveRoute(providerId = providerId)
++        },
++        configuredProxy = {
++            settingsStore.settingsFlow.value.networkSetting.proxyUrl.toProxyOrNull()
++        },
++    )
++
++/** Selector bound to one scope (MCP / backup): every URI uses that scope's route. */
++fun routingProxySelectorForScope(
++    settingsStore: SettingsStore,
++    scope: NetworkScope,
++): RoutingProxySelector =
++    RoutingProxySelector(
++        resolveRoute = {
++            settingsStore.settingsFlow.value.networkSetting.routing.resolveRoute(scope = scope)
++        },
++        configuredProxy = {
++            settingsStore.settingsFlow.value.networkSetting.proxyUrl.toProxyOrNull()
++        },
++    )
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/WebViewProxy.kt b/app/src/main/java/me/rerere/rikkahub/data/network/WebViewProxy.kt
+new file mode 100644
+index 000000000..150045a1d
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/WebViewProxy.kt
+@@ -0,0 +1,79 @@
++package me.rerere.rikkahub.data.network
++
++import android.os.Handler
++import android.os.Looper
++import androidx.webkit.ProxyConfig
++import androidx.webkit.ProxyController
++import androidx.webkit.WebViewFeature
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.util.concurrent.Executor
++
++/**
++ * Built-in browser (WebView) proxy, following the Minis approach: the browser
++ * scope points the app-wide WebView proxy at the local proxy override
++ * ([ProxyController], `PROXY_OVERRIDE` feature).
++ *
++ * Notes:
++ * - The override is app-wide (all WebViews in this process), not per page.
++ *   It is (re)applied when a browser page opens and when the browser route
++ *   changes; a route change does not reach an already-open page until it is
++ *   reopened.
++ * - Only the proxy host/port (plus credentials, when configured) are put in
++ *   the rule; loopback is always bypassed. A proxy that answers 407 without
++ *   usable URL credentials will fail in the WebView — the WebView page has no
++ *   auth handler for external proxies (the API-traffic authenticators do not
++ *   apply here). This is a known limitation, documented in the delivery notes.
++ * - SOCKS5 uses the `socks5://` rule scheme (Chromium's SOCKS5 scheme).
++ *   Whether a given WebView build honours it depends on the WebView
++ *   implementation; unsupported builds are reported by [isSupported].
++ */
++object WebViewProxy {
++    private val mainExecutor: Executor =
++        Executor { command -> Handler(Looper.getMainLooper()).post(command) }
++
++    fun isSupported(): Boolean =
++        WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)
++
++    /**
++     * Apply [route] for the built-in browser. Returns false when the WebView
++     * implementation does not support proxy override (the caller should show
++     * a note instead of silently pretending it worked). Clearing the override
++     * (non-PROXY route, or PROXY with no proxy configured) also returns true.
++     */
++    fun apply(
++        route: NetworkRoute,
++        proxyUrl: String,
++        proxyUsername: String,
++        proxyPassword: String?,
++    ): Boolean {
++        if (!isSupported()) return false
++        val controller = ProxyController.getInstance()
++        if (route != NetworkRoute.PROXY) {
++            controller.clearProxyOverride(mainExecutor) {}
++            return true
++        }
++        val proxy = proxyUrl.toProxyOrNull() ?: run {
++            // PROXY route but no proxy configured (missing-proxy rule):
++            // clear any override so the browser goes direct.
++            controller.clearProxyOverride(mainExecutor) {}
++            return true
++        }
++        val address = proxy.address() as? InetSocketAddress ?: return false
++        val credentials = if (proxyUsername.isNotBlank() && !proxyPassword.isNullOrEmpty()) {
++            "${proxyUsername}:${proxyPassword}@"
++        } else {
++            ""
++        }
++        val scheme = if (proxy.type() == Proxy.Type.SOCKS) "socks5" else "http"
++        val rule = "$scheme://$credentials${address.hostString}:${address.port}"
++        val config = ProxyConfig.Builder()
++            .addProxyRule(rule)
++            .addBypassRule("localhost")
++            .addBypassRule("127.0.0.1")
++            .addBypassRule("::1")
++            .build()
++        controller.setProxyOverride(config, mainExecutor) {}
++        return true
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt b/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt
+index c4d8aeefd..1ad6c25d4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt
++++ b/app/src/main/java/me/rerere/rikkahub/di/AppModule.kt
+@@ -345,7 +345,7 @@ val appModule =
+         }
+ 
+         single {
+-            WorkspaceTerminalSessionManager(get(), get(), get())
++            WorkspaceTerminalSessionManager(get(), get(), get(), get())
+         }
+ 
+         single {
+diff --git a/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt b/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
+index b4f4385fb..485dcdb56 100644
+--- a/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
++++ b/app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt
+@@ -23,10 +23,12 @@ import me.rerere.rikkahub.data.ai.TermuxCliCommandExecutor
+ import me.rerere.rikkahub.data.ai.mcp.McpManager
+ import me.rerere.rikkahub.data.remote.ModelsDevUpdater
+ import me.rerere.rikkahub.data.network.HostOverrideDns
+-import me.rerere.rikkahub.data.tunnel.TsnetSocketFactory
++import me.rerere.rikkahub.data.network.NetworkScope
+ import me.rerere.rikkahub.data.network.SettingsProxyAuthenticator
+-import me.rerere.rikkahub.data.network.SettingsProxySelector
+ import me.rerere.rikkahub.data.network.SettingsSocks5Authenticator
++import me.rerere.rikkahub.data.network.routingProxySelectorForProviders
++import me.rerere.rikkahub.data.network.routingProxySelectorForScope
++import me.rerere.rikkahub.data.tunnel.TsnetSocketFactory
+ import me.rerere.rikkahub.data.ai.transformers.AssistantTemplateLoader
+ import me.rerere.rikkahub.data.ai.transformers.TemplateTransformer
+ import me.rerere.rikkahub.data.codex.CodexAccountRepository
+@@ -258,7 +260,9 @@ val dataSourceModule =
+             val appliedNetworkSetting = AtomicReference(initialNetworkSetting)
+             lateinit var client: OkHttpClient
+             client = OkHttpClient.Builder()
+-                .proxySelector(SettingsProxySelector(settingsStore))
++                // Route-aware proxy selection: each request host resolves to its
++                // provider's route (or the default route); see RoutingProxySelector.
++                .proxySelector(routingProxySelectorForProviders(settingsStore))
+                 .proxyAuthenticator(SettingsProxyAuthenticator(settingsStore))
+                 .dns(HostOverrideDns(settingsStore))
+                 .socketFactory(TsnetSocketFactory())
+@@ -541,6 +545,13 @@ val dataSourceModule =
+             HttpClient(OkHttp) {
+                 engine {
+                     config {
++                        // Backup route (WebDAV / S3): the Ktor client previously used
++                        // no proxy selector at all, so backup traffic bypassed the
++                        // configured proxy entirely. It now follows the backup scope's
++                        // route, and the tunnel socket factory lets tailnet backup
++                        // targets (e.g. a WebDAV server on the tailnet) connect.
++                        proxySelector(routingProxySelectorForScope(get(), NetworkScope.BACKUP))
++                        socketFactory(TsnetSocketFactory())
+                         connectTimeout(20, TimeUnit.SECONDS)
+                         readTimeout(10, TimeUnit.MINUTES)
+                         writeTimeout(120, TimeUnit.SECONDS)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSession.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSession.kt
+index a64031ed0..406037574 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSession.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSession.kt
+@@ -40,6 +40,12 @@ internal fun createWorkspaceTerminalSession(
+     client: TerminalSessionClient,
+     shellCompatibilityMode: Boolean,
+     extraMounts: List<WorkspaceBindMount> = emptyList(),
++    /**
++     * Proxy environment entries (`KEY=value`) for the shell scope, e.g. `ALL_PROXY=...`.
++     * Empty when the shell route is not PROXY or no proxy is configured; a running
++     * shell does not pick up later route changes (new terminals do).
++     */
++    proxyEnv: List<String> = emptyList(),
+ ): TerminalSession {
+     val appContext = context.applicationContext
+     val workspaceDir = File(File(appContext.filesDir, "workspaces"), root)
+@@ -93,8 +99,14 @@ internal fun createWorkspaceTerminalSession(
+             "LC_ALL=C.UTF-8",
+             "USER=root",
+             "SHELL=$shellPath",
+-            shellPath,
+         )
++    // Shell route: proxy variables go into the clean env (after /usr/bin/env -i),
++    // next to HOME/PATH/TERM and before the shell path — /usr/bin/env treats
++    // everything before the command as assignments. Only the entries the caller
++    // computed for the current shell route are added; nothing is injected for
++    // other routes.
++    args += proxyEnv
++    args += shellPath
+ 
+     val env = mutableListOf(
+         "PROOT_LOADER=${loader.absolutePath}",
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSessionManager.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSessionManager.kt
+index bd0972cb2..465533ace 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSessionManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/workspace/WorkspaceTerminalSessionManager.kt
+@@ -19,7 +19,11 @@ import me.rerere.rikkahub.AppScope
+ import me.rerere.rikkahub.R
+ import java.util.concurrent.atomic.AtomicLong
+ import me.rerere.rikkahub.data.db.entity.WorkspaceEntity
++import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.log.AppLog
++import me.rerere.rikkahub.data.network.NetworkScope
++import me.rerere.rikkahub.data.network.proxyShellEnvVars
++import me.rerere.rikkahub.data.network.resolveProxyPasswordForAuth
+ import me.rerere.rikkahub.data.repository.WorkspaceRepository
+ import me.rerere.workspace.WorkspaceMountUnavailableException
+ 
+@@ -37,6 +41,7 @@ class WorkspaceTerminalSessionManager internal constructor(
+     context: Context,
+     private val appScope: AppScope,
+     private val workspaceRepository: WorkspaceRepository,
++    private val settingsStore: SettingsStore,
+ ) {
+     private val appContext = context.applicationContext
+     private val workspaceStates = MutableStateFlow<Map<String, WorkspaceTerminalTabsState>>(emptyMap())
+@@ -192,6 +197,7 @@ class WorkspaceTerminalSessionManager internal constructor(
+                     client = client,
+                     shellCompatibilityMode = workspace.shellCompatibilityMode,
+                     extraMounts = workspace.extraBindMounts(),
++                    proxyEnv = shellProxyEnv(),
+                 )
+             }
+         }.onFailure { error ->
+@@ -234,6 +240,20 @@ class WorkspaceTerminalSessionManager internal constructor(
+         }
+     }
+ 
++    /**
++     * Proxy environment entries for a new local shell, from the current shell
++     * route. Empty unless the shell route is PROXY and a proxy is configured.
++     * Read live at session creation; a running shell does not pick up later
++     * route changes (new terminals do).
++     */
++    private fun shellProxyEnv(): List<String> {
++        val net = settingsStore.settingsFlow.value.networkSetting
++        val route = net.routing.resolveRoute(scope = NetworkScope.SHELL)
++        val password = resolveProxyPasswordForAuth(net.proxyPassword)
++        return proxyShellEnvVars(route, net.proxyUrl, net.proxyUsername, password)
++            .map { (key, value) -> "$key=$value" }
++    }
++
+     private fun updateTitle(root: String, tabId: Long, title: String?) {
+         val normalizedTitle = title?.trim()?.takeIf { it.isNotEmpty() }
+         workspaceStates.update { states ->
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
+new file mode 100644
+index 000000000..17c58fff1
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
+@@ -0,0 +1,313 @@
++package me.rerere.rikkahub.ui.pages.setting
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.material3.LargeFlexibleTopAppBar
++import androidx.compose.material3.ListItemDefaults
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TopAppBarDefaults
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.remember
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.input.nestedscroll.nestedScroll
++import androidx.compose.ui.res.stringResource
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.network.NetworkRoute
++import me.rerere.rikkahub.data.network.NetworkRoutingSettings
++import me.rerere.rikkahub.data.network.NetworkScope
++import me.rerere.rikkahub.data.network.WebViewProxy
++import me.rerere.rikkahub.data.network.resolveProxyPasswordForAuth
++import me.rerere.rikkahub.data.network.toProxyOrNull
++import me.rerere.rikkahub.ui.components.nav.BackButton
++import me.rerere.rikkahub.ui.components.ui.CardGroup
++import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
++import org.koin.androidx.compose.koinViewModel
++
++/**
++ * Network Route settings page (Minis "Network Route" page, interaction model
++ * only — no Minis code): default route + per-scope routes (terminal / browser /
++ * MCP / backup) + per-provider routes + one-click restore direct.
++ *
++ * Enforcement lives in the routing-aware proxy selector (providers), the
++ * scope-bound selectors (MCP / backup), shell env vars (terminal) and the
++ * WebView proxy override (browser). See NetworkRouting.kt.
++ */
++@Composable
++fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
++    val settings by vm.settings.collectAsStateWithLifecycle()
++    val net = settings.networkSetting
++    val routing = net.routing
++    val proxyConfigured = net.proxyUrl.toProxyOrNull() != null
++    val webViewSupported = remember { WebViewProxy.isSupported() }
++    val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
++
++    fun updateRouting(transform: (NetworkRoutingSettings) -> NetworkRoutingSettings) {
++        // Compute the new routing first: the browser proxy is applied with the
++        // fresh values right away (no need to wait for the DataStore round-trip).
++        val newRouting = transform(routing)
++        vm.updateSettings { current ->
++            current.copy(networkSetting = current.networkSetting.copy(routing = newRouting))
++        }
++        WebViewProxy.apply(
++            route = newRouting.resolveRoute(scope = NetworkScope.BROWSER),
++            proxyUrl = net.proxyUrl,
++            proxyUsername = net.proxyUsername,
++            proxyPassword = resolveProxyPasswordForAuth(net.proxyPassword),
++        )
++    }
++
++    Scaffold(
++        modifier = Modifier
++            .fillMaxSize()
++            .nestedScroll(scrollBehavior.nestedScrollConnection),
++        topBar = {
++            LargeFlexibleTopAppBar(
++                title = { Text(stringResource(R.string.setting_page_network_routing_title)) },
++                navigationIcon = { BackButton() },
++                scrollBehavior = scrollBehavior,
++            )
++        },
++    ) { padding ->
++        LazyColumn(
++            contentPadding = padding,
++            verticalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            if (routing.forceDirect) {
++                item {
++                    CardGroup(
++                        modifier = Modifier.padding(horizontal = 8.dp),
++                    ) {
++                        item(
++                            headlineContent = {
++                                Text(stringResource(R.string.setting_page_network_routing_force_direct_on))
++                            },
++                            supportingContent = {
++                                Text(stringResource(R.string.setting_page_network_routing_force_direct_desc))
++                            },
++                            colors = ListItemDefaults.colors(
++                                containerColor = MaterialTheme.colorScheme.errorContainer,
++                                headlineColor = MaterialTheme.colorScheme.onErrorContainer,
++                                supportingColor = MaterialTheme.colorScheme.onErrorContainer,
++                            ),
++                        )
++                    }
++                }
++            }
++            item {
++                CardGroup(
++                    modifier = Modifier.padding(horizontal = 8.dp),
++                ) {
++                    formItem(
++                        headlineContent = {
++                            Text(stringResource(R.string.setting_page_network_routing_default))
++                        },
++                        supportingContent = {
++                            Column {
++                                Text(stringResource(R.string.setting_page_network_routing_default_desc))
++                                if (!proxyConfigured) {
++                                    Text(stringResource(R.string.setting_page_network_routing_no_proxy))
++                                }
++                            }
++                        },
++                    ) {
++                        RouteChoiceButtons(
++                            selected = routing.defaultRoute,
++                            options = listOf(
++                                NetworkRoute.DIRECT,
++                                NetworkRoute.TAILSCALE,
++                                NetworkRoute.PROXY,
++                            ),
++                            onSelect = { route ->
++                                updateRouting { it.copy(defaultRoute = route) }
++                            },
++                        )
++                    }
++                }
++            }
++            item {
++                CardGroup(
++                    modifier = Modifier.padding(horizontal = 8.dp),
++                    title = { Text(stringResource(R.string.setting_page_network_routing_scope_title)) },
++                ) {
++                    NetworkScope.entries.forEach { scope ->
++                        val selected = routing.scopeRoutes[scope.key] ?: NetworkRoute.FOLLOW_DEFAULT
++                        formItem(
++                            headlineContent = {
++                                Text(scopeName(scope))
++                            },
++                            supportingContent = {
++                                Column {
++                                    Text(
++                                        stringResource(
++                                            R.string.setting_page_network_routing_effective,
++                                            routeName(routing.resolveRoute(scope = scope)),
++                                        ),
++                                    )
++                                    if (selected == NetworkRoute.PROXY && !proxyConfigured) {
++                                        Text(stringResource(R.string.setting_page_network_routing_no_proxy))
++                                    }
++                                    if (selected == NetworkRoute.TAILSCALE) {
++                                        Text(stringResource(R.string.setting_page_network_routing_tailscale_note))
++                                    }
++                                    if (scope == NetworkScope.BROWSER && !webViewSupported) {
++                                        Text(stringResource(R.string.setting_page_network_routing_webview_unsupported))
++                                    }
++                                }
++                            },
++                        ) {
++                            RouteChoiceButtons(
++                                selected = selected,
++                                options = listOf(
++                                    NetworkRoute.DIRECT,
++                                    NetworkRoute.TAILSCALE,
++                                    NetworkRoute.PROXY,
++                                    NetworkRoute.FOLLOW_DEFAULT,
++                                ),
++                                onSelect = { route ->
++                                    updateRouting { current ->
++                                        val routes = current.scopeRoutes.toMutableMap()
++                                        if (route == NetworkRoute.FOLLOW_DEFAULT) {
++                                            routes.remove(scope.key)
++                                        } else {
++                                            routes[scope.key] = route
++                                        }
++                                        current.copy(scopeRoutes = routes)
++                                    }
++                                },
++                            )
++                        }
++                    }
++                }
++            }
++            item {
++                CardGroup(
++                    modifier = Modifier.padding(horizontal = 8.dp),
++                    title = { Text(stringResource(R.string.setting_page_network_routing_provider_title)) },
++                ) {
++                    settings.providers.forEach { provider ->
++                        val providerId = provider.id.toString()
++                        val selected =
++                            routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
++                        formItem(
++                            headlineContent = {
++                                Text(provider.name)
++                            },
++                            supportingContent = {
++                                Column {
++                                    Text(
++                                        stringResource(
++                                            R.string.setting_page_network_routing_effective,
++                                            routeName(routing.resolveRoute(providerId = providerId)),
++                                        ),
++                                    )
++                                    if (selected == NetworkRoute.PROXY && !proxyConfigured) {
++                                        Text(stringResource(R.string.setting_page_network_routing_no_proxy))
++                                    }
++                                    if (selected == NetworkRoute.TAILSCALE) {
++                                        Text(stringResource(R.string.setting_page_network_routing_tailscale_note))
++                                    }
++                                }
++                            },
++                        ) {
++                            RouteChoiceButtons(
++                                selected = selected,
++                                options = listOf(
++                                    NetworkRoute.DIRECT,
++                                    NetworkRoute.TAILSCALE,
++                                    NetworkRoute.PROXY,
++                                    NetworkRoute.FOLLOW_DEFAULT,
++                                ),
++                                onSelect = { route ->
++                                    updateRouting { current ->
++                                        val routes = current.providerRoutes.toMutableMap()
++                                        if (route == NetworkRoute.FOLLOW_DEFAULT) {
++                                            routes.remove(providerId)
++                                        } else {
++                                            routes[providerId] = route
++                                        }
++                                        current.copy(providerRoutes = routes)
++                                    }
++                                },
++                            )
++                        }
++                    }
++                }
++            }
++            item {
++                CardGroup(
++                    modifier = Modifier.padding(horizontal = 8.dp),
++                ) {
++                    item(
++                        onClick = {
++                            updateRouting { it.copy(forceDirect = !it.forceDirect) }
++                        },
++                        headlineContent = {
++                            Text(
++                                stringResource(
++                                    if (routing.forceDirect) {
++                                        R.string.setting_page_network_routing_resume
++                                    } else {
++                                        R.string.setting_page_network_routing_force_direct
++                                    },
++                                ),
++                            )
++                        },
++                        supportingContent = {
++                            Text(stringResource(R.string.setting_page_network_routing_force_direct_desc))
++                        },
++                        colors = ListItemDefaults.colors(
++                            containerColor = MaterialTheme.colorScheme.errorContainer,
++                            headlineColor = MaterialTheme.colorScheme.onErrorContainer,
++                            supportingColor = MaterialTheme.colorScheme.onErrorContainer,
++                        ),
++                    )
++                }
++            }
++        }
++    }
++}
++
++@Composable
++private fun RouteChoiceButtons(
++    selected: NetworkRoute,
++    options: List<NetworkRoute>,
++    onSelect: (NetworkRoute) -> Unit,
++) {
++    ConnectedChoiceButtons(
++        options = options,
++        selected = selected,
++        onSelect = onSelect,
++        modifier = Modifier.fillMaxWidth(),
++    ) { option, _ ->
++        Text(routeName(option))
++    }
++}
++
++@Composable
++private fun routeName(route: NetworkRoute): String = stringResource(
++    when (route) {
++        NetworkRoute.DIRECT -> R.string.setting_page_network_routing_route_direct
++        NetworkRoute.TAILSCALE -> R.string.setting_page_network_routing_route_tailscale
++        NetworkRoute.PROXY -> R.string.setting_page_network_routing_route_proxy
++        NetworkRoute.FOLLOW_DEFAULT -> R.string.setting_page_network_routing_route_default
++    },
++)
++
++@Composable
++private fun scopeName(scope: NetworkScope): String = stringResource(
++    when (scope) {
++        NetworkScope.SHELL -> R.string.setting_page_network_routing_scope_shell
++        NetworkScope.BROWSER -> R.string.setting_page_network_routing_scope_browser
++        NetworkScope.MCP -> R.string.setting_page_network_routing_scope_mcp
++        NetworkScope.BACKUP -> R.string.setting_page_network_routing_scope_backup
++    },
++)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesNetworkPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesNetworkPage.kt
+index cd5c2da5a..9b8135a3e 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesNetworkPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPreferencesNetworkPage.kt
+@@ -34,6 +34,7 @@ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.ArrowRight01
+ import me.rerere.hugeicons.stroke.Internet
+ import me.rerere.hugeicons.stroke.Refresh
++import me.rerere.hugeicons.stroke.Route01
+ import me.rerere.hugeicons.stroke.Router
+ import me.rerere.hugeicons.stroke.ServerStack01
+ import me.rerere.hugeicons.stroke.Shield01
+@@ -198,6 +199,22 @@ fun SettingPreferencesNetworkPage(vm: SettingVM = koinViewModel()) {
+                 CardGroup(
+                     modifier = Modifier.padding(horizontal = 8.dp),
+                 ) {
++                    item(
++                        onClick = { nav.navigate(Screen.SettingNetworkRouting) },
++                        leadingContent = {
++                            CardGroupIcon(
++                                icon = HugeIcons.Route01,
++                                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
++                                contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
++                            )
++                        },
++                        headlineContent = {
++                            Text(stringResource(R.string.setting_page_preferences_network_routing))
++                        },
++                        trailingContent = {
++                            Icon(HugeIcons.ArrowRight01, contentDescription = null)
++                        },
++                    )
+                     item(
+                         onClick = { nav.navigate(Screen.SettingNetworkProxy) },
+                         leadingContent = {
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/webview/WebViewPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/webview/WebViewPage.kt
+index d098f4723..1647891b6 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/webview/WebViewPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/webview/WebViewPage.kt
+@@ -21,6 +21,7 @@ import androidx.compose.material3.Text
+ import androidx.compose.material3.TopAppBar
+ import androidx.compose.material3.rememberBottomSheetState
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.produceState
+@@ -40,11 +41,16 @@ import me.rerere.hugeicons.stroke.Bug01
+ import me.rerere.hugeicons.stroke.Earth
+ import me.rerere.hugeicons.stroke.MoreVertical
+ import me.rerere.hugeicons.stroke.Refresh01
++import me.rerere.rikkahub.data.datastore.SettingsStore
++import me.rerere.rikkahub.data.network.NetworkScope
++import me.rerere.rikkahub.data.network.WebViewProxy
++import me.rerere.rikkahub.data.network.resolveProxyPasswordForAuth
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.webview.WEB_VIEW_BASE_URL
+ import me.rerere.rikkahub.ui.components.webview.WebView
+ import me.rerere.rikkahub.ui.components.webview.WebViewContentCache
+ import me.rerere.rikkahub.ui.components.webview.rememberWebViewState
++import org.koin.compose.koinInject
+ import me.rerere.rikkahub.ui.theme.JetbrainsMono
+ 
+ @OptIn(ExperimentalMaterial3Api::class)
+@@ -54,6 +60,19 @@ fun WebViewPage(
+     contentId: String,
+ ) {
+     val context = LocalContext.current
++    // Browser route: apply the current browser scope's proxy to the app-wide
++    // WebView proxy override when the page opens. A route change while the page
++    // is open only takes effect on the next open (the override is app-wide).
++    val settingsStore = koinInject<SettingsStore>()
++    LaunchedEffect(Unit) {
++        val net = settingsStore.settingsFlow.value.networkSetting
++        WebViewProxy.apply(
++            route = net.routing.resolveRoute(scope = NetworkScope.BROWSER),
++            proxyUrl = net.proxyUrl,
++            proxyUsername = net.proxyUsername,
++            proxyPassword = resolveProxyPasswordForAuth(net.proxyPassword),
++        )
++    }
+     // 缓存 HTML 在 IO 线程读盘，组合期不再主线程读文件。
+     val content by produceState(initialValue = "", contentId) {
+         value = withContext(Dispatchers.IO) {
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index e7150373d..137989abc 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -3205,6 +3205,28 @@
+   <string name="setting_page_preferences_network_proxy_desc">يدعم عناوين وكيل HTTP و SOCKS5. اتركه فارغًا لاستخدام إعدادات النظام.
+ </string>
+   <string name="setting_page_preferences_network_proxy_invalid">أدخل عنوان وكيل صالحًا يتضمن المضيف والمنفذ.</string>
++  <string name="setting_page_preferences_network_routing">مسار الشبكة</string>
++  <string name="setting_page_network_routing_title">مسار الشبكة</string>
++  <string name="setting_page_network_routing_default">المسار الافتراضي</string>
++  <string name="setting_page_network_routing_default_desc">يُستخدم عندما لا يكون للنطاق أو المزوّد مسار خاص به. اختيار الوكيل يحافظ على السلوك السابق: تمر الحركة عبر الوكيل المُعدّ، أو مباشرةً عند عدم وجود وكيل.</string>
++  <string name="setting_page_network_routing_scope_title">مسارات حسب النطاق</string>
++  <string name="setting_page_network_routing_provider_title">مسارات حسب المزوّد</string>
++  <string name="setting_page_network_routing_route_direct">مباشر</string>
++  <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
++  <string name="setting_page_network_routing_route_proxy">وكيل</string>
++  <string name="setting_page_network_routing_route_default">افتراضي</string>
++  <string name="setting_page_network_routing_effective">سارٍ: %1$s</string>
++  <string name="setting_page_network_routing_no_proxy">لم يتم إعداد وكيل — سيتم الاتصال مباشرةً.</string>
++  <string name="setting_page_network_routing_tailscale_note">وجهات Tailscale تمر دائمًا عبر النفق؛ أما الوجهات العامة فتتصل مباشرةً حاليًا (توجيه عقدة الخروج غير منفذ بعد).</string>
++  <string name="setting_page_network_routing_force_direct">استعادة الاتصالات المباشرة</string>
++  <string name="setting_page_network_routing_force_direct_desc">تمر كل الحركة مباشرةً. تُحفظ الإعدادات ويمكن استعادتها.</string>
++  <string name="setting_page_network_routing_force_direct_on">تمت استعادة الاتصالات المباشرة</string>
++  <string name="setting_page_network_routing_resume">استعادة المسارات</string>
++  <string name="setting_page_network_routing_scope_shell">الطرفية</string>
++  <string name="setting_page_network_routing_scope_browser">المتصفح</string>
++  <string name="setting_page_network_routing_scope_mcp">MCP</string>
++  <string name="setting_page_network_routing_scope_backup">النسخ الاحتياطي</string>
++  <string name="setting_page_network_routing_webview_unsupported">لا يدعم WebView على هذا الجهاز تجاوز الوكيل؛ المتصفح يتصل مباشرةً دائمًا.</string>
+   <string name="setting_page_preferences_network_host_overrides">تجاوز DNS للنطاقات</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">يثبّت النطاق على عنوان IP محدد متجاوزًا مُحلِّل النظام، وهو مفيد عندما يكون المسار المُحلَّل بطيئًا أو غير مستقر.</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">لا توجد مدخلات بعد</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 782749a7a..2c459862a 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -2520,6 +2520,28 @@
+     <string name="setting_page_preferences_network_proxy">代理</string>
+     <string name="setting_page_preferences_network_proxy_desc">支援 HTTP 和 SOCKS5 代理 URL。留空以使用系統設定。</string>
+     <string name="setting_page_preferences_network_proxy_invalid">請輸入包含主機和埠的有效代理 URL。</string>
++    <string name="setting_page_preferences_network_routing">網路路由</string>
++    <string name="setting_page_network_routing_title">網路路由</string>
++    <string name="setting_page_network_routing_default">預設路由</string>
++    <string name="setting_page_network_routing_default_desc">未單獨設定路由的範圍或提供商使用它。選代理可保持以往行為：走已設定的代理，未設定時直連。</string>
++    <string name="setting_page_network_routing_scope_title">按範圍設定路由</string>
++    <string name="setting_page_network_routing_provider_title">按提供商設定路由</string>
++    <string name="setting_page_network_routing_route_direct">直連</string>
++    <string name="setting_page_network_routing_route_tailscale">隧道</string>
++    <string name="setting_page_network_routing_route_proxy">代理</string>
++    <string name="setting_page_network_routing_route_default">預設</string>
++    <string name="setting_page_network_routing_effective">生效：%1$s</string>
++    <string name="setting_page_network_routing_no_proxy">未設定代理，將直連。</string>
++    <string name="setting_page_network_routing_tailscale_note">尾網目標始終走隧道；公網目標目前直連（出口節點撥號尚未實作）。</string>
++    <string name="setting_page_network_routing_force_direct">恢復直連</string>
++    <string name="setting_page_network_routing_force_direct_desc">全部流量直連。設定保留，可隨時恢復。</string>
++    <string name="setting_page_network_routing_force_direct_on">已恢復直連</string>
++    <string name="setting_page_network_routing_resume">恢復路由</string>
++    <string name="setting_page_network_routing_scope_shell">終端機</string>
++    <string name="setting_page_network_routing_scope_browser">瀏覽器</string>
++    <string name="setting_page_network_routing_scope_mcp">MCP</string>
++    <string name="setting_page_network_routing_scope_backup">備份</string>
++    <string name="setting_page_network_routing_webview_unsupported">目前裝置的 WebView 不支援設定代理，瀏覽器始終直連。</string>
+   <string name="setting_page_preferences_network_host_overrides">主機解析覆蓋</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">將網域固定解析到指定 IP，繞過系統解析器，適用於解析到慢或不穩定路由的情況。</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">尚未設定</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 605e08151..e8493cca2 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -2195,6 +2195,28 @@
+ <string name="setting_page_preferences_network_proxy">プロキシ</string>
+ <string name="setting_page_preferences_network_proxy_desc">HTTPおよびSOCKS5プロキシURLをサポートします。空白の場合はシステム設定を使用します。</string>
+ <string name="setting_page_preferences_network_proxy_invalid">ホストとポートを含む有効なプロキシURLを入力してください。</string>
++<string name="setting_page_preferences_network_routing">ネットワークルート</string>
++<string name="setting_page_network_routing_title">ネットワークルート</string>
++<string name="setting_page_network_routing_default">既定ルート</string>
++<string name="setting_page_network_routing_default_desc">範囲やプロバイダーに個別のルートが未設定の場合に使用します。プロキシを選ぶと従来の動作を維持します。設定済みのプロキシ経由、未設定の場合は直接接続します。</string>
++<string name="setting_page_network_routing_scope_title">範囲別ルート</string>
++<string name="setting_page_network_routing_provider_title">プロバイダー別ルート</string>
++<string name="setting_page_network_routing_route_direct">直接</string>
++<string name="setting_page_network_routing_route_tailscale">Tailscale</string>
++<string name="setting_page_network_routing_route_proxy">プロキシ</string>
++<string name="setting_page_network_routing_route_default">既定</string>
++<string name="setting_page_network_routing_effective">適用中：%1$s</string>
++<string name="setting_page_network_routing_no_proxy">プロキシが設定されていません。直接接続します。</string>
++<string name="setting_page_network_routing_tailscale_note">Tailscale 宛は常にトンネル経由です。公開宛先は現在直接接続します（出口ノード経由のダイヤルは未実装です）。</string>
++<string name="setting_page_network_routing_force_direct">直接接続に戻す</string>
++<string name="setting_page_network_routing_force_direct_desc">すべての通信が直接接続になります。設定は保持され、いつでも復元できます。</string>
++<string name="setting_page_network_routing_force_direct_on">直接接続に戻しました</string>
++<string name="setting_page_network_routing_resume">ルートを復元</string>
++<string name="setting_page_network_routing_scope_shell">ターミナル</string>
++<string name="setting_page_network_routing_scope_browser">ブラウザー</string>
++<string name="setting_page_network_routing_scope_mcp">MCP</string>
++<string name="setting_page_network_routing_scope_backup">バックアップ</string>
++<string name="setting_page_network_routing_webview_unsupported">このデバイスの WebView はプロキシの上書きに対応していません。ブラウザーは常に直接接続します。</string>
+   <string name="setting_page_preferences_network_host_overrides">ホスト DNS 上書き</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">ドメインを固定 IP に紐付け、システムのリゾルバをバイパスします。解決先が遅い・不安定な場合に有効です。</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">設定なし</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index ee0129f7e..c073ca7cd 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -2192,6 +2192,28 @@
+ <string name="setting_page_preferences_network_proxy">프록시</string>
+ <string name="setting_page_preferences_network_proxy_desc">HTTP 및 SOCKS5 프록시 URL을 지원합니다. 비워 두면 시스템 설정을 사용합니다.</string>
+ <string name="setting_page_preferences_network_proxy_invalid">호스트와 포트가 있는 유효한 프록시 URL을 입력하세요.</string>
++<string name="setting_page_preferences_network_routing">네트워크 경로</string>
++<string name="setting_page_network_routing_title">네트워크 경로</string>
++<string name="setting_page_network_routing_default">기본 경로</string>
++<string name="setting_page_network_routing_default_desc">범위나 제공업체에 개별 경로가 없을 때 사용합니다. 프록시를 선택하면 이전 동작을 유지합니다. 설정된 프록시를 경유하고, 설정되지 않았으면 직접 연결합니다.</string>
++<string name="setting_page_network_routing_scope_title">범위별 경로</string>
++<string name="setting_page_network_routing_provider_title">제공업체별 경로</string>
++<string name="setting_page_network_routing_route_direct">직접</string>
++<string name="setting_page_network_routing_route_tailscale">Tailscale</string>
++<string name="setting_page_network_routing_route_proxy">프록시</string>
++<string name="setting_page_network_routing_route_default">기본값</string>
++<string name="setting_page_network_routing_effective">적용 중: %1$s</string>
++<string name="setting_page_network_routing_no_proxy">프록시가 설정되지 않았습니다. 직접 연결합니다.</string>
++<string name="setting_page_network_routing_tailscale_note">Tailscale 대상은 항상 터널을 사용합니다. 공용 대상은 현재 직접 연결합니다(출구 노드 다이얼은 아직 구현되지 않았습니다).</string>
++<string name="setting_page_network_routing_force_direct">직접 연결로 복원</string>
++<string name="setting_page_network_routing_force_direct_desc">모든 트래픽이 직접 연결됩니다. 설정은 유지되며 언제든 복원할 수 있습니다.</string>
++<string name="setting_page_network_routing_force_direct_on">직접 연결로 복원됨</string>
++<string name="setting_page_network_routing_resume">경로 복원</string>
++<string name="setting_page_network_routing_scope_shell">터미널</string>
++<string name="setting_page_network_routing_scope_browser">브라우저</string>
++<string name="setting_page_network_routing_scope_mcp">MCP</string>
++<string name="setting_page_network_routing_scope_backup">백업</string>
++<string name="setting_page_network_routing_webview_unsupported">이 기기의 WebView는 프록시 재지정을 지원하지 않습니다. 브라우저는 항상 직접 연결합니다.</string>
+   <string name="setting_page_preferences_network_host_overrides">호스트 DNS 고정</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">도메인을 지정한 IP 로 고정하여 시스템 리졸버를 우회합니다. 응답이 느리거나 불안정할 때 유용합니다.</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">설정된 항목 없음</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 402f09146..2276d5415 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -2190,6 +2190,28 @@
+ <string name="setting_page_preferences_network_proxy">Прокси</string>
+ <string name="setting_page_preferences_network_proxy_desc">Поддерживает HTTP и SOCKS5 прокси-URL. Оставьте пустым для использования системных настроек.</string>
+ <string name="setting_page_preferences_network_proxy_invalid">Введите корректный URL прокси-сервера с хостом и портом.</string>
++<string name="setting_page_preferences_network_routing">Маршрут сети</string>
++<string name="setting_page_network_routing_title">Маршрут сети</string>
++<string name="setting_page_network_routing_default">Маршрут по умолчанию</string>
++<string name="setting_page_network_routing_default_desc">Используется, когда у области или провайдера нет собственного маршрута. «Прокси» сохраняет прежнее поведение: трафик идёт через настроенный прокси, а при его отсутствии — напрямую.</string>
++<string name="setting_page_network_routing_scope_title">Маршруты по областям</string>
++<string name="setting_page_network_routing_provider_title">Маршруты по провайдерам</string>
++<string name="setting_page_network_routing_route_direct">Напрямую</string>
++<string name="setting_page_network_routing_route_tailscale">Tailscale</string>
++<string name="setting_page_network_routing_route_proxy">Прокси</string>
++<string name="setting_page_network_routing_route_default">По умолчанию</string>
++<string name="setting_page_network_routing_effective">Действует: %1$s</string>
++<string name="setting_page_network_routing_no_proxy">Прокси не настроен — будет прямое подключение.</string>
++<string name="setting_page_network_routing_tailscale_note">Назначения в Tailscale всегда идут через туннель; публичные назначения пока подключаются напрямую (маршрутизация через выходной узел ещё не реализована).</string>
++<string name="setting_page_network_routing_force_direct">Вернуть прямые подключения</string>
++<string name="setting_page_network_routing_force_direct_desc">Весь трафик идёт напрямую. Настройки сохраняются, их можно восстановить.</string>
++<string name="setting_page_network_routing_force_direct_on">Прямые подключения восстановлены</string>
++<string name="setting_page_network_routing_resume">Восстановить маршруты</string>
++<string name="setting_page_network_routing_scope_shell">Терминал</string>
++<string name="setting_page_network_routing_scope_browser">Браузер</string>
++<string name="setting_page_network_routing_scope_mcp">MCP</string>
++<string name="setting_page_network_routing_scope_backup">Резервная копия</string>
++<string name="setting_page_network_routing_webview_unsupported">WebView этого устройства не поддерживает переопределение прокси; браузер всегда подключается напрямую.</string>
+   <string name="setting_page_preferences_network_host_overrides">Переопределение DNS хостов</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">Закрепляет домен за указанными IP-адресами в обход системного распознавателя. Полезно, когда полученный маршрут медленный или нестабильный.</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">Пока нет записей</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 376acc2be..2a79c49bc 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1506,6 +1506,28 @@
+   <string name="setting_page_preferences_network_proxy">代理</string>
+   <string name="setting_page_preferences_network_proxy_desc">支持 HTTP 和 SOCKS5 代理 URL。留空以使用系统设置。</string>
+   <string name="setting_page_preferences_network_proxy_invalid">请输入包含主机和端口的有效代理 URL。</string>
++  <string name="setting_page_preferences_network_routing">网络路由</string>
++  <string name="setting_page_network_routing_title">网络路由</string>
++  <string name="setting_page_network_routing_default">默认路由</string>
++  <string name="setting_page_network_routing_default_desc">未单独设置路由的范围或提供商使用它。选代理可保持以往行为：走已配置的代理，未配置时直连。</string>
++  <string name="setting_page_network_routing_scope_title">按范围设置路由</string>
++  <string name="setting_page_network_routing_provider_title">按提供商设置路由</string>
++  <string name="setting_page_network_routing_route_direct">直连</string>
++  <string name="setting_page_network_routing_route_tailscale">隧道</string>
++  <string name="setting_page_network_routing_route_proxy">代理</string>
++  <string name="setting_page_network_routing_route_default">默认</string>
++  <string name="setting_page_network_routing_effective">生效：%1$s</string>
++  <string name="setting_page_network_routing_no_proxy">未配置代理，将直连。</string>
++  <string name="setting_page_network_routing_tailscale_note">尾网目标始终走隧道；公网目标目前直连（出口节点拨号尚未实现）。</string>
++  <string name="setting_page_network_routing_force_direct">恢复直连</string>
++  <string name="setting_page_network_routing_force_direct_desc">全部流量直连。设置保留，可随时恢复。</string>
++  <string name="setting_page_network_routing_force_direct_on">已恢复直连</string>
++  <string name="setting_page_network_routing_resume">恢复路由</string>
++  <string name="setting_page_network_routing_scope_shell">终端</string>
++  <string name="setting_page_network_routing_scope_browser">浏览器</string>
++  <string name="setting_page_network_routing_scope_mcp">MCP</string>
++  <string name="setting_page_network_routing_scope_backup">备份</string>
++  <string name="setting_page_network_routing_webview_unsupported">当前设备的 WebView 不支持设置代理，浏览器始终直连。</string>
+   <string name="setting_page_preferences_network_host_overrides">主机解析覆盖</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">将域名固定解析到指定 IP，绕过系统解析器，适用于解析到慢或不稳定路由的情况。</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">暂未配置</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index e255fe7af..8fae66ff2 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1161,6 +1161,28 @@
+   <string name="setting_page_preferences_network_proxy">Proxy</string>
+   <string name="setting_page_preferences_network_proxy_desc">Supports HTTP and SOCKS5 proxy URLs. Leave blank to use system settings.</string>
+   <string name="setting_page_preferences_network_proxy_invalid">Enter a valid proxy URL with a host and port.</string>
++  <string name="setting_page_preferences_network_routing">Network Route</string>
++  <string name="setting_page_network_routing_title">Network Route</string>
++  <string name="setting_page_network_routing_default">Default route</string>
++  <string name="setting_page_network_routing_default_desc">Used when a scope or provider has no route of its own. Proxy keeps the previous behavior: traffic goes through the configured proxy, or direct when none is configured.</string>
++  <string name="setting_page_network_routing_scope_title">Per-scope routes</string>
++  <string name="setting_page_network_routing_provider_title">Per-provider routes</string>
++  <string name="setting_page_network_routing_route_direct">Direct</string>
++  <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
++  <string name="setting_page_network_routing_route_proxy">Proxy</string>
++  <string name="setting_page_network_routing_route_default">Default</string>
++  <string name="setting_page_network_routing_effective">Effective: %1$s</string>
++  <string name="setting_page_network_routing_no_proxy">No proxy configured — falls back to direct.</string>
++  <string name="setting_page_network_routing_tailscale_note">Tailscale destinations always use the tunnel; public destinations currently go direct (exit-node routing is not implemented yet).</string>
++  <string name="setting_page_network_routing_force_direct">Restore direct connections</string>
++  <string name="setting_page_network_routing_force_direct_desc">All traffic goes direct. Settings are kept and can be resumed.</string>
++  <string name="setting_page_network_routing_force_direct_on">Direct connections restored</string>
++  <string name="setting_page_network_routing_resume">Resume routes</string>
++  <string name="setting_page_network_routing_scope_shell">Terminal</string>
++  <string name="setting_page_network_routing_scope_browser">Browser</string>
++  <string name="setting_page_network_routing_scope_mcp">MCP</string>
++  <string name="setting_page_network_routing_scope_backup">Backup</string>
++  <string name="setting_page_network_routing_webview_unsupported">The WebView on this device does not support proxy override; the browser always goes direct.</string>
+   <string name="setting_page_preferences_network_host_overrides">Host DNS overrides</string>
+   <string name="setting_page_preferences_network_host_overrides_desc">Pin a domain to fixed IP addresses, bypassing the system resolver. Useful when the resolved route is slow or unstable.</string>
+   <string name="setting_page_preferences_network_host_overrides_empty">No entries yet</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt b/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
+new file mode 100644
+index 000000000..83b44a037
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
+@@ -0,0 +1,208 @@
++package me.rerere.rikkahub.data.network
++
++import me.rerere.ai.provider.ProviderSetting
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Pure-JVM tests for the network route model: resolution precedence,
++ * follow-default fallback, force-direct override, provider host mapping and
++ * shell env vars. No SettingsStore / Android runtime involved.
++ */
++class NetworkRoutingTest {
++
++    private val empty = NetworkRoutingSettings()
++
++    @Test
++    fun `default route is proxy`() {
++        assertEquals(NetworkRoute.PROXY, empty.defaultRoute)
++    }
++
++    @Test
++    fun `unconfigured routing is not configured`() {
++        assertFalse(empty.isConfigured())
++        assertEquals(NetworkRoute.PROXY, empty.resolveRoute(scope = NetworkScope.SHELL))
++        assertEquals(NetworkRoute.PROXY, empty.resolveRoute(providerId = "any"))
++    }
++
++    @Test
++    fun `force direct wins over everything`() {
++        val routing = NetworkRoutingSettings(
++            defaultRoute = NetworkRoute.PROXY,
++            scopeRoutes = mapOf(NetworkScope.MCP.key to NetworkRoute.TAILSCALE),
++            providerRoutes = mapOf("prov-1" to NetworkRoute.PROXY),
++            forceDirect = true,
++        )
++        assertEquals(NetworkRoute.DIRECT, routing.resolveRoute(scope = NetworkScope.MCP))
++        assertEquals(NetworkRoute.DIRECT, routing.resolveRoute(providerId = "prov-1"))
++        assertEquals(NetworkRoute.DIRECT, routing.resolveRoute())
++    }
++
++    @Test
++    fun `provider route wins over scope and default`() {
++        val routing = NetworkRoutingSettings(
++            defaultRoute = NetworkRoute.TAILSCALE,
++            scopeRoutes = mapOf(NetworkScope.BACKUP.key to NetworkRoute.DIRECT),
++            providerRoutes = mapOf("prov-1" to NetworkRoute.PROXY),
++        )
++        assertEquals(NetworkRoute.PROXY, routing.resolveRoute(providerId = "prov-1"))
++    }
++
++    @Test
++    fun `scope route wins over default`() {
++        val routing = NetworkRoutingSettings(
++            defaultRoute = NetworkRoute.TAILSCALE,
++            scopeRoutes = mapOf(NetworkScope.SHELL.key to NetworkRoute.DIRECT),
++        )
++        assertEquals(NetworkRoute.DIRECT, routing.resolveRoute(scope = NetworkScope.SHELL))
++        assertEquals(NetworkRoute.TAILSCALE, routing.resolveRoute(scope = NetworkScope.MCP))
++    }
++
++    @Test
++    fun `follow default falls back to the default route`() {
++        val routing = NetworkRoutingSettings(defaultRoute = NetworkRoute.TAILSCALE)
++        assertEquals(
++            NetworkRoute.TAILSCALE,
++            routing.resolveRoute(providerId = "unknown-provider"),
++        )
++        assertEquals(NetworkRoute.TAILSCALE, routing.resolveRoute(scope = NetworkScope.BACKUP))
++    }
++
++    @Test
++    fun `any configured entry marks routing configured`() {
++        assertTrue(
++            empty.copy(defaultRoute = NetworkRoute.DIRECT).isConfigured(),
++        )
++        assertTrue(
++            empty.copy(scopeRoutes = mapOf(NetworkScope.BROWSER.key to NetworkRoute.DIRECT))
++                .isConfigured(),
++        )
++        assertTrue(
++            empty.copy(providerRoutes = mapOf("p" to NetworkRoute.DIRECT)).isConfigured(),
++        )
++        assertTrue(empty.copy(forceDirect = true).isConfigured())
++    }
++
++    @Test
++    fun `provider endpoint hosts cover known providers`() {
++        assertTrue("api.openai.com" in providerEndpointHosts(ProviderSetting.OpenAI()))
++        assertTrue(
++            "generativelanguage.googleapis.com" in providerEndpointHosts(ProviderSetting.Google()),
++        )
++        assertTrue(".googleapis.com" in providerEndpointHosts(ProviderSetting.Google()))
++        assertTrue("api.anthropic.com" in providerEndpointHosts(ProviderSetting.Claude()))
++        assertTrue("api.x.ai" in providerEndpointHosts(ProviderSetting.Grok()))
++        assertTrue(providerEndpointHosts(ProviderSetting.AICore()).isEmpty())
++    }
++
++    @Test
++    fun `find provider by exact host and by suffix`() {
++        val openai = ProviderSetting.OpenAI()
++        val google = ProviderSetting.Google()
++        assertEquals(
++            openai.id.toString(),
++            findProviderIdByHost(listOf(openai, google), "api.openai.com"),
++        )
++        // aiplatform.googleapis.com matches Google via the .googleapis.com suffix.
++        assertEquals(
++            google.id.toString(),
++            findProviderIdByHost(listOf(openai, google), "aiplatform.googleapis.com"),
++        )
++        assertNull(findProviderIdByHost(listOf(openai, google), "example.com"))
++    }
++
++    @Test
++    fun `shared host goes to the first provider in list order`() {
++        // Codex and an OpenAI provider both use api.openai.com: the first one
++        // wins and both get the same route (host matching limitation).
++        val codex = ProviderSetting.Codex()
++        val openai = ProviderSetting.OpenAI()
++        assertEquals(
++            codex.id.toString(),
++            findProviderIdByHost(listOf(codex, openai), "api.openai.com"),
++        )
++        assertEquals(
++            openai.id.toString(),
++            findProviderIdByHost(listOf(openai, codex), "api.openai.com"),
++        )
++    }
++
++    @Test
++    fun `shell env vars are empty for direct`() {
++        assertTrue(
++            proxyShellEnvVars(
++                route = NetworkRoute.DIRECT,
++                proxyUrl = "http://proxy:8080",
++                proxyUsername = "",
++                proxyPassword = null,
++            ).isEmpty(),
++        )
++    }
++
++    @Test
++    fun `shell env vars are empty when proxy is not configured`() {
++        assertTrue(
++            proxyShellEnvVars(
++                route = NetworkRoute.PROXY,
++                proxyUrl = "",
++                proxyUsername = "",
++                proxyPassword = null,
++            ).isEmpty(),
++        )
++    }
++
++    @Test
++    fun `shell env vars use http scheme for http proxy`() {
++        val env = proxyShellEnvVars(
++            route = NetworkRoute.PROXY,
++            proxyUrl = "http://proxy:8080",
++            proxyUsername = "",
++            proxyPassword = null,
++        )
++        assertEquals("http://proxy:8080", env["ALL_PROXY"])
++        assertEquals("http://proxy:8080", env["HTTP_PROXY"])
++        assertEquals("http://proxy:8080", env["HTTPS_PROXY"])
++        assertTrue(env["NO_PROXY"]!!.contains("localhost"))
++        assertTrue(env["NO_PROXY"]!!.contains("127.0.0.1"))
++    }
++
++    @Test
++    fun `shell env vars use socks5h scheme for socks proxy`() {
++        val env = proxyShellEnvVars(
++            route = NetworkRoute.PROXY,
++            proxyUrl = "socks5://proxy:1080",
++            proxyUsername = "",
++            proxyPassword = null,
++        )
++        assertEquals("socks5h://proxy:1080", env["ALL_PROXY"])
++        assertEquals("socks5h://proxy:1080", env["HTTP_PROXY"])
++    }
++
++    @Test
++    fun `shell env vars embed proxy credentials`() {
++        val env = proxyShellEnvVars(
++            route = NetworkRoute.PROXY,
++            proxyUrl = "http://proxy:8080",
++            proxyUsername = "user",
++            proxyPassword = "secret",
++        )
++        assertEquals("http://user:secret@proxy:8080", env["ALL_PROXY"])
++    }
++
++    @Test
++    fun `shell env vars reject a proxy url with embedded credentials`() {
++        // toProxyOrNull rejects URLs carrying user info; credentials only come
++        // from the username/password fields, never from the URL itself.
++        assertTrue(
++            proxyShellEnvVars(
++                route = NetworkRoute.PROXY,
++                proxyUrl = "http://old:pass@proxy:8080",
++                proxyUsername = "",
++                proxyPassword = null,
++            ).isEmpty(),
++        )
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/network/RoutingProxySelectorTest.kt b/app/src/test/java/me/rerere/rikkahub/data/network/RoutingProxySelectorTest.kt
+new file mode 100644
+index 000000000..78d5a3b71
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/network/RoutingProxySelectorTest.kt
+@@ -0,0 +1,154 @@
++package me.rerere.rikkahub.data.network
++
++import java.io.IOException
++import java.net.InetSocketAddress
++import java.net.Proxy
++import java.net.URI
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Pure-JVM tests for the routing-aware proxy selector: provider host mapping,
++ * scope routes, proxy fallback and the tailscale/direct pass-through.
++ *
++ * The selector is built directly with lambdas here (the SettingsStore-backed
++ * factories in RoutingProxySelector.kt need a DataStore and are covered by the
++ * shared-client wiring, not by these tests). The system selector is null so
++ * the missing-proxy fallback is deterministic.
++ */
++class RoutingProxySelectorTest {
++
++    private val proxyUrl = "http://proxy.example.com:8080"
++
++    private fun selector(
++        routes: Map<String, NetworkRoute>,
++        defaultRoute: NetworkRoute = NetworkRoute.PROXY,
++        proxy: String = proxyUrl,
++    ) = RoutingProxySelector(
++        resolveRoute = { uri ->
++            val host = uri.host ?: return@RoutingProxySelector defaultRoute
++            routes[host] ?: defaultRoute
++        },
++        configuredProxy = { proxy.toProxyOrNull() },
++        systemProxySelector = null,
++    )
++
++    private fun proxiesFor(selector: RoutingProxySelector, url: String): List<Proxy> =
++        selector.select(URI(url))
++
++    private fun assertProxy(proxies: List<Proxy>, host: String, port: Int, type: Proxy.Type) {
++        assertEquals(1, proxies.size)
++        assertEquals(type, proxies[0].type())
++        val address = proxies[0].address() as InetSocketAddress
++        assertEquals(host, address.hostString)
++        assertEquals(port, address.port)
++    }
++
++    @Test
++    fun `provider proxy route selects the configured proxy`() {
++        val sel = selector(mapOf("api.openai.com" to NetworkRoute.PROXY))
++        assertProxy(
++            proxiesFor(sel, "https://api.openai.com/v1/chat/completions"),
++            "proxy.example.com",
++            8080,
++            Proxy.Type.HTTP,
++        )
++    }
++
++    @Test
++    fun `provider direct route selects no proxy`() {
++        val sel = selector(mapOf("api.openai.com" to NetworkRoute.DIRECT))
++        val proxies = proxiesFor(sel, "https://api.openai.com/v1/chat/completions")
++        assertEquals(listOf(Proxy.NO_PROXY), proxies)
++    }
++
++    @Test
++    fun `provider tailscale route selects no proxy`() {
++        // Tailscale destinations are handled by the socket factory, not by a proxy.
++        val sel = selector(mapOf("api.openai.com" to NetworkRoute.TAILSCALE))
++        val proxies = proxiesFor(sel, "https://api.openai.com/v1/chat/completions")
++        assertEquals(listOf(Proxy.NO_PROXY), proxies)
++    }
++
++    @Test
++    fun `unknown host falls back to the default route`() {
++        val sel = selector(emptyMap(), defaultRoute = NetworkRoute.PROXY)
++        assertProxy(
++            proxiesFor(sel, "https://unknown.example.com/v1"),
++            "proxy.example.com",
++            8080,
++            Proxy.Type.HTTP,
++        )
++    }
++
++    @Test
++    fun `unknown host with default direct selects no proxy`() {
++        val sel = selector(emptyMap(), defaultRoute = NetworkRoute.DIRECT)
++        val proxies = proxiesFor(sel, "https://unknown.example.com/v1")
++        assertEquals(listOf(Proxy.NO_PROXY), proxies)
++    }
++
++    @Test
++    fun `proxy route without a configured proxy selects no proxy`() {
++        val sel = selector(
++            mapOf("api.openai.com" to NetworkRoute.PROXY),
++            proxy = "",
++        )
++        val proxies = proxiesFor(sel, "https://api.openai.com/v1")
++        assertEquals(listOf(Proxy.NO_PROXY), proxies)
++    }
++
++    @Test
++    fun `socks proxy is selected with socks type`() {
++        val sel = selector(
++            mapOf("api.openai.com" to NetworkRoute.PROXY),
++            proxy = "socks5://proxy.example.com:1080",
++        )
++        assertProxy(
++            proxiesFor(sel, "https://api.openai.com/v1"),
++            "proxy.example.com",
++            1080,
++            Proxy.Type.SOCKS,
++        )
++    }
++
++    @Test
++    fun `fixed route selector routes every uri to its route`() {
++        // Mirrors the scope-bound selector (MCP / backup): one fixed route.
++        val direct = RoutingProxySelector(
++            resolveRoute = { NetworkRoute.DIRECT },
++            configuredProxy = { proxyUrl.toProxyOrNull() },
++            systemProxySelector = null,
++        )
++        assertEquals(
++            listOf(Proxy.NO_PROXY),
++            proxiesFor(direct, "https://example.com/sync"),
++        )
++
++        val proxy = RoutingProxySelector(
++            resolveRoute = { NetworkRoute.PROXY },
++            configuredProxy = { proxyUrl.toProxyOrNull() },
++            systemProxySelector = null,
++        )
++        assertProxy(
++            proxiesFor(proxy, "https://example.com/sync"),
++            "proxy.example.com",
++            8080,
++            Proxy.Type.HTTP,
++        )
++    }
++
++    @Test
++    fun `connect failed is a no-op`() {
++        val sel = selector(mapOf("api.openai.com" to NetworkRoute.PROXY))
++        val proxies = proxiesFor(sel, "https://api.openai.com/v1")
++        sel.connectFailed(
++            URI("https://api.openai.com/v1"),
++            proxies[0].address(),
++            IOException("boom"),
++        )
++        // No exception: a failed proxy never changes routing by itself.
++        assertTrue(true)
++    }
++}
