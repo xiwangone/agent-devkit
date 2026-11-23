@@ -1,0 +1,568 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+index dcf1ed1de..5606ff0e4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+@@ -109,6 +109,38 @@ data class NetworkRoutingSettings(
+     fun isConfigured(): Boolean =
+         defaultRoute != NetworkRoute.PROXY || scopeRoutes.isNotEmpty() ||
+             providerRoutes.isNotEmpty() || forceDirect
++
++    /** True when [providerId] has a route of its own; a stored FOLLOW_DEFAULT entry counts as none. */
++    fun hasProviderOverride(providerId: String): Boolean =
++        providerRoutes[providerId]?.takeIf { it != NetworkRoute.FOLLOW_DEFAULT } != null
++
++    /**
++     * Apply [route] to every provider in [providerIds]. FOLLOW_DEFAULT clears the
++     * override, matching what tapping "Default" on a single provider row does.
++     */
++    fun withProviderRoutes(
++        providerIds: Collection<String>,
++        route: NetworkRoute,
++    ): NetworkRoutingSettings {
++        val routes = providerRoutes.toMutableMap()
++        for (id in providerIds) {
++            if (route == NetworkRoute.FOLLOW_DEFAULT) routes.remove(id) else routes[id] = route
++        }
++        return copy(providerRoutes = routes)
++    }
++}
++
++/**
++ * On-device providers make no network requests, so routes are meaningless for them.
++ * Mirrors [providerEndpointHosts], which returns an empty host list for the same set.
++ */
++fun isOnDeviceProvider(provider: ProviderSetting): Boolean = when (provider) {
++    is ProviderSetting.AICore,
++    is ProviderSetting.LiteRtLocal,
++    is ProviderSetting.LlamaCppLocal,
++    -> true
++
++    else -> false
+ }
+ 
+ /**
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
+index 17c58fff1..81a2cac2a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingNetworkRoutingPage.kt
+@@ -2,34 +2,52 @@ package me.rerere.rikkahub.ui.pages.setting
+ 
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Checkbox
++import androidx.compose.material3.Icon
+ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.ListItemDefaults
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.input.nestedscroll.nestedScroll
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import me.rerere.ai.provider.ProviderSetting
++import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.ArrowDown01
++import me.rerere.hugeicons.stroke.ArrowUp01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.network.NetworkRoute
+ import me.rerere.rikkahub.data.network.NetworkRoutingSettings
+ import me.rerere.rikkahub.data.network.NetworkScope
+ import me.rerere.rikkahub.data.network.WebViewProxy
++import me.rerere.rikkahub.data.network.isOnDeviceProvider
+ import me.rerere.rikkahub.data.network.resolveProxyPasswordForAuth
+ import me.rerere.rikkahub.data.network.toProxyOrNull
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
++import me.rerere.rikkahub.ui.components.ui.CardGroupScope
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
++import me.rerere.rikkahub.ui.components.ui.ListSelectableItem
+ import org.koin.androidx.compose.koinViewModel
+ 
+ /**
+@@ -49,6 +67,15 @@ fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
+     val proxyConfigured = net.proxyUrl.toProxyOrNull() != null
+     val webViewSupported = remember { WebViewProxy.isSupported() }
+     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
++    // On-device providers make no network requests, so they have no route to set.
++    val routableProviders = settings.providers.filterNot(::isOnDeviceProvider)
++    val customizedProviders =
++        routableProviders.filter { routing.hasProviderOverride(it.id.toString()) }
++    val followingDefaultProviders =
++        routableProviders.filterNot { routing.hasProviderOverride(it.id.toString()) }
++    // Fold state is UI-local only; it is not persisted and does not touch the schema.
++    var providerListExpanded by remember { mutableStateOf(false) }
++    var batchDialogVisible by remember { mutableStateOf(false) }
+ 
+     fun updateRouting(transform: (NetworkRoutingSettings) -> NetworkRoutingSettings) {
+         // Compute the new routing first: the browser proxy is applied with the
+@@ -188,54 +215,68 @@ fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
+                     }
+                 }
+             }
+-            item {
+-                CardGroup(
+-                    modifier = Modifier.padding(horizontal = 8.dp),
+-                    title = { Text(stringResource(R.string.setting_page_network_routing_provider_title)) },
+-                ) {
+-                    settings.providers.forEach { provider ->
+-                        val providerId = provider.id.toString()
+-                        val selected =
+-                            routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
+-                        formItem(
+-                            headlineContent = {
+-                                Text(provider.name)
+-                            },
+-                            supportingContent = {
+-                                Column {
++            if (routableProviders.isNotEmpty()) {
++                item {
++                    CardGroup(
++                        modifier = Modifier.padding(horizontal = 8.dp),
++                        title = {
++                            Row(
++                                modifier = Modifier.fillMaxWidth(),
++                                horizontalArrangement = Arrangement.SpaceBetween,
++                                verticalAlignment = Alignment.CenterVertically,
++                            ) {
++                                Text(stringResource(R.string.setting_page_network_routing_provider_title))
++                                TextButton(
++                                    onClick = { batchDialogVisible = true },
++                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
++                                ) {
++                                    Text(stringResource(R.string.setting_page_network_routing_batch))
++                                }
++                            }
++                        },
++                    ) {
++                        customizedProviders.forEach { provider ->
++                            ProviderRouteItem(
++                                provider = provider,
++                                routing = routing,
++                                proxyConfigured = proxyConfigured,
++                                onRouteSelect = { providerId, route ->
++                                    updateRouting { it.withProviderRoutes(listOf(providerId), route) }
++                                },
++                            )
++                        }
++                        if (providerListExpanded) {
++                            followingDefaultProviders.forEach { provider ->
++                                ProviderRouteItem(
++                                    provider = provider,
++                                    routing = routing,
++                                    proxyConfigured = proxyConfigured,
++                                    onRouteSelect = { providerId, route ->
++                                        updateRouting { it.withProviderRoutes(listOf(providerId), route) }
++                                    },
++                                )
++                            }
++                        }
++                        if (followingDefaultProviders.isNotEmpty()) {
++                            item(
++                                onClick = { providerListExpanded = !providerListExpanded },
++                                headlineContent = {
+                                     Text(
+                                         stringResource(
+-                                            R.string.setting_page_network_routing_effective,
+-                                            routeName(routing.resolveRoute(providerId = providerId)),
++                                            R.string.setting_page_network_routing_provider_rest,
++                                            followingDefaultProviders.size,
+                                         ),
+                                     )
+-                                    if (selected == NetworkRoute.PROXY && !proxyConfigured) {
+-                                        Text(stringResource(R.string.setting_page_network_routing_no_proxy))
+-                                    }
+-                                    if (selected == NetworkRoute.TAILSCALE) {
+-                                        Text(stringResource(R.string.setting_page_network_routing_tailscale_note))
+-                                    }
+-                                }
+-                            },
+-                        ) {
+-                            RouteChoiceButtons(
+-                                selected = selected,
+-                                options = listOf(
+-                                    NetworkRoute.DIRECT,
+-                                    NetworkRoute.TAILSCALE,
+-                                    NetworkRoute.PROXY,
+-                                    NetworkRoute.FOLLOW_DEFAULT,
+-                                ),
+-                                onSelect = { route ->
+-                                    updateRouting { current ->
+-                                        val routes = current.providerRoutes.toMutableMap()
+-                                        if (route == NetworkRoute.FOLLOW_DEFAULT) {
+-                                            routes.remove(providerId)
++                                },
++                                trailingContent = {
++                                    Icon(
++                                        imageVector = if (providerListExpanded) {
++                                            HugeIcons.ArrowUp01
+                                         } else {
+-                                            routes[providerId] = route
+-                                        }
+-                                        current.copy(providerRoutes = routes)
+-                                    }
++                                            HugeIcons.ArrowDown01
++                                        },
++                                        contentDescription = null,
++                                    )
+                                 },
+                             )
+                         }
+@@ -273,6 +314,18 @@ fun SettingNetworkRoutingPage(vm: SettingVM = koinViewModel()) {
+                 }
+             }
+         }
++        if (batchDialogVisible) {
++            ProviderBatchRouteDialog(
++                providers = routableProviders,
++                routing = routing,
++                proxyConfigured = proxyConfigured,
++                onDismiss = { batchDialogVisible = false },
++                onApply = { providerIds, route ->
++                    updateRouting { it.withProviderRoutes(providerIds, route) }
++                    batchDialogVisible = false
++                },
++            )
++        }
+     }
+ }
+ 
+@@ -311,3 +364,151 @@ private fun scopeName(scope: NetworkScope): String = stringResource(
+         NetworkScope.BACKUP -> R.string.setting_page_network_routing_scope_backup
+     },
+ )
++
++/** One provider row: name + effective route + the four route buttons. */
++@Composable
++private fun CardGroupScope.ProviderRouteItem(
++    provider: ProviderSetting,
++    routing: NetworkRoutingSettings,
++    proxyConfigured: Boolean,
++    onRouteSelect: (providerId: String, route: NetworkRoute) -> Unit,
++) {
++    val providerId = provider.id.toString()
++    val selected = routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
++    formItem(
++        headlineContent = {
++            Text(provider.name)
++        },
++        supportingContent = {
++            Column {
++                Text(
++                    stringResource(
++                        R.string.setting_page_network_routing_effective,
++                        routeName(routing.resolveRoute(providerId = providerId)),
++                    ),
++                )
++                if (selected == NetworkRoute.PROXY && !proxyConfigured) {
++                    Text(stringResource(R.string.setting_page_network_routing_no_proxy))
++                }
++                if (selected == NetworkRoute.TAILSCALE) {
++                    Text(stringResource(R.string.setting_page_network_routing_tailscale_note))
++                }
++            }
++        },
++    ) {
++        RouteChoiceButtons(
++            selected = selected,
++            options = listOf(
++                NetworkRoute.DIRECT,
++                NetworkRoute.TAILSCALE,
++                NetworkRoute.PROXY,
++                NetworkRoute.FOLLOW_DEFAULT,
++            ),
++            onSelect = { route -> onRouteSelect(providerId, route) },
++        )
++    }
++}
++
++/**
++ * Batch route dialog: check any number of providers, pick a route, apply it to
++ * all of them at once. Picking "Default" clears the override for the selection.
++ */
++@Composable
++private fun ProviderBatchRouteDialog(
++    providers: List<ProviderSetting>,
++    routing: NetworkRoutingSettings,
++    proxyConfigured: Boolean,
++    onDismiss: () -> Unit,
++    onApply: (providerIds: List<String>, route: NetworkRoute) -> Unit,
++) {
++    var selectedIds by remember { mutableStateOf(setOf<String>()) }
++    var batchRoute by remember { mutableStateOf(routing.defaultRoute) }
++    val allSelected = providers.isNotEmpty() && selectedIds.size == providers.size
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(R.string.setting_page_network_routing_batch)) },
++        text = {
++            Column(
++                modifier = Modifier.verticalScroll(rememberScrollState()),
++                verticalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                Text(
++                    text = stringResource(R.string.setting_page_network_routing_batch_desc),
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++                Row(
++                    verticalAlignment = Alignment.CenterVertically,
++                    horizontalArrangement = Arrangement.spacedBy(6.dp),
++                ) {
++                    Checkbox(
++                        checked = allSelected,
++                        onCheckedChange = { checked ->
++                            selectedIds = if (checked) {
++                                providers.map { it.id.toString() }.toSet()
++                            } else {
++                                emptySet()
++                            }
++                        },
++                    )
++                    Text(stringResource(R.string.setting_page_network_routing_batch_select_all))
++                }
++                providers.forEach { provider ->
++                    val providerId = provider.id.toString()
++                    val selected =
++                        routing.providerRoutes[providerId] ?: NetworkRoute.FOLLOW_DEFAULT
++                    ListSelectableItem(
++                        key = providerId,
++                        selectedKeys = selectedIds.toList(),
++                        onSelectChange = { key ->
++                            val id = key as String
++                            selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id
++                        },
++                    ) {
++                        Column {
++                            Text(provider.name)
++                            Text(
++                                text = stringResource(
++                                    R.string.setting_page_network_routing_effective,
++                                    routeName(routing.resolveRoute(providerId = providerId)),
++                                ),
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            )
++                            if (selected == NetworkRoute.PROXY && !proxyConfigured) {
++                                Text(
++                                    text = stringResource(R.string.setting_page_network_routing_no_proxy),
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                                )
++                            }
++                        }
++                    }
++                }
++                RouteChoiceButtons(
++                    selected = batchRoute,
++                    options = listOf(
++                        NetworkRoute.DIRECT,
++                        NetworkRoute.TAILSCALE,
++                        NetworkRoute.PROXY,
++                        NetworkRoute.FOLLOW_DEFAULT,
++                    ),
++                    onSelect = { batchRoute = it },
++                )
++            }
++        },
++        confirmButton = {
++            TextButton(
++                onClick = { onApply(selectedIds.toList(), batchRoute) },
++                enabled = selectedIds.isNotEmpty(),
++            ) {
++                Text(stringResource(R.string.confirm))
++            }
++        },
++        dismissButton = {
++            TextButton(onClick = onDismiss) {
++                Text(stringResource(R.string.cancel))
++            }
++        },
++    )
++}
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 2c8d7a1a8..e4e330bd6 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -3263,6 +3263,10 @@
+   <string name="setting_page_network_routing_default_desc">يُستخدم عندما لا يكون للنطاق أو المزوّد مسار خاص به. اختيار الوكيل يحافظ على السلوك السابق: تمر الحركة عبر الوكيل المُعدّ، أو مباشرةً عند عدم وجود وكيل.</string>
+   <string name="setting_page_network_routing_scope_title">مسارات حسب النطاق</string>
+   <string name="setting_page_network_routing_provider_title">مسارات حسب المزوّد</string>
++  <string name="setting_page_network_routing_batch">تعيين جماعي</string>
++  <string name="setting_page_network_routing_batch_desc">حدّد مقدمي الخدمة ثم اختر مسارًا لتطبيقه على جميع المحددين.</string>
++  <string name="setting_page_network_routing_batch_select_all">تحديد الكل</string>
++  <string name="setting_page_network_routing_provider_rest">يتبع %1$d من مقدمي الخدمة الآخرين المسار الافتراضي</string>
+   <string name="setting_page_network_routing_route_direct">مباشر</string>
+   <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+   <string name="setting_page_network_routing_route_proxy">وكيل</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 15ba03192..cac00fb50 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -2569,6 +2569,10 @@
+     <string name="setting_page_network_routing_default_desc">未單獨設定路由的範圍或提供商使用它。選代理可保持以往行為：走已設定的代理，未設定時直連。</string>
+     <string name="setting_page_network_routing_scope_title">按範圍設定路由</string>
+     <string name="setting_page_network_routing_provider_title">按提供商設定路由</string>
++    <string name="setting_page_network_routing_batch">批次設定</string>
++    <string name="setting_page_network_routing_batch_desc">先勾選提供商，再選一個路由，一次套用到全部已選提供商。</string>
++    <string name="setting_page_network_routing_batch_select_all">全選</string>
++    <string name="setting_page_network_routing_provider_rest">其餘 %1$d 個提供商跟隨預設</string>
+     <string name="setting_page_network_routing_route_direct">直連</string>
+     <string name="setting_page_network_routing_route_tailscale">隧道</string>
+     <string name="setting_page_network_routing_route_proxy">代理</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 83f8a08e4..e259a9cff 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -2244,6 +2244,10 @@
+ <string name="setting_page_network_routing_default_desc">範囲やプロバイダーに個別のルートが未設定の場合に使用します。プロキシを選ぶと従来の動作を維持します。設定済みのプロキシ経由、未設定の場合は直接接続します。</string>
+ <string name="setting_page_network_routing_scope_title">範囲別ルート</string>
+ <string name="setting_page_network_routing_provider_title">プロバイダー別ルート</string>
++<string name="setting_page_network_routing_batch">一括設定</string>
++<string name="setting_page_network_routing_batch_desc">プロバイダーを選択し、ルートを選ぶと、選択したすべてに適用されます。</string>
++<string name="setting_page_network_routing_batch_select_all">すべて選択</string>
++<string name="setting_page_network_routing_provider_rest">残り%1$d件のプロバイダーは既定に従います</string>
+ <string name="setting_page_network_routing_route_direct">直接</string>
+ <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+ <string name="setting_page_network_routing_route_proxy">プロキシ</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 0396c7a61..21679f850 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -2241,6 +2241,10 @@
+ <string name="setting_page_network_routing_default_desc">범위나 제공업체에 개별 경로가 없을 때 사용합니다. 프록시를 선택하면 이전 동작을 유지합니다. 설정된 프록시를 경유하고, 설정되지 않았으면 직접 연결합니다.</string>
+ <string name="setting_page_network_routing_scope_title">범위별 경로</string>
+ <string name="setting_page_network_routing_provider_title">제공업체별 경로</string>
++<string name="setting_page_network_routing_batch">일괄 설정</string>
++<string name="setting_page_network_routing_batch_desc">제공업체를 선택한 뒤 경로를 선택하면 선택한 모든 제공업체에 적용됩니다.</string>
++<string name="setting_page_network_routing_batch_select_all">모두 선택</string>
++<string name="setting_page_network_routing_provider_rest">나머지 %1$d개 제공업체는 기본값을 따릅니다</string>
+ <string name="setting_page_network_routing_route_direct">직접</string>
+ <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+ <string name="setting_page_network_routing_route_proxy">프록시</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 1d2817891..128bc638a 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -2239,6 +2239,10 @@
+ <string name="setting_page_network_routing_default_desc">Используется, когда у области или провайдера нет собственного маршрута. «Прокси» сохраняет прежнее поведение: трафик идёт через настроенный прокси, а при его отсутствии — напрямую.</string>
+ <string name="setting_page_network_routing_scope_title">Маршруты по областям</string>
+ <string name="setting_page_network_routing_provider_title">Маршруты по провайдерам</string>
++<string name="setting_page_network_routing_batch">Массовая настройка</string>
++<string name="setting_page_network_routing_batch_desc">Выберите провайдеров, затем маршрут — он применится ко всем выбранным.</string>
++<string name="setting_page_network_routing_batch_select_all">Выбрать все</string>
++<string name="setting_page_network_routing_provider_rest">Остальные провайдеры (%1$d) следуют маршруту по умолчанию</string>
+ <string name="setting_page_network_routing_route_direct">Напрямую</string>
+ <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+ <string name="setting_page_network_routing_route_proxy">Прокси</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 19aa2a081..8bf69eb94 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1555,6 +1555,10 @@
+   <string name="setting_page_network_routing_default_desc">未单独设置路由的范围或提供商使用它。选代理可保持以往行为：走已配置的代理，未配置时直连。</string>
+   <string name="setting_page_network_routing_scope_title">按范围设置路由</string>
+   <string name="setting_page_network_routing_provider_title">按提供商设置路由</string>
++  <string name="setting_page_network_routing_batch">批量设置</string>
++  <string name="setting_page_network_routing_batch_desc">先勾选提供商，再选一个路由，一次应用到全部已选提供商。</string>
++  <string name="setting_page_network_routing_batch_select_all">全选</string>
++  <string name="setting_page_network_routing_provider_rest">其余 %1$d 个提供商跟随默认</string>
+   <string name="setting_page_network_routing_route_direct">直连</string>
+   <string name="setting_page_network_routing_route_tailscale">隧道</string>
+   <string name="setting_page_network_routing_route_proxy">代理</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 0a69a152b..9c3c2a54d 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -1209,6 +1209,10 @@
+   <string name="setting_page_network_routing_default_desc">Used when a scope or provider has no route of its own. Proxy keeps the previous behavior: traffic goes through the configured proxy, or direct when none is configured.</string>
+   <string name="setting_page_network_routing_scope_title">Per-scope routes</string>
+   <string name="setting_page_network_routing_provider_title">Per-provider routes</string>
++  <string name="setting_page_network_routing_batch">Batch set routes</string>
++  <string name="setting_page_network_routing_batch_desc">Select providers, then choose a route to apply to all of them.</string>
++  <string name="setting_page_network_routing_batch_select_all">Select all</string>
++  <string name="setting_page_network_routing_provider_rest">Other %1$d providers follow the default</string>
+   <string name="setting_page_network_routing_route_direct">Direct</string>
+   <string name="setting_page_network_routing_route_tailscale">Tailscale</string>
+   <string name="setting_page_network_routing_route_proxy">Proxy</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt b/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
+index 83b44a037..55623d2a9 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/network/NetworkRoutingTest.kt
+@@ -205,4 +205,59 @@ class NetworkRoutingTest {
+             ).isEmpty(),
+         )
+     }
++
++    @Test
++    fun `batch apply sets the same route for several providers`() {
++        val updated = empty.withProviderRoutes(
++            listOf("p1", "p2"),
++            NetworkRoute.DIRECT,
++        )
++        assertEquals(NetworkRoute.DIRECT, updated.providerRoutes["p1"])
++        assertEquals(NetworkRoute.DIRECT, updated.providerRoutes["p2"])
++        assertEquals(NetworkRoute.DIRECT, updated.resolveRoute(providerId = "p1"))
++    }
++
++    @Test
++    fun `batch apply with default clears overrides and keeps the rest`() {
++        val routing = empty.copy(
++            providerRoutes = mapOf(
++                "p1" to NetworkRoute.DIRECT,
++                "p2" to NetworkRoute.PROXY,
++                "p3" to NetworkRoute.TAILSCALE,
++            ),
++        )
++        val updated = routing.withProviderRoutes(listOf("p1", "p2"), NetworkRoute.FOLLOW_DEFAULT)
++        assertFalse("p1" in updated.providerRoutes)
++        assertFalse("p2" in updated.providerRoutes)
++        assertEquals(NetworkRoute.TAILSCALE, updated.providerRoutes["p3"])
++        assertEquals(NetworkRoute.PROXY, updated.resolveRoute(providerId = "p1"))
++    }
++
++    @Test
++    fun `batch apply with an empty selection changes nothing`() {
++        val routing = empty.copy(providerRoutes = mapOf("p1" to NetworkRoute.DIRECT))
++        assertEquals(routing, routing.withProviderRoutes(emptyList(), NetworkRoute.PROXY))
++    }
++
++    @Test
++    fun `hasProviderOverride ignores stored follow-default entries`() {
++        val routing = empty.copy(
++            providerRoutes = mapOf(
++                "p1" to NetworkRoute.DIRECT,
++                "p2" to NetworkRoute.FOLLOW_DEFAULT,
++            ),
++        )
++        assertTrue(routing.hasProviderOverride("p1"))
++        assertFalse(routing.hasProviderOverride("p2"))
++        assertFalse(routing.hasProviderOverride("p3"))
++    }
++
++    @Test
++    fun `on-device providers are excluded from routing`() {
++        assertTrue(isOnDeviceProvider(ProviderSetting.AICore()))
++        assertTrue(isOnDeviceProvider(ProviderSetting.LiteRtLocal()))
++        assertTrue(isOnDeviceProvider(ProviderSetting.LlamaCppLocal()))
++        assertFalse(isOnDeviceProvider(ProviderSetting.OpenAI()))
++        assertFalse(isOnDeviceProvider(ProviderSetting.Google()))
++    }
+ }
