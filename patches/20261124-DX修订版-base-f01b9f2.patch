@@ -1,0 +1,360 @@
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+new file mode 100644
+index 000000000..830b99516
+--- /dev/null
++++ b/CONTRIBUTING.md
+@@ -0,0 +1,50 @@
++# Contributing to RikkaHub Agents
++
++感谢参与！本文件汇总从 fork 到合并的关键路径，细节约定见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)（必读，尤其是第 1 节「隐式约定」的 8 条隐式约定）。
++
++## 环境准备
++
++- **JDK 17+**（local-llm 模块的单测需要 **JDK 21**，见 `.github/workflows/tests.yml` 中单独的 job）
++- Android SDK（**API 37**）、**NDK**（`:llama-cpp` 本地推理库需要）
++- 初始化子模块（缺一不可，否则编译失败）：
++
++```bash
++git clone https://github.com/xiwangone/rikkahub-agents.git
++cd rikkahub-agents
++git submodule update --init --recursive
++```
++
++## 构建与测试
++
++```bash
++./gradlew :app:assembleDebug          # 构建调试包
++./gradlew :app:testDebugUnitTest      # app 模块单测（CI 同款命令）
++./gradlew :ai:testDebugUnitTest       # 协议层单测
++./gradlew :local-llm:testDebugUnitTest  # 需 JDK 21
++```
++
++CI 实际执行的模块清单与重试策略以 `.github/workflows/tests.yml` 为准。
++
++## 提交前自查
++
++1. **领域模型与数据库实体成对改**：给会话/消息加字段时，Entity 列 + 双向映射 + 数据库版本/迁移三件套缺一不可，并补一条实体往返单测（ARCHITECTURE.md §1.2）。
++2. **新工具必须登记 ToolIndex**：`app/src/main/java/.../tools/registry/ToolIndex.kt` 中登记一行，`ToolIndexTest` 会校验定义/注册/渲染三方对齐，漏登记直接构建失败。
++3. **新文案走本地化资源**，不要硬编码 Kotlin 字符串——CI 有 `check-new-localization.py` 拦截；新增资源需保证七语言覆盖（`check-port-resources.py`）。
++4. **给会话/UI 加逻辑优先看是否有既有策略函数**（`StreamUiUpdatePolicy.kt`、`ChatMessageQueuePolicy.kt` 等策略文件）可复用，并为其补纯 JVM 单测。
++5. 数据库迁移改动需同步在 `app/src/androidTest/.../migrations/` 补 Migration 测试。
++
++## 测试策略
++
++- 纯逻辑（策略、解析、分帧）写 `src/test` 纯 JVM 测试，跑得快、CI 全量执行。
++- 需要 Android 运行时（Room、Worker、崩溃恢复）的写 `src/androidTest`，当前 CI 无模拟器，这类测试本地跑 `connectedCheck` 验证。
++- 被隔离的历史测试在 `stale-tests/`（含台账 README）：恢复对应功能时用 `git mv` 收回并保证编译通过，不要直接改坏 `:app:compileDebugUnitTestKotlin` 的绿色状态。
++
++## 提交与 PR
++
++- 提交信息用简体中文、一行说明改动语义（与现有 git 历史风格一致）。
++- PR 会自动触发：单元测试（16 个模块，以 `.github/workflows/tests.yml` 为准）、本地化/资源检查、detekt、CodeQL。依赖图提交只在依赖文件推到 master 时触发，PR 不触发。
++- 涉及 `.github/scripts/` 下 Python 门禁脚本的改动，`scripts-check.yml` 会做 `py_compile` 检查，PR 描述中请说明触发场景。
++
++## 许可证
++
++AGPLv3。提交即表示同意以同协议授权你的贡献。
+diff --git a/README.md b/README.md
+index ffed4165b..1cb2f38d8 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@
+ 
+ # RikkaHub Agents
+ 
+-**🤖 设备端 Agent 工具** —— 170+ 内置工具按需启用，一句话完成手机自动化。
++**🤖 设备端 Agent 工具** —— 260+ 内置工具按需启用，一句话完成手机自动化。
+ 
+ 把手机本身变成 Agent 的执行环境：应用、通知、文件、媒体、SSH、浏览器、定时与工作流，全部由对话驱动。
+ LLM 提供商由你自行配置（OpenAI 兼容 / 本地模型），**对话与数据只在你选择的提供商与设备之间流转**。
+@@ -20,7 +20,7 @@ LLM 提供商由你自行配置（OpenAI 兼容 / 本地模型），**对话与
+ 
+ [![📥 下载 APK](https://img.shields.io/badge/📥-下载%20APK-2ea44f?style=for-the-badge&logo=android&logoColor=white)](https://github.com/xiwangone/rikkahub-agents/releases/latest)
+ 
+-> <span style="color:red">**❗️❗️❗️ 注：包含 170+ 内置工具，请按需启用 —— 常驻过多会持续占用上下文与额度！**</span>
++> <span style="color:red">**❗️❗️❗️ 注：包含 260+ 内置工具，请按需启用 —— 常驻过多会持续占用上下文与额度！**</span>
+ 
+ </div>
+ 
+@@ -72,7 +72,7 @@ LLM 提供商由你自行配置（OpenAI 兼容 / 本地模型），**对话与
+ 
+ ### 关键机制
+ 
+-- **工具按需注入**：工具面按名称稳定排序后注入请求前缀，并支持「冷档」—— 未解锁的工具只发空 schema，避免 170+ 工具一次性吃满上下文。
++- **工具按需注入**：工具面按名称稳定排序后注入请求前缀，并支持「冷档」—— 未解锁的工具只发空 schema，避免 260+ 工具一次性吃满上下文。
+ - **审批与底线**：每个助手独立开关工具；修改性调用逐次审批；危险命令由 HARDLINE 无条件拦截。定时任务与子代理这类无人值守的会话走独立通道。
+ - **工作区隔离**：文件操作限定在会话绑定的工作区；子代理可绑定独立工作区，避免与主会话互相覆盖。
+ - **子代理执行体**：每次派发是**独立会话**（配置与模型可复用，上下文不继承），有超时与步数上限；默认只读工作区，可在配置页按需放开白名单。
+@@ -144,7 +144,7 @@ rikkahub-agents/
+ 
+ ## 功能简介
+ 
+-一个把原生 Android LLM 聊天客户端变成设备端 Agent 的项目：**170+ 内置工具**（设备控制、凭证、工作区、SSH、子代理等）、AI 驱动的工作流、定时任务、内置浏览器（AI 操控）、SSH、屏幕自动化、文件管理、音乐播放、语音转文字、可下载的本地 LLM，以及远程 Telegram Bot。**所有功能默认关闭，按需开启。**
++一个把原生 Android LLM 聊天客户端变成设备端 Agent 的项目：**260+ 内置工具**（设备控制、凭证、工作区、SSH、子代理等）、AI 驱动的工作流、定时任务、内置浏览器（AI 操控）、SSH、屏幕自动化、文件管理、音乐播放、语音转文字、可下载的本地 LLM，以及远程 Telegram Bot。**所有功能默认关闭，按需开启。**
+ 
+ > *"把手机上的待办事项导出为 Markdown 文件，放到工作区。"*
+ > *"每两小时截一次屏，持续 4 小时，看看我今天下午都干了什么。"*
+@@ -223,11 +223,12 @@ AI 可读取、汇总和转发指定应用的通知。白名单默认全空。
+ 
+ ### 6. 从源码构建（可选）
+ 
+-前置：**JDK 17+**、Android SDK（**API 37**）。
++前置：**JDK 17+**、Android SDK（**API 37**）、Android NDK（**28.2.13676358**，`llama-cpp` 模块含 C++ 代码，需经 CMake 编译；仓内未指定 `ndkVersion`，使用 AGP 9.3 的默认版本即可）。
+ 
+ ```bash
+ git clone https://github.com/xiwangone/rikkahub-agents.git
+ cd rikkahub-agents
++git submodule update --init --recursive   # 子模块：material3/material-color-utilities、llama-cpp/native/llama.cpp
+ ./gradlew :app:assembleDebug          # 产物：app/build/outputs/apk/debug/
+ adb install app/build/outputs/apk/debug/app-debug.apk   # 安装到已连接设备
+ ```
+diff --git a/ai/README.md b/ai/README.md
+index 61e9d8443..37991ba28 100644
+--- a/ai/README.md
++++ b/ai/README.md
+@@ -1,24 +1,22 @@
+-# 环境配置
++# ai 模块
+ 
+-## 准备环境
++`me.rerere.ai` —— 纯 Kotlin 的 LLM 协议层库（Provider 抽象、SSE 流式解析、消息/工具序列化），供 `:app` 及其他模块复用。
+ 
+-- 安装CMake
+-- 安装NDK，并配置`ANDROID_NDK`环境变量
++## 构建
+ 
+-## git submodule
+-
+-在项目根目录执行以下命令初始化子模块：
++本模块**不含任何 native（C/C++）代码**，无需 CMake / NDK / libMNN.so（历史上的 MNN native 构建已随模块重构移除，此前的构建说明已过时）：
+ 
+ ```bash
+-git submodule update --init --recursive
++./gradlew :ai:build
+ ```
+ 
+-注意：必须在git仓库的根目录（`rikkahub/`）执行此命令，不是在 `src/main/cpp/mnn` 目录。
+-
+-## 构建libMNN.so
+-
+-进入 `src/main/cpp/mnn` 目录，执行以下命令：
++## 单元测试
+ 
+ ```bash
+-./build.sh
++./gradlew :ai:testDebugUnitTest
+ ```
++
++- `:ai` 的单测已纳入 CI（`.github/workflows/tests.yml`），Provider 协议解析、流式分帧、消息序列化均有覆盖。
++- 若新增 Provider 或改动流式协议，请同步补充 `src/test` 下的协议层测试。
++
++> 注：`llama.cpp`（local-llm 本地推理）与 `material-color-utilities`（取色）在各自模块内以 git submodule 引入，与本模块无关；子模块初始化见根目录 README「从源码构建」。
+diff --git a/docs/index.html b/docs/index.html
+index 4ae34ed01..88bdd7fad 100644
+--- a/docs/index.html
++++ b/docs/index.html
+@@ -3,23 +3,23 @@
+ <head>
+   <meta charset="UTF-8" />
+   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+-  <title>RikkaHub Agent · Tell your phone what to do.</title>
+-  <meta name="description" content="A native Android LLM agent with 70+ device tools, an in-app browser the AI drives, AI-authored workflows, scheduled jobs, SSH, music + media, screen automation, file manager, and a remote Telegram bot. All opt-in. Open source." />
++  <title>RikkaHub Agents · Tell your phone what to do.</title>
++  <meta name="description" content="A native Android LLM agent with 260+ device tools, an in-app browser the AI drives, AI-authored workflows, scheduled jobs, SSH, music + media, screen automation, file manager, and a remote Telegram bot. All opt-in. Open source." />
+   <meta name="theme-color" content="#1a1b26" />
+   <meta name="color-scheme" content="dark" />
+ 
+-  <meta property="og:title" content="RikkaHub Agent · Tell your phone what to do." />
+-  <meta property="og:description" content="A native Android LLM agent with 70+ device tools, in-app browser, workflows, scheduled jobs, SSH, music, file manager, and a Telegram bot. Open source. Android 8+." />
++  <meta property="og:title" content="RikkaHub Agents · Tell your phone what to do." />
++  <meta property="og:description" content="A native Android LLM agent with 260+ device tools, in-app browser, workflows, scheduled jobs, SSH, music, file manager, and a Telegram bot. Open source. Android 8+." />
+   <meta property="og:type" content="website" />
+-  <meta property="og:url" content="https://extv.github.io/rikkahub-agent/" />
+-  <meta property="og:image" content="https://raw.githubusercontent.com/ExTV/rikkahub-agent/master/docs/icon.png" />
++  <meta property="og:url" content="https://github.com/xiwangone/rikkahub-agents" />
++  <meta property="og:image" content="https://raw.githubusercontent.com/xiwangone/rikkahub-agents/master/docs/icon.png" />
+   <meta property="og:image:width" content="512" />
+   <meta property="og:image:height" content="512" />
+ 
+   <meta name="twitter:card" content="summary_large_image" />
+-  <meta name="twitter:title" content="RikkaHub Agent" />
++  <meta name="twitter:title" content="RikkaHub Agents" />
+   <meta name="twitter:description" content="Tell your phone what to do. It does it." />
+-  <meta name="twitter:image" content="https://raw.githubusercontent.com/ExTV/rikkahub-agent/master/docs/icon.png" />
++  <meta name="twitter:image" content="https://raw.githubusercontent.com/xiwangone/rikkahub-agents/master/docs/icon.png" />
+ 
+   <link rel="icon" type="image/png" href="icon.png" />
+ 
+@@ -31,14 +31,14 @@
+   {
+     "@context": "https://schema.org",
+     "@type": "SoftwareApplication",
+-    "name": "RikkaHub Agent",
++    "name": "RikkaHub Agents",
+     "applicationCategory": "ProductivityApplication",
+     "operatingSystem": "Android 8+",
+     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+-    "url": "https://extv.github.io/rikkahub-agent/",
+-    "downloadUrl": "https://github.com/ExTV/rikkahub-agent/releases/latest",
+-    "description": "On-device LLM agent for Android with 70+ device tools, in-app browser, workflows, scheduled jobs, SSH, music, file manager, and a Telegram bot.",
+-    "author": { "@type": "Person", "name": "ExTV", "url": "https://github.com/ExTV" }
++    "url": "https://github.com/xiwangone/rikkahub-agents",
++    "downloadUrl": "https://github.com/xiwangone/rikkahub-agents/releases/latest",
++    "description": "On-device LLM agent for Android with 260+ device tools, in-app browser, workflows, scheduled jobs, SSH, music, file manager, and a Telegram bot.",
++    "author": { "@type": "Person", "name": "xiwangone", "url": "https://github.com/xiwangone" }
+   }
+   </script>
+ 
+@@ -1054,18 +1054,18 @@
+ 
+ <!-- NAV -->
+ <nav id="nav">
+-  <a href="https://github.com/ExTV/rikkahub-agent" class="nav-logo">
++  <a href="https://github.com/xiwangone/rikkahub-agents" class="nav-logo">
+     <img src="icon.png" alt="" class="nav-logo-img" />
+-    <span>RikkaHub Agent</span>
++    <span>RikkaHub Agents</span>
+   </a>
+   <ul class="nav-links">
+     <li><a href="#features">Features</a></li>
+     <li><a href="#providers">Models</a></li>
+     <li><a href="#quickstart">Quick start</a></li>
+     <li><a href="#faq">FAQ</a></li>
+-    <li><a href="https://github.com/ExTV/rikkahub-agent">GitHub</a></li>
++    <li><a href="https://github.com/xiwangone/rikkahub-agents">GitHub</a></li>
+   </ul>
+-  <a href="https://github.com/ExTV/rikkahub-agent/releases/latest" class="nav-cta">
++  <a href="https://github.com/xiwangone/rikkahub-agents/releases/latest" class="nav-cta">
+     <svg width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+     Download
+   </a>
+@@ -1079,15 +1079,15 @@
+     <h1>Tell it once.<br /><em>Walk away.</em></h1>
+     <p class="hero-sub">
+       A fork of <a href="https://github.com/rikkahub/rikkahub">RikkaHub</a> that turns the native Android LLM chat client into a real on-device agent.<br />
+-      <strong>70+ device tools</strong>, an in-app browser the AI drives, AI-authored workflows, scheduled jobs, SSH, music, file manager, and a remote Telegram bot.<br />
++      <strong>260+ device tools</strong>, an in-app browser the AI drives, AI-authored workflows, scheduled jobs, SSH, music, file manager, and a remote Telegram bot.<br />
+       All opt-in. Tell it what to do in plain language; it runs in the background, on your phone, on your terms.
+     </p>
+     <div class="hero-actions">
+-      <a href="https://github.com/ExTV/rikkahub-agent/releases/latest" class="btn btn-primary">
++      <a href="https://github.com/xiwangone/rikkahub-agents/releases/latest" class="btn btn-primary">
+         <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+         Download APK
+       </a>
+-      <a href="https://github.com/ExTV/rikkahub-agent" class="btn btn-ghost">
++      <a href="https://github.com/xiwangone/rikkahub-agents" class="btn btn-ghost">
+         <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+         Star on GitHub
+       </a>
+@@ -1110,7 +1110,7 @@
+ <section id="stats">
+   <div class="stats-row reveal">
+     <div class="stat">
+-      <div class="stat-num">70+</div>
++      <div class="stat-num">260+</div>
+       <div class="stat-label">device tools</div>
+     </div>
+     <div class="stat-sep"></div>
+@@ -1170,7 +1170,7 @@
+           <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="3"/><circle cx="12" cy="18" r="0.6" fill="currentColor"/></svg>
+         </div>
+         <h3>Control your phone</h3>
+-        <p>Tap, swipe, scroll, screenshots, open apps, torch, brightness, volume, notifications, vibrate, share. Plus read battery, WiFi, signal, location, sensors, contacts, and SMS. <strong>70+ tools</strong>, all built into Android, no extra apps required.</p>
++        <p>Tap, swipe, scroll, screenshots, open apps, torch, brightness, volume, notifications, vibrate, share. Plus read battery, WiFi, signal, location, sensors, contacts, and SMS. <strong>260+ tools</strong>, all built into Android, no extra apps required.</p>
+       </div>
+ 
+       <div class="feature-card reveal">
+@@ -1278,7 +1278,7 @@
+       <div class="qs-steps reveal">
+         <div class="qs-step">
+           <div class="qs-step-num">1</div>
+-          <p><strong>Install.</strong> Download the latest <code>*-universal-debug.apk</code> from <a href="https://github.com/ExTV/rikkahub-agent/releases/latest">Releases</a>, allow install from unknown sources, open.</p>
++          <p><strong>Install.</strong> Download the latest <code>*-universal-debug.apk</code> from <a href="https://github.com/xiwangone/rikkahub-agents/releases/latest">Releases</a>, allow install from unknown sources, open.</p>
+         </div>
+         <div class="qs-step">
+           <div class="qs-step-num">2</div>
+@@ -1320,8 +1320,8 @@
+         </div>
+         <div class="qs-tab-panel" data-tab="build" data-active="false">
+ <pre><span class="c-comment"># Build the APK yourself</span>
+-<span class="c-prompt">$ </span><span class="c-cmd">git clone</span> <span class="c-str">https://github.com/ExTV/rikkahub-agent.git</span>
+-<span class="c-prompt">$ </span><span class="c-cmd">cd</span> rikkahub-agent
++<span class="c-prompt">$ </span><span class="c-cmd">git clone</span> <span class="c-str">https://github.com/xiwangone/rikkahub-agents.git</span>
++<span class="c-prompt">$ </span><span class="c-cmd">cd</span> rikkahub-agents
+ <span class="c-prompt">$ </span><span class="c-cmd">./gradlew</span> :app:installDebug
+ 
+ <span class="c-comment"># Requirements:</span>
+@@ -1343,11 +1343,11 @@
+     <h2>Put your phone to work.</h2>
+     <p>Free, open source, runs entirely on your device. The hard part is deciding what to delegate first.</p>
+     <div class="cta-actions">
+-      <a href="https://github.com/ExTV/rikkahub-agent/releases/latest" class="btn btn-primary">
++      <a href="https://github.com/xiwangone/rikkahub-agents/releases/latest" class="btn btn-primary">
+         <svg width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+         Download the latest APK
+       </a>
+-      <a href="https://github.com/ExTV/rikkahub-agent" class="btn btn-ghost">
++      <a href="https://github.com/xiwangone/rikkahub-agents" class="btn btn-ghost">
+         <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+         Source on GitHub
+       </a>
+@@ -1369,7 +1369,7 @@
+       <details>
+         <summary>Does this require root?</summary>
+         <div class="faq-answer">
+-          No. RikkaHub Agent uses standard Android permissions and accessibility-service APIs. No root, no Magisk, no custom ROM. Some advanced tools (notification listener, screen automation) need a one-tap permission grant in Settings; everything else is runtime permissions.
++          No. RikkaHub Agents uses standard Android permissions and accessibility-service APIs. No root, no Magisk, no custom ROM. Some advanced tools (notification listener, screen automation) need a one-tap permission grant in Settings; everything else is runtime permissions.
+         </div>
+       </details>
+ 
+@@ -1404,7 +1404,7 @@
+       <details>
+         <summary>How is this different from vanilla RikkaHub?</summary>
+         <div class="faq-answer">
+-          Upstream <a href="https://github.com/rikkahub/rikkahub">RikkaHub</a> is a beautiful native LLM chat client. This fork keeps that UI down to the pixel and adds the agent layer: 70+ device tools, an in-app browser the AI drives, AI-authored workflows, scheduled jobs, sub-agents, the skills system (markdown plus JavaScript), SSH, Telegram bot, music + media controls, notification listener, file manager, screen automation, the Doctor diagnostic menu, and the three-layer approval gate. If you don't enable any of the new features, the app behaves exactly like vanilla RikkaHub.
++          Upstream <a href="https://github.com/rikkahub/rikkahub">RikkaHub</a> is a beautiful native LLM chat client. This fork keeps that UI down to the pixel and adds the agent layer: 260+ device tools, an in-app browser the AI drives, AI-authored workflows, scheduled jobs, sub-agents, the skills system (markdown plus JavaScript), SSH, Telegram bot, music + media controls, notification listener, file manager, screen automation, the Doctor diagnostic menu, and the three-layer approval gate. If you don't enable any of the new features, the app behaves exactly like vanilla RikkaHub.
+         </div>
+       </details>
+ 
+@@ -1425,7 +1425,7 @@
+       <details>
+         <summary>License?</summary>
+         <div class="faq-answer">
+-          AGPLv3, inherited from upstream. See the <a href="https://github.com/ExTV/rikkahub-agent/blob/master/LICENSE">LICENSE</a> file for the full text and the upstream segmented dual-licensing terms.
++          AGPLv3, inherited from upstream. See the <a href="https://github.com/xiwangone/rikkahub-agents/blob/master/LICENSE">LICENSE</a> file for the full text and the upstream segmented dual-licensing terms.
+         </div>
+       </details>
+ 
+@@ -1439,7 +1439,7 @@
+     <div class="footer-brand">
+       <div class="footer-brand-logo">
+         <img src="icon.png" alt="" />
+-        <span>RikkaHub Agent</span>
++        <span>RikkaHub Agents</span>
+       </div>
+       <p>An on-device LLM agent for Android. Open source. Tell it what to do; it does it.</p>
+     </div>
+@@ -1447,10 +1447,10 @@
+     <div class="footer-col">
+       <h4>Project</h4>
+       <ul>
+-        <li><a href="https://github.com/ExTV/rikkahub-agent">GitHub</a></li>
+-        <li><a href="https://github.com/ExTV/rikkahub-agent/releases">Releases</a></li>
+-        <li><a href="https://github.com/ExTV/rikkahub-agent/issues">Issues</a></li>
+-        <li><a href="https://github.com/ExTV/rikkahub-agent/blob/master/LICENSE">License</a></li>
++        <li><a href="https://github.com/xiwangone/rikkahub-agents">GitHub</a></li>
++        <li><a href="https://github.com/xiwangone/rikkahub-agents/releases">Releases</a></li>
++        <li><a href="https://github.com/xiwangone/rikkahub-agents/issues">Issues</a></li>
++        <li><a href="https://github.com/xiwangone/rikkahub-agents/blob/master/LICENSE">License</a></li>
+       </ul>
+     </div>
+ 
+@@ -1471,6 +1471,7 @@
+         <li><a href="https://github.com/ExTV">@ExTV on GitHub</a></li>
+         <li><a href="https://github.com/ExTV/agent-keyboard">agent-keyboard</a></li>
+         <li><a href="https://github.com/ExTV/Podroid">Podroid</a></li>
++        <li><a href="https://github.com/xiwangone">@xiwangone on GitHub</a></li>
+       </ul>
+     </div>
+   </div>
