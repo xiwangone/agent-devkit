@@ -1,0 +1,240 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
+index c62fd31c6..5610544af 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpManager.kt
+@@ -408,29 +408,35 @@ class McpManager(
+                     val common = serverConfig.commonOptions
+                     val tools = common.tools.toMutableList()
+ 
+-                    // 基于server对比
+-                    serverTools.forEach { serverTool ->
+-                        val tool = tools.find { it.name == serverTool.name }
+-                        if (tool == null) {
+-                            tools.add(
+-                                McpTool(
+-                                    name = serverTool.name,
++                    if (serverTools.isEmpty() && tools.isNotEmpty()) {
++                        // 服务端返回空列表且存量非空：视为瞬时故障或权限骤降，不做合并，
++                        // 否则会把已存工具（含用户手动开关）一次性抹掉并持久化。
++                        AppLog.w(TAG, "sync: ignoring empty tool list from ${common.name}, keeping ${tools.size} stored tools")
++                    } else {
++                        // 基于server对比
++                        serverTools.forEach { serverTool ->
++                            val tool = tools.find { it.name == serverTool.name }
++                            if (tool == null) {
++                                tools.add(
++                                    McpTool(
++                                        name = serverTool.name,
++                                        description = serverTool.description,
++                                        enable = true,
++                                        inputSchema = serverTool.inputSchema.toSchema()
++                                    )
++                                )
++                            } else {
++                                val index = tools.indexOf(tool)
++                                tools[index] = tool.copy(
+                                     description = serverTool.description,
+-                                    enable = true,
+                                     inputSchema = serverTool.inputSchema.toSchema()
+                                 )
+-                            )
+-                        } else {
+-                            val index = tools.indexOf(tool)
+-                            tools[index] = tool.copy(
+-                                description = serverTool.description,
+-                                inputSchema = serverTool.inputSchema.toSchema()
+-                            )
++                            }
+                         }
+-                    }
+ 
+-                    // 删除不在server内的
+-                    tools.removeIf { tool -> serverTools.none { it.name == tool.name } }
++                        // 删除不在server内的
++                        tools.removeIf { tool -> serverTools.none { it.name == tool.name } }
++                    }
+ 
+                     // 更新clients: rekey the live Client under the freshened config (same id,
+                     // updated tools). Drop ALL keys for this id first — not just the `config`
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt
+index 1ec15d76b..6d5cbf412 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt
+@@ -531,7 +531,17 @@ private fun McpServerConfig.resolvedHeaders(): List<Pair<String, String>> {
+     }
+ }
+ 
+-private fun mergeTools(storedTools: List<McpTool>, serverTools: List<Tool>): List<McpTool> {
++/**
++ * 按服务端列表差量合并已存工具：存量工具保留用户开关（enable/needsApproval），
++ * 只刷新描述与入参结构；服务端新增的工具默认开启；服务端已无的工具移出列表。
++ * 服务端返回空列表且存量非空时视为瞬时故障或权限骤降，不做合并直接返回存量，
++ * 否则一次同步就会把用户手动开关连同工具条目一次性抹掉并持久化。
++ */
++internal fun mergeTools(storedTools: List<McpTool>, serverTools: List<Tool>): List<McpTool> {
++    if (serverTools.isEmpty() && storedTools.isNotEmpty()) {
++        AppLog.w(TAG, "mergeTools: ignoring empty server tool list, keeping ${storedTools.size} stored tools")
++        return storedTools
++    }
+     val toolsByName = storedTools.associateBy { it.name }
+     return serverTools.map { serverTool ->
+         toolsByName[serverTool.name]?.copy(
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/MessageQueue.kt b/app/src/main/java/me/rerere/rikkahub/service/MessageQueue.kt
+index 52c8bd9df..b60fb5fdd 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/MessageQueue.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/MessageQueue.kt
+@@ -123,6 +123,7 @@ class MessageQueue {
+      * 条目就会既不在队列、也没有发出去 —— 表现为「转圈一会就停、也没有回复」，用户只能重发。
+      * 放回队首保证不丢，默认暂停则避免「失败 → 立即重派 → 又失败」的空转。
+      */
++    @Synchronized
+     fun requeueFront(message: QueuedMessage, pause: Boolean = true) {
+         val current = mutableState.value
+         mutableState.value =
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/McpToolMergeTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/McpToolMergeTest.kt
+new file mode 100644
+index 000000000..f0f37ab85
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/McpToolMergeTest.kt
+@@ -0,0 +1,78 @@
++package me.rerere.rikkahub.data.ai.mcp
++
++import io.modelcontextprotocol.kotlin.sdk.types.Tool
++import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
++import kotlinx.serialization.json.JsonElement
++import kotlinx.serialization.json.JsonObject
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class McpToolMergeTest {
++    private fun serverTool(name: String, description: String? = null) = Tool(
++        name = name,
++        description = description,
++        inputSchema = ToolSchema(
++            properties = JsonObject(emptyMap<String, JsonElement>()),
++            required = emptyList<String>(),
++        ),
++    )
++
++    @Test
++    fun `empty server list keeps stored tools with user switches`() {
++        val stored = listOf(
++            McpTool(name = "search", enable = false, needsApproval = false),
++            McpTool(name = "fetch", enable = true),
++        )
++
++        assertSame(stored, mergeTools(stored, emptyList()))
++    }
++
++    @Test
++    fun `empty stored and empty server yields empty`() {
++        assertTrue(mergeTools(emptyList(), emptyList()).isEmpty())
++    }
++
++    @Test
++    fun `surviving tool keeps user switches and refreshes description`() {
++        val stored = listOf(
++            McpTool(name = "search", enable = false, needsApproval = false, description = "old"),
++        )
++        val server = listOf(serverTool("search", "new"))
++
++        val merged = mergeTools(stored, server)
++
++        assertEquals(1, merged.size)
++        assertEquals("search", merged[0].name)
++        assertFalse(merged[0].enable)
++        assertFalse(merged[0].needsApproval)
++        assertEquals("new", merged[0].description)
++    }
++
++    @Test
++    fun `new server tool is enabled by default`() {
++        val stored = listOf(McpTool(name = "search", enable = false))
++        val server = listOf(serverTool("search"), serverTool("fetch", "fetch the web"))
++
++        val merged = mergeTools(stored, server)
++
++        assertEquals(listOf("search", "fetch"), merged.map { it.name })
++        assertFalse(merged[0].enable)
++        assertTrue(merged[1].enable)
++        assertTrue(merged[1].needsApproval)
++        assertEquals("fetch the web", merged[1].description)
++    }
++
++    @Test
++    fun `disappeared tool is removed`() {
++        val stored = listOf(
++            McpTool(name = "search", enable = false),
++            McpTool(name = "gone", enable = true),
++        )
++        val server = listOf(serverTool("search"))
++
++        assertEquals(listOf("search"), mergeTools(stored, server).map { it.name })
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/service/MessageQueueTest.kt b/app/src/test/java/me/rerere/rikkahub/service/MessageQueueTest.kt
+index e2f16823a..1a4bde94c 100644
+--- a/app/src/test/java/me/rerere/rikkahub/service/MessageQueueTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/service/MessageQueueTest.kt
+@@ -11,6 +11,9 @@ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.runBlocking
+ import kotlinx.coroutines.withTimeout
+ import kotlinx.coroutines.yield
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import kotlin.concurrent.thread
+ import me.rerere.ai.agent.AgentEvent
+ import me.rerere.ai.agent.AgentHooks
+ import me.rerere.ai.agent.AgentRequest
+@@ -320,4 +323,48 @@ class MessageQueueTest {
+         assertTrue(queue.state.value.messages.isEmpty())
+         assertFalse(queue.state.value.paused)
+     }
++
++    @Test
++    fun `requeueFront puts message back at front and pauses`() {
++        val queue = MessageQueue()
++        queue.enqueue(text("first"))
++        queue.enqueue(text("second"))
++        val failed = queue.takeNext()!!
++
++        queue.requeueFront(failed)
++
++        assertTrue(queue.state.value.paused)
++        assertEquals(text("first"), queue.state.value.messages.first().parts)
++        assertNull(queue.takeNext())
++        queue.resume()
++        assertEquals(text("first"), queue.takeNext()!!.parts)
++        assertEquals(text("second"), queue.takeNext()!!.parts)
++    }
++
++    @Test
++    fun `concurrent enqueue and requeueFront lose no message`() {
++        val queue = MessageQueue()
++        val threads = 4
++        val perThread = 250
++        val start = CountDownLatch(1)
++        val done = CountDownLatch(threads * 2)
++        repeat(threads) { t ->
++            thread {
++                start.await()
++                repeat(perThread) { i -> queue.enqueue(text("e-$t-$i")) }
++                done.countDown()
++            }
++            thread {
++                start.await()
++                repeat(perThread) { i ->
++                    queue.requeueFront(QueuedMessage(parts = text("r-$t-$i")), pause = false)
++                }
++                done.countDown()
++            }
++        }
++        start.countDown()
++
++        assertTrue(done.await(30, TimeUnit.SECONDS))
++        assertEquals(threads * perThread * 2, queue.size)
++    }
+ }
