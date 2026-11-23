@@ -1,0 +1,286 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+index ece2d5c6b..a3e9fb0b9 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsModels.kt
+@@ -257,6 +257,29 @@ data class Settings(
+         return (webDavConfigs.firstOrNull() ?: webDavConfig).withLegacyExpanded()
+     }
+ 
++    /**
++     * 删除一个 WebDAV 配置（保留至少一个）。
++     *
++     * @return 删除后的 Settings；删除后将无配置剩余时返回 null；id 不存在时返回原值。
++     * 删除当前生效配置时，生效配置顺延为剩余列表首个（与旧单配置槽保持同步）。
++     */
++    fun withoutWebDavConfig(cfgId: String): Settings? {
++        if (webDavConfigs.isEmpty()) {
++            // 旧单配置模式：唯一配置在旧单配置槽里，删它会归零 → 拒绝；id 对不上则不做任何改动。
++            if (webDavConfig.id == cfgId) return null
++            return this
++        }
++        val remaining = webDavConfigs.filterNot { it.id == cfgId }
++        if (remaining.size == webDavConfigs.size) return this
++        if (remaining.isEmpty()) return null
++        val newActive = remaining.first()
++        return copy(
++            webDavConfigs = remaining,
++            activeWebDavConfigId = newActive.id,
++            webDavConfig = newActive,
++        )
++    }
++
+     /**
+      * 当前生效的 S3 配置（同 [activeWebDavConfig] 逻辑：id 悬空时退回旧单配置，
+      * 不静默换到列表首个配置）。
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
+index ec0c87147..d12afcf60 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
+@@ -56,6 +56,7 @@ import kotlin.uuid.Uuid
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.withTimeoutOrNull
+ import me.rerere.hugeicons.HugeIcons
++import me.rerere.hugeicons.stroke.Delete01
+ import me.rerere.hugeicons.stroke.PlusSign
+ import me.rerere.hugeicons.stroke.Upload02
+ import me.rerere.rikkahub.R
+@@ -110,8 +111,7 @@ fun WebDavTab(
+     var showBackupFiles by remember { mutableStateOf(false) }
+     var isBackingUp by remember { mutableStateOf(false) }
+     var restoringItemId by remember { mutableStateOf<String?>(null) }
+-    var showAddConfigDialog by remember { mutableStateOf(false) }
+-    var showConfigMenuFor by remember { mutableStateOf<String?>(null) }
++    var showDeleteConfigConfirm by remember { mutableStateOf(false) }
+     var configMenuExpanded by remember { mutableStateOf(false) }
+     // 恢复加密备份：需输口令的待处理项
+     var pendingPasswordItem by remember { mutableStateOf<WebDavBackupItem?>(null) }
+@@ -224,17 +224,10 @@ fun WebDavTab(
+         }
+     }
+ 
+-    /** 删除配置（保留至少一个）。 */
++    /** 删除配置（保留至少一个：删最后一个时 withoutWebDavConfig 返回 null，不做改动）。 */
+     fun removeWebDavConfig(cfgId: String) {
+-        if (webDavConfigs.size <= 1 && settings.webDavConfig.id == cfgId) return
+-        val remaining = webDavConfigs.filterNot { it.id == cfgId }
+-        val newActive = remaining.firstOrNull()?.id
+         vm.updateSettings { current ->
+-            current.copy(
+-                webDavConfigs = remaining,
+-                activeWebDavConfigId = newActive,
+-                webDavConfig = remaining.firstOrNull() ?: WebDavConfig(),
+-            )
++            current.withoutWebDavConfig(cfgId) ?: current
+         }
+     }
+ 
+@@ -319,6 +312,13 @@ fun WebDavTab(
+                             IconButton(onClick = { addWebDavConfig() }) {
+                                 Icon(HugeIcons.PlusSign, contentDescription = stringResource(R.string.backup_page_add_config))
+                             }
++                            // 删除当前配置：先弹确认；仅剩一个时禁用（保留至少一个）。
++                            IconButton(
++                                onClick = { showDeleteConfigConfirm = true },
++                                enabled = allConfigs.size > 1,
++                            ) {
++                                Icon(HugeIcons.Delete01, contentDescription = stringResource(R.string.backup_page_delete_config))
++                            }
+                         }
+                     },
+                 )
+@@ -638,6 +638,21 @@ fun WebDavTab(
+         )
+     }
+ 
++    // 删除当前配置：与删除备份文件同一确认样式；仅剩一个时按钮已禁用，这里只作兜底。
++    RikkaDeleteConfirmDialog(
++        show = showDeleteConfigConfirm,
++        title = stringResource(R.string.backup_page_delete),
++        message = stringResource(
++            R.string.backup_delete_config_confirm,
++            webDavConfig.displayName.ifBlank { stringResource(R.string.backup_config_unnamed) },
++        ),
++        onConfirm = {
++            showDeleteConfigConfirm = false
++            removeWebDavConfig(webDavConfig.id)
++        },
++        onDismiss = { showDeleteConfigConfirm = false },
++    )
++
+     // 备份缺口令：弹加密设置框让用户设口令，设好后自动重试备份。
+     if (showEncryptionDialog) {
+         BackupEncryptionDialog(
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 84b7caa48..d57591852 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -4450,6 +4450,8 @@
+   <string name="backend_service_name_required">الاسم مطلوب</string>
+   <string name="backup_config_unnamed">بدون اسم</string>
+   <string name="backup_delete_remote_confirm">هل تريد حذف النسخة الاحتياطية \"%1$s\" من السحابة؟ لن تتأثر الملفات المحلية. لا يمكن التراجع عن هذا الإجراء.</string>
++  <string name="backup_page_delete_config">حذف الإعداد</string>
++  <string name="backup_delete_config_confirm">هل تريد حذف الإعداد \"%1$s\"؟ لن تتأثر النسخ الاحتياطية المحفوظة على هذا الخادم. لا يمكن التراجع عن هذا الإجراء.</string>
+   <string name="backup_encryption_required">تحتوي النسخة الاحتياطية على أسرار بنص صريح (مفاتيح المزوّدين، وبيانات اعتماد المخزن، وما إلى ذلك). فعّل التشفير أولًا من \"النسخ الاحتياطي والاستعادة → إعدادات التشفير\" وعيّن كلمة مرور.</string>
+   <string name="backup_page_item_media_creation">ملفات إنشاء الوسائط</string>
+   <string name="backup_page_item_media_creation_desc">الصور والصوت والفيديو التي أنشأتها أدوات الوسائط (files/media_creation/)</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 0f539b105..d8adf9ba4 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -4442,6 +4442,8 @@
+   <string name="backend_service_name_required">名稱不能為空</string>
+   <string name="backup_config_unnamed">未命名</string>
+   <string name="backup_delete_remote_confirm">從雲端刪除備份「%1$s」？本機檔案不受影響。此操作無法復原。</string>
++  <string name="backup_page_delete_config">刪除配置</string>
++  <string name="backup_delete_config_confirm">刪除配置「%1$s」？已儲存在該伺服器上的備份不受影響。此操作無法復原。</string>
+   <string name="backup_encryption_required">備份包含明文密鑰（提供者金鑰／憑證庫等）。請先在「備份與還原 → 加密設定」開啟加密並設定密碼。</string>
+   <string name="backup_page_item_media_creation">媒體創作檔案</string>
+   <string name="backup_page_item_media_creation_desc">媒體工具創作的圖片、音訊與影片（files/media_creation/）</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 9d5af6c1b..44079a943 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -4443,6 +4443,8 @@
+   <string name="backend_service_name_required">名前は必須です</string>
+   <string name="backup_config_unnamed">名前なし</string>
+   <string name="backup_delete_remote_confirm">クラウドからバックアップ「%1$s」を削除しますか？ローカルファイルには影響しません。この操作は取り消せません。</string>
++  <string name="backup_page_delete_config">構成を削除</string>
++  <string name="backup_delete_config_confirm">構成「%1$s」を削除しますか？このサーバーに保存済みのバックアップには影響しません。この操作は取り消せません。</string>
+   <string name="backup_encryption_required">バックアップに平文のシークレット（プロバイダーのキー、保管庫の認証情報など）が含まれています。「バックアップと復元 → 暗号化設定」で暗号化をオンにし、パスワードを先に設定してください。</string>
+   <string name="backup_page_item_media_creation">メディア作成ファイル</string>
+   <string name="backup_page_item_media_creation_desc">メディアツールで作成した画像・音声・動画（files/media_creation/）</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 9b710aacf..65501e196 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -4443,6 +4443,8 @@
+   <string name="backend_service_name_required">이름을 입력하세요</string>
+   <string name="backup_config_unnamed">이름 없음</string>
+   <string name="backup_delete_remote_confirm">클라우드에서 백업 \"%1$s\"을(를) 삭제하시겠습니까? 로컬 파일에는 영향을 주지 않습니다. 이 작업은 되돌릴 수 없습니다.</string>
++  <string name="backup_page_delete_config">구성 삭제</string>
++  <string name="backup_delete_config_confirm">구성 \"%1$s\"을(를) 삭제하시겠습니까? 이 서버에 이미 저장된 백업에는 영향을 주지 않습니다. 이 작업은 되돌릴 수 없습니다.</string>
+   <string name="backup_encryption_required">백업에 평문 비밀정보(제공업체 키, 자격 증명 보관함 등)가 포함되어 있습니다. \"백업 및 복원 → 암호화 설정\"에서 암호화를 켜고 비밀번호를 먼저 설정하세요.</string>
+   <string name="backup_page_item_media_creation">미디어 생성 파일</string>
+   <string name="backup_page_item_media_creation_desc">미디어 도구로 만든 이미지, 오디오 및 동영상(files/media_creation/)</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index f041fb08d..ea5e466f8 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -4447,6 +4447,8 @@
+   <string name="backend_service_name_required">Укажите имя</string>
+   <string name="backup_config_unnamed">Без названия</string>
+   <string name="backup_delete_remote_confirm">Удалить резервную копию «%1$s» из облака? Локальные файлы не изменятся. Это действие нельзя отменить.</string>
++  <string name="backup_page_delete_config">Удалить профиль</string>
++  <string name="backup_delete_config_confirm">Удалить профиль «%1$s»? Резервные копии, уже сохранённые на этом сервере, не будут затронуты. Это действие нельзя отменить.</string>
+   <string name="backup_encryption_required">Резервная копия содержит секреты в открытом виде (ключи провайдеров, учётные данные хранилища и т. д.). Сначала включите шифрование в разделе «Резервное копирование и восстановление → Настройки шифрования» и задайте пароль.</string>
+   <string name="backup_page_item_media_creation">Файлы, созданные медиаинструментами</string>
+   <string name="backup_page_item_media_creation_desc">Изображения, аудио и видео, созданные медиаинструментами (files/media_creation/)</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 93ba883fb..c2a7c3fa7 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -297,6 +297,8 @@
+   <string name="backup_page_connection_success">连接成功</string>
+   <string name="backup_page_delete">删除</string>
+   <string name="backup_delete_remote_confirm">从云端删除备份“%1$s”？本地文件不受影响。此操作无法撤销。</string>
++  <string name="backup_page_delete_config">删除配置</string>
++  <string name="backup_delete_config_confirm">删除配置“%1$s”？已保存在该服务器上的备份不受影响。此操作无法撤销。</string>
+   <string name="backup_page_delete_failed">删除失败: %s</string>
+   <string name="backup_page_delete_success">删除成功</string>
+   <string name="backup_page_export_desc">导出APP数据为文件</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c77ec096a..37134742c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -297,6 +297,8 @@
+   <string name="backup_page_connection_success">Connection successful</string>
+   <string name="backup_page_delete">Delete</string>
+   <string name="backup_delete_remote_confirm">Delete backup \"%1$s\" from the cloud? Local files are not affected. This action cannot be undone.</string>
++  <string name="backup_page_delete_config">Delete profile</string>
++  <string name="backup_delete_config_confirm">Delete profile \"%1$s\"? Backups already stored on this server are not affected. This action cannot be undone.</string>
+   <string name="backup_page_delete_failed">Delete failed: %s</string>
+   <string name="backup_page_delete_success">Delete successful</string>
+   <string name="backup_page_export_desc">Export app data to a file</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/WebDavConfigRemovalTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/WebDavConfigRemovalTest.kt
+new file mode 100644
+index 000000000..5a533e76b
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/WebDavConfigRemovalTest.kt
+@@ -0,0 +1,77 @@
++package me.rerere.rikkahub.data.datastore
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * WebDAV 配置删除（Settings.withoutWebDavConfig）的纯逻辑回归：
++ * 删当前生效配置时生效配置顺延为剩余首个；删最后一个（列表仅剩一个或旧单配置模式）
++ * 必须拒绝；不存在的 id 不做任何改动。
++ */
++class WebDavConfigRemovalTest {
++
++    private fun config(id: String, name: String) = WebDavConfig(id = id, name = name)
++
++    @Test
++    fun `deleting the active config promotes the remaining one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            webDavConfigs = listOf(first, second),
++            activeWebDavConfigId = "b",
++            webDavConfig = second,
++        )
++        val result = settings.withoutWebDavConfig("b")
++        assertEquals(listOf(first), result?.webDavConfigs)
++        assertEquals("a", result?.activeWebDavConfigId)
++        assertEquals(first, result?.webDavConfig)
++    }
++
++    @Test
++    fun `deleting a non-active config keeps the active one`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            webDavConfigs = listOf(first, second),
++            activeWebDavConfigId = "a",
++            webDavConfig = first,
++        )
++        val result = settings.withoutWebDavConfig("b")
++        assertEquals(listOf(first), result?.webDavConfigs)
++        assertEquals("a", result?.activeWebDavConfigId)
++        assertEquals(first, result?.webDavConfig)
++    }
++
++    @Test
++    fun `deleting the only listed config is refused`() {
++        val only = config("a", "only")
++        val settings = Settings(
++            webDavConfigs = listOf(only),
++            activeWebDavConfigId = "a",
++            webDavConfig = only,
++        )
++        assertNull(settings.withoutWebDavConfig("a"))
++    }
++
++    @Test
++    fun `deleting the legacy single config is refused`() {
++        val legacy = config("legacy", "legacy")
++        val settings = Settings(webDavConfig = legacy)
++        assertNull(settings.withoutWebDavConfig("legacy"))
++    }
++
++    @Test
++    fun `unknown id leaves settings unchanged`() {
++        val first = config("a", "first")
++        val second = config("b", "second")
++        val settings = Settings(
++            webDavConfigs = listOf(first, second),
++            activeWebDavConfigId = "a",
++            webDavConfig = first,
++        )
++        assertEquals(settings, settings.withoutWebDavConfig("missing"))
++        val legacySettings = Settings(webDavConfig = config("legacy", "legacy"))
++        assertEquals(legacySettings, legacySettings.withoutWebDavConfig("missing"))
++    }
++}
