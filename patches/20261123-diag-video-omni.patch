@@ -1,0 +1,434 @@
+diff --git a/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt b/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
+index 2f122e726..ee1c518cb 100644
+--- a/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
++++ b/ai/src/main/java/me/rerere/ai/registry/ModelRegistry.kt
+@@ -778,6 +778,23 @@ object ModelRegistry {
+         videoOutput()
+     }
+ 
++    private val AGNES_VIDEO = defineModel {
++        tokens("agnes", "video")
++        videoOutput()
++    }
++
++    // Gemini Omni 是 Google 的原生多模态视频生成/编辑模型（gemini-omni-1.1/1.2-flash）：
++    // OpenRouter 官方声明 output_modalities 含 video，但名字里没有 video token，
++    // 通用兜底规则覆盖不到；models.dev 目录也未声明其视频输出，故单列一条家族规则。
++    // 通用机制（OpenRouterRequestBuilder 解析 API 的 output_modalities）已存在，
++    // 但只在 listModels 拉取成功时生效，OpenRouter 拉列表目前失败（另案），
++    // 手动添加的模型走不到那条线；待拉列表修好后，拉取的模型自动带视频模态，
++    // 本规则作为手动添加模型与非 OpenRouter 提供商的兜底。
++    private val GEMINI_OMNI_VIDEO = defineModel {
++        tokens("gemini", "omni")
++        videoOutput()
++    }
++
+     // Wan 视频模型分两种命名：wan*-video（完整 video token）与 wan*-t2v/i2v/s2v。
+     // 分词器按字母/数字边界切分，t2v 会切成 t、2、v 三个 token，单 token 匹配不到，
+     // 所以第二种形态要拆成三个 token 的序列另写一条规则。
+@@ -791,6 +808,15 @@ object ModelRegistry {
+         videoOutput()
+     }
+ 
++    // 通用兜底：名字里带 video token、但未命中任何家族规则的模型，认作视频输出。
++    // 计分最低（1 个 token）：任何家族规则（≥2 个 token，如 agnes+video）都优先于它，
++    // 只有无任何家族规则命中时才生效；同分并列只会与其他单 token 视频家族规则合并，
++    // 那些规则输出相同（TEXT+VIDEO、无能力），合并结果不变。
++    private val GENERIC_VIDEO = defineModel {
++        tokens("video")
++        videoOutput()
++    }
++
+     private val ALL_MODELS = listOf(
+         GPT4O,
+         GPT_4_1,
+@@ -918,8 +944,11 @@ object ModelRegistry {
+         SEEDANCE_VIDEO,
+         HUNYUAN_VIDEO,
+         MINIMAX_VIDEO,
++        AGNES_VIDEO,
++        GEMINI_OMNI_VIDEO,
+         WAN_VIDEO,
+         WAN_VIDEO_T2V,
++        GENERIC_VIDEO,
+     )
+ 
+     @Volatile
+diff --git a/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt b/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
+index a90b94f65..9cd6ddc99 100644
+--- a/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
++++ b/ai/src/test/java/me/rerere/ai/registry/ModelRegistryTest.kt
+@@ -219,6 +219,27 @@ class ModelRegistryTest {
+         assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("wan2.6-t2v"))
+         assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("wanx2.1-i2v-plus"))
+         assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("cogvideox-5b"))
++        // agnes 视频模型：专用规则（agnes+video，2 个 token）优先于通用兜底（video，1 个 token），
++        // 两者输出相同；断言能力为空可确认没有其他规则并入
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-video-2.5"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-video-2.5-flash"))
++        assertEquals(emptyList<ModelAbility>(), ModelRegistry.MODEL_ABILITIES.getData("agnes-video-2.5"))
++        // Gemini Omni 视频模型：OpenRouter 官方声明输出含 video，但名字里没有 video token，
++        // 通用兜底覆盖不到；models.dev 目录也未声明视频输出，故单列家族规则（gemini+omni，2 个 token）
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("google/gemini-omni-1.2-flash"))
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("google/gemini-omni-1.1-flash"))
++        assertEquals(emptyList<ModelAbility>(), ModelRegistry.MODEL_ABILITIES.getData("google/gemini-omni-1.2-flash"))
++        // Gemini 文本同门不挂视频：2.5-flash / 3-pro 等名字里无 omni，不命中本规则
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("google/gemini-2.5-flash"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("google/gemini-3-pro"))
++        // 通用兜底：名字带 video token、但无任何家族规则命中的模型，也认作视频输出
++        assertEquals(videoOutput, ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("acme-video-1.0"))
++        // agnes 非视频模型不受影响：文本 / 图像 / 系统模型均无 video token
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-3.0-flash"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-3.0-pro"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-image-2.1-flash"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-image-2.5-flash"))
++        assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("agnes-sys1-1.0"))
+         // 文本同门不挂视频：混元文本模型、MiniMax 文本模型
+         assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("hunyuan-a13b"))
+         assertFalse(Modality.VIDEO in ModelRegistry.MODEL_OUTPUT_MODALITIES.getData("minimax-m2.5"))
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnostics.kt b/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnostics.kt
+index 433aab2d1..5b8139821 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnostics.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnostics.kt
+@@ -6,12 +6,12 @@ import org.json.JSONObject
+  * 隧道网络诊断：纯类型与纯判定（零 Android 依赖，本地 kotlinc 可直编）。
+  *
+  * 检查项（按执行顺序，超时为单项预算）：
+- * 1.1 模块状态 / 1.2 本机联网 / 1.3 系统 DNS / 1.4 直连目标站 / 1.5 控制面连通 /
+- * 1.6 MagicDNS 记录 / 1.6b MagicDNS 真实解析 / 1.7 对端列表 / 1.8 出口与路由 /
+- * 1.9 尾网 TCP / 1.10 尾网 Ping。
+- * 1.6 只查 netmap 记录存在（标题写「记录」不写「解析成功」）；真解析是 1.6b 的事，
+- * 它复用 AppDnsResolver 的 buildQuery / parseResponse，只自己做 TCP 传输
+- * （Socket + 2 字节长度前缀，与 AppDnsResolver.queryDnsTcp 同口径）。
++ * 模块状态 / 本机联网 / 系统 DNS / 直连目标站 / 控制面连通 /
++ * MagicDNS 记录 / MagicDNS 真实解析 / 对端列表 / 出口与路由 /
++ * 尾网 TCP / 尾网 Ping。
++ * MagicDNS 记录只查 netmap 记录存在（标题写「记录」不写「解析成功」）；真解析是
++ * MagicDNS 真实解析的事，它复用 AppDnsResolver 的 buildQuery / parseResponse，
++ * 只自己做 TCP 传输（Socket + 2 字节长度前缀，与 AppDnsResolver.queryDnsTcp 同口径）。
+  * 明细文案经 DiagStrings 解析（调用方传入实现），复制文本跟系统语言走。
+  */
+ enum class DiagStatus { PASS, FAIL, SKIP, RUNNING, PENDING }
+@@ -93,18 +93,18 @@ fun interface DiagStrings {
+ }
+ 
+ /** 超时为单项预算（毫秒）；0 表示纯读快照、不设超时。 */
+-enum class DiagItemId(val displayNo: String, val timeoutMs: Long) {
+-    MODULE("1.1", 8_000),
+-    DEVICE_NETWORK("1.2", 1_000),
+-    SYSTEM_DNS("1.3", 5_000),
+-    DIRECT("1.4", 8_000),
+-    CONTROL_PLANE("1.5", 8_000),
+-    MAGIC_DNS("1.6", 0),
+-    MAGIC_DNS_RESOLVE("1.6b", 10_000),
+-    PEERS("1.7", 0),
+-    ROUTES("1.8", 0),
+-    TAILNET_TCP("1.9", 10_000),
+-    TAILNET_PING("1.10", 10_000),
++enum class DiagItemId(val timeoutMs: Long) {
++    MODULE(8_000),
++    DEVICE_NETWORK(1_000),
++    SYSTEM_DNS(5_000),
++    DIRECT(8_000),
++    CONTROL_PLANE(8_000),
++    MAGIC_DNS(0),
++    MAGIC_DNS_RESOLVE(10_000),
++    PEERS(0),
++    ROUTES(0),
++    TAILNET_TCP(10_000),
++    TAILNET_PING(10_000),
+ }
+ 
+ data class DiagItemState(
+@@ -177,7 +177,7 @@ fun DiagPeer.firstIpv4(): String =
+ 
+ /**
+  * 探针目标：首个在线且最近活跃的对端；没有活跃的退化到首个在线对端；全离线返回 null。
+- * 1.6 / 1.6b / 1.9 / 1.10 共用同一目标，诊断口径一致。
++ * MagicDNS 记录 / MagicDNS 真实解析 / 尾网 TCP / 尾网 Ping 共用同一目标，诊断口径一致。
+  */
+ fun pickProbeTarget(peers: List<DiagPeer>): DiagPeer? =
+     peers.firstOrNull { it.online && it.active } ?: peers.firstOrNull { it.online }
+@@ -189,7 +189,7 @@ fun pickProbeTarget(peers: List<DiagPeer>): DiagPeer? =
+ internal fun errorDetail(error: String): String =
+     error.replace('\n', ' ').replace('\r', ' ').trim().take(120)
+ 
+-/** 1.1 模块状态：后端必须是 Running 才算通过。 */
++/** 模块状态：后端必须是 Running 才算通过。 */
+ fun decideModule(strings: DiagStrings, running: Boolean, backendState: String, error: String?): Pair<DiagStatus, String> =
+     when {
+         !running -> DiagStatus.FAIL to strings.get(DiagStringKey.MODULE_NOT_STARTED) +
+@@ -200,18 +200,18 @@ fun decideModule(strings: DiagStrings, running: Boolean, backendState: String, e
+         else -> DiagStatus.FAIL to strings.get(DiagStringKey.MODULE_BAD_STATE, backendState)
+     }
+ 
+-/** 1.2 本机联网。 */
++/** 本机联网。 */
+ fun decideDeviceNetwork(strings: DiagStrings, connected: Boolean, transport: String): Pair<DiagStatus, String> =
+     if (connected) DiagStatus.PASS to strings.get(DiagStringKey.DEVICE_CONNECTED, transport)
+     else DiagStatus.FAIL to strings.get(DiagStringKey.DEVICE_OFFLINE)
+ 
+-/** 1.3 系统 DNS：解析 example.com。 */
++/** 系统 DNS：解析 example.com。 */
+ fun decideSystemDns(strings: DiagStrings, ok: Boolean, latencyMs: Long?, error: String?): Pair<DiagStatus, String> =
+     if (ok) DiagStatus.PASS to strings.get(DiagStringKey.DNS_OK, latencyMs ?: 0)
+     else DiagStatus.FAIL to strings.get(DiagStringKey.DNS_FAIL) +
+         (error?.takeIf { it.isNotBlank() }?.let { strings.get(DiagStringKey.ERROR_SUFFIX, errorDetail(it)) } ?: "")
+ 
+-/** 1.4 直连目标站：HTTPS GET example.com。 */
++/** 直连目标站：HTTPS GET example.com。 */
+ fun decideDirect(strings: DiagStrings, httpStatus: Int?, latencyMs: Long?): Pair<DiagStatus, String> =
+     when {
+         httpStatus != null && httpStatus in 200..299 ->
+@@ -220,7 +220,7 @@ fun decideDirect(strings: DiagStrings, httpStatus: Int?, latencyMs: Long?): Pair
+         else -> DiagStatus.FAIL to strings.get(DiagStringKey.DIRECT_FAIL_UNREACHABLE)
+     }
+ 
+-/** 1.5 控制面连通：任意 HTTP 响应都算可达（根路径不保证返回 200）。 */
++/** 控制面连通：任意 HTTP 响应都算可达（根路径不保证返回 200）。 */
+ fun decideControlPlane(strings: DiagStrings, host: String, httpStatus: Int?, latencyMs: Long?, error: String?): Pair<DiagStatus, String> =
+     when {
+         httpStatus != null -> DiagStatus.PASS to strings.get(DiagStringKey.CONTROL_OK, host, httpStatus, latencyMs ?: 0)
+@@ -228,7 +228,7 @@ fun decideControlPlane(strings: DiagStrings, host: String, httpStatus: Int?, lat
+             (error?.takeIf { it.isNotBlank() }?.let { strings.get(DiagStringKey.ERROR_SUFFIX, errorDetail(it)) } ?: "")
+     }
+ 
+-/** 1.6 MagicDNS 记录：只查 netmap 里有没有该对端的记录，不做真解析。 */
++/** MagicDNS 记录：只查 netmap 里有没有该对端的记录，不做真解析。 */
+ fun decideMagicDns(strings: DiagStrings, target: DiagPeer?): Pair<DiagStatus, String> =
+     if (target == null) DiagStatus.SKIP to strings.get(DiagStringKey.NO_PEER)
+     else {
+@@ -239,7 +239,7 @@ fun decideMagicDns(strings: DiagStrings, target: DiagPeer?): Pair<DiagStatus, St
+     }
+ 
+ /**
+- * 1.6b MagicDNS 真实解析：对 1.6 的目标发 A 查询。
++ * MagicDNS 真实解析：对 MagicDNS 记录的目标发 A 查询。
+  * rcode: null = 无有效响应；3 = NXDOMAIN。addresses 为解析到的地址（hostAddress 串）。
+  */
+ fun decideDnsResolve(
+@@ -265,7 +265,7 @@ fun decideDnsResolve(
+     }
+ }
+ 
+-/** 1.7 对端列表。 */
++/** 对端列表。 */
+ fun decidePeers(strings: DiagStrings, peers: List<DiagPeer>): Pair<DiagStatus, String> =
+     when {
+         peers.isEmpty() -> DiagStatus.FAIL to strings.get(DiagStringKey.PEERS_NONE)
+@@ -276,7 +276,7 @@ fun decidePeers(strings: DiagStrings, peers: List<DiagPeer>): Pair<DiagStatus, S
+         else -> DiagStatus.FAIL to strings.get(DiagStringKey.PEERS_ALL_OFFLINE, peers.size)
+     }
+ 
+-/** 1.8 出口与路由：回读守护进程的生效设置（只展示，不做价值判断）。 */
++/** 出口与路由：回读守护进程的生效设置（只展示，不做价值判断）。 */
+ fun decideRoutes(strings: DiagStrings, peers: List<DiagPeer>, acceptRoutes: Boolean, exitNodeIP: String): Pair<DiagStatus, String> {
+     val ip = exitNodeIP.trim().takeIf { it.isNotBlank() && it != "<nil>" && it != "invalid IP" }
+     val exitPart = if (ip == null) strings.get(DiagStringKey.ROUTES_EXIT_UNSET)
+@@ -289,7 +289,7 @@ fun decideRoutes(strings: DiagStrings, peers: List<DiagPeer>, acceptRoutes: Bool
+     return DiagStatus.PASS to strings.get(DiagStringKey.ROUTES, exitPart, routesPart)
+ }
+ 
+-/** 1.9 尾网 TCP：必须读到 HTTP 横幅才算通过（StartProxy 是懒拨号，连上不代表通）。 */
++/** 尾网 TCP：必须读到 HTTP 横幅才算通过（StartProxy 是懒拨号，连上不代表通）。 */
+ fun decideTailnetTcp(strings: DiagStrings, ok: Boolean, banner: String?, error: String?): Pair<DiagStatus, String> =
+     when {
+         ok && banner != null -> DiagStatus.PASS to strings.get(DiagStringKey.TCP_BANNER, banner.take(40))
+@@ -299,7 +299,7 @@ fun decideTailnetTcp(strings: DiagStrings, ok: Boolean, banner: String?, error:
+             (error?.takeIf { it.isNotBlank() }?.let { strings.get(DiagStringKey.ERROR_SUFFIX, errorDetail(it)) } ?: "")
+     }
+ 
+-/** 1.10 尾网 Ping（TSMP）。 */
++/** 尾网 Ping（TSMP）。 */
+ fun decideTailnetPing(strings: DiagStrings, ok: Boolean, latencyMs: Long?, error: String?): Pair<DiagStatus, String> =
+     if (ok) DiagStatus.PASS to strings.get(DiagStringKey.PING_OK, latencyMs ?: 0)
+     else DiagStatus.FAIL to strings.get(DiagStringKey.PING_FAIL) +
+@@ -380,7 +380,7 @@ fun buildCopyText(
+         for (item in items) {
+             val title = titles[item.id] ?: item.id.name
+             val detail = item.detail.takeIf { it.isNotBlank() }?.let { strings.get(DiagStringKey.PAREN_SUFFIX, it) } ?: ""
+-            appendLine(strings.get(DiagStringKey.COPY_ITEM, item.id.displayNo, title, statusWord(strings, item.status), detail))
++            appendLine(strings.get(DiagStringKey.COPY_ITEM, title, statusWord(strings, item.status), detail))
+         }
+     }.trimEnd()
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsRunner.kt b/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsRunner.kt
+index fe4c5f3d8..7a62427f8 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsRunner.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsRunner.kt
+@@ -24,9 +24,9 @@ import java.net.URL
+ import kotlin.random.Random
+ 
+ /**
+- * 隧道网络诊断执行器：按 1.1–1.10 顺序跑，每项独立超时、独立失败，不互相拖垮。
++ * 隧道网络诊断执行器：按声明顺序跑，每项独立超时、独立失败，不互相拖垮。
+  * 取消只认 CancellationException（重抛），其余异常收敛为该项 FAIL。
+- * DNS 真解析（1.6b）复用 AppDnsResolver.buildQuery / parseResponse，只自己做
++ * DNS 真解析（MagicDNS 真实解析）复用 AppDnsResolver.buildQuery / parseResponse，只自己做
+  * TCP 传输（与 AppDnsResolver.queryDnsTcp 同口径：2 字节长度前缀）。
+  * 探针连完即关并 stopProxy，不留监听。
+  */
+@@ -275,7 +275,7 @@ class TunnelDiagnosticsRunner(
+     }
+ 
+     /**
+-     * 1.6b：经 100.100.100.100:53 的本地代理端口发 TCP DNS A 查询。
++     * MagicDNS 真实解析：经 100.100.100.100:53 的本地代理端口发 TCP DNS A 查询。
+      * 编解码复用 AppDnsResolver；传输失败（非超时）直接报传输错误。
+      */
+     private suspend fun probeMagicDnsResolve(domain: String, netmapIp: String): Pair<DiagStatus, String> =
+@@ -331,7 +331,7 @@ class TunnelDiagnosticsRunner(
+         }
+     }
+ 
+-    /** 1.9：经对端 :80 的本地代理端口发 HTTP 请求，必须读到横幅才算通过。 */
++    /** 尾网 TCP：经对端 :80 的本地代理端口发 HTTP 请求，必须读到横幅才算通过。 */
+     private suspend fun probeTailnetTcp(targetIp: String): Pair<DiagStatus, String> =
+         withContext(Dispatchers.IO) {
+             val proxy = bridge.proxyTo(targetIp, 80)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/TunnelDiagnosticsPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/TunnelDiagnosticsPage.kt
+index 3e37aaaf7..a441dacf8 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/TunnelDiagnosticsPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/TunnelDiagnosticsPage.kt
+@@ -72,7 +72,7 @@ class TunnelDiagnosticsViewModel(
+ ) : ViewModel() {
+     private val runner = TunnelDiagnosticsRunner(TsnetBridge, settingsStore, appContext, appContext.diagStrings())
+ 
+-    // 1.9 尾网 TCP 暂时隐藏。
++    // 尾网 TCP 暂时隐藏。
+     private val visibleItems = DiagItemId.entries.filter { it != DiagItemId.TAILNET_TCP }
+ 
+     private val _items = MutableStateFlow(visibleItems.map { DiagItemState(it, DiagStatus.PENDING) })
+@@ -292,7 +292,7 @@ private fun DiagItemRow(state: DiagItemState, title: String) {
+         Column(modifier = Modifier.weight(1f)) {
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                 Text(
+-                    text = "${state.id.displayNo} $title",
++                    text = title,
+                     style = MaterialTheme.typography.bodyMedium,
+                 )
+                 Text(
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 84b7caa48..e506a52bb 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -4310,7 +4310,7 @@
+   <string name="tunnel_diag_detail_error_suffix">: %1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">(%1$s)</string>
+   <string name="tunnel_diag_detail_copy_header">تشخيص الشبكة %1$s (%2$d ثانية، ناجح %3$d / فاشل %4$d / متخطّى %5$d)</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s: %3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s: %2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">تعذّرت قراءة حالة النفق</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">حالة النفق غير معروفة</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">النفق غير مشغّل</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 0f539b105..348b38ba1 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -4302,7 +4302,7 @@
+   <string name="tunnel_diag_detail_error_suffix">：%1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">（%1$s）</string>
+   <string name="tunnel_diag_detail_copy_header">網路診斷 %1$s（用時 %2$d 秒，通過 %3$d / 失敗 %4$d / 跳過 %5$d）</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s：%3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s：%2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">讀取隧道狀態失敗</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">隧道狀態未知</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">隧道未執行</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 9d5af6c1b..fefbfccfa 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -4303,7 +4303,7 @@
+   <string name="tunnel_diag_detail_error_suffix">：%1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">（%1$s）</string>
+   <string name="tunnel_diag_detail_copy_header">ネットワーク診断 %1$s（%2$d 秒、成功 %3$d / 失敗 %4$d / スキップ %5$d）</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s：%3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s：%2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">トンネル状態の読み取りに失敗しました</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">トンネル状態が不明です</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">トンネルが実行されていません</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 9b710aacf..ee5d6c2f6 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -4303,7 +4303,7 @@
+   <string name="tunnel_diag_detail_error_suffix">: %1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">(%1$s)</string>
+   <string name="tunnel_diag_detail_copy_header">네트워크 진단 %1$s (%2$d초, 성공 %3$d / 실패 %4$d / 건너뜀 %5$d)</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s: %3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s: %2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">터널 상태를 읽지 못함</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">터널 상태 알 수 없음</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">터널이 실행 중이 아님</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index f041fb08d..48e449847 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -4307,7 +4307,7 @@
+   <string name="tunnel_diag_detail_error_suffix">: %1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">(%1$s)</string>
+   <string name="tunnel_diag_detail_copy_header">Диагностика сети %1$s (%2$d сек, пройдено %3$d / не пройдено %4$d / пропущено %5$d)</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s: %3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s: %2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">Не удалось прочитать состояние туннеля</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">Состояние туннеля неизвестно</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">Туннель не работает</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 93ba883fb..24b1d65c5 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -4387,7 +4387,7 @@
+   <string name="tunnel_diag_detail_error_suffix">：%1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">（%1$s）</string>
+   <string name="tunnel_diag_detail_copy_header">网络诊断 %1$s（用时 %2$d 秒，通过 %3$d / 失败 %4$d / 跳过 %5$d）</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s：%3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s：%2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">读取隧道状态失败</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">隧道状态未知</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">隧道未运行</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index c77ec096a..999f943bb 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -4387,7 +4387,7 @@
+   <string name="tunnel_diag_detail_error_suffix">: %1$s</string>
+   <string name="tunnel_diag_detail_paren_suffix">(%1$s)</string>
+   <string name="tunnel_diag_detail_copy_header">Network diagnostics %1$s (%2$d sec, pass %3$d / fail %4$d / skip %5$d)</string>
+-  <string name="tunnel_diag_detail_copy_item">%1$s %2$s: %3$s%4$s</string>
++  <string name="tunnel_diag_detail_copy_item">%1$s: %2$s%3$s</string>
+   <string name="tunnel_diag_detail_snapshot_fail">Failed to read tunnel status</string>
+   <string name="tunnel_diag_detail_snapshot_unknown">Tunnel status unknown</string>
+   <string name="tunnel_diag_detail_snapshot_not_running">Tunnel not running</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsTest.kt b/app/src/test/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsTest.kt
+index e4d7c7574..881cb95bb 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/tunnel/TunnelDiagnosticsTest.kt
+@@ -64,7 +64,7 @@ class TunnelDiagnosticsTest {
+             DiagStringKey.ERROR_SUFFIX -> "：%1\$s"
+             DiagStringKey.PAREN_SUFFIX -> "（%1\$s）"
+             DiagStringKey.COPY_HEADER -> "网络诊断 %1\$s（用时 %2\$d 秒，通过 %3\$d / 失败 %4\$d / 跳过 %5\$d）"
+-            DiagStringKey.COPY_ITEM -> "%1\$s %2\$s：%3\$s%4\$s"
++            DiagStringKey.COPY_ITEM -> "%1\$s：%2\$s%3\$s"
+             DiagStringKey.SNAPSHOT_FAIL -> "读取隧道状态失败"
+             DiagStringKey.SNAPSHOT_UNKNOWN -> "隧道状态未知"
+             DiagStringKey.SNAPSHOT_NOT_RUNNING -> "隧道未运行"
+@@ -254,7 +254,7 @@ class TunnelDiagnosticsTest {
+     }
+ 
+     @Test
+-    fun `buildCopyText lists every item with number and status`() {
++    fun `buildCopyText lists every item with status`() {
+         val items = DiagItemId.entries.map { id ->
+             DiagItemState(id, if (id == DiagItemId.MODULE) DiagStatus.PASS else DiagStatus.SKIP, "ok")
+         }
+@@ -262,8 +262,8 @@ class TunnelDiagnosticsTest {
+         val text = buildCopyText(zhStrings, items, titles, 1_000L, 13_000L)
+         assertTrue(text.startsWith("网络诊断 "))
+         assertTrue(text.contains("通过 1 / 失败 0 / 跳过 10"))
+-        assertTrue(text.contains("1.6b MAGIC_DNS_RESOLVE：跳过"))
+-        assertTrue(text.contains("1.10 TAILNET_PING：跳过"))
++        assertTrue(text.contains("MAGIC_DNS_RESOLVE：跳过"))
++        assertTrue(text.contains("TAILNET_PING：跳过"))
+         assertFalse(text.contains("auth"))
+         assertFalse(text.contains("controlplane"))
+     }
