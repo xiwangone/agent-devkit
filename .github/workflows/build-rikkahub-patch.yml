@@ -24,7 +24,7 @@ on:
       base_sha:
         description: "rikkahub-agents base commit"
         required: true
-        default: "4860a7e6a12b87fcfb2e3a4213c9aede8fd4f80b"
+        default: "3972b8834d54fb21a3ba102e1adbfe9bd8a28bab"
       patch_ref:
         description: "本仓里放 patch 的分支"
         required: true
@@ -53,7 +53,7 @@ jobs:
     env:
       GRADLE_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
       _JAVA_OPTIONS: "-Djava.net.preferIPv4Stack=true"
-      BASE_SHA: ${{ github.event.inputs.base_sha || '4860a7e6a12b87fcfb2e3a4213c9aede8fd4f80b' }}
+      BASE_SHA: ${{ github.event.inputs.base_sha || '3972b8834d54fb21a3ba102e1adbfe9bd8a28bab' }}
       PATCH_REF: ${{ github.event.inputs.patch_ref || github.ref_name }}
       # 注意：dispatch 时 inputs.patch_path 取不到值会用声明的默认值；
       # push 触发时 inputs 整个为空，这里故意不写 || 默认值，
@@ -106,7 +106,7 @@ jobs:
       # setup-build-env 只是装 JDK/SDK 的环境动作，变化极少，
       # 换 base 时如它改了再手动 bump 这个 SHA。
       - name: 准备构建环境（复用本仓 setup-build-env）
-        uses: xiwangone/rikkahub-agents/.github/actions/setup-build-env@4860a7e6a12b87fcfb2e3a4213c9aede8fd4f80b
+        uses: xiwangone/rikkahub-agents/.github/actions/setup-build-env@3972b8834d54fb21a3ba102e1adbfe9bd8a28bab
 
       - name: 缓存 Gradle 发行版
         uses: actions/cache@v4
