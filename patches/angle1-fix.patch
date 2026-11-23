@@ -1,0 +1,1178 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt
+index 5f1cb5cc5..0c6eb1d2f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/ChatToolFactory.kt
+@@ -59,7 +59,11 @@ class ChatToolFactory(
+         // 当前 UI 场景（默认 UNKNOWN = 纯静态判定）：用于 WARM 档按场景动态调整。
+         // 由调用方（ChatService）在装配前从 AppScene.current 读取并传入。
+         uiScene: UiScene = UiScene.UNKNOWN,
+-    ): List<Tool> = buildList {
++    ): List<Tool> {
++        // schedule_job 校验用的非本地工具名：本次装配一份新的集合，两个会话
++        // 并发装配不会互相串名；provider 是懒求值，装配完填入即可。
++        val cronExtraKnownToolNames = mutableSetOf<String>()
++        return buildList {
+         // 统计总开关：**默认关**（普通用户不需要埋点）；开启后 usage / tool_scope 才有数据。
+         ToolUsageTracker.setEnabled(settings.displaySetting.toolStatsEnabled)
+         // 记忆分层：只注入 core 常驻；conditional 由模型按需检索。
+@@ -72,7 +76,7 @@ class ChatToolFactory(
+             addAll(createSearchTools(settings))
+         }
+ 
+-        addAll(localTools.getTools(assistant.localTools, invocationCtx))
++        addAll(localTools.getTools(assistant.localTools, invocationCtx, cronExtraKnownToolNames))
+ 
+         addAll(workspaceAndSkillTools(assistant, workspaceIdOverride, workspaceCwd))
+ 
+@@ -128,6 +132,10 @@ class ChatToolFactory(
+             settings.displaySetting.toolSurfaceTrimming && ToolSurfacePolicy.TRIM_ENABLED
+         val (listFiltered, scopeAsTier) =
+             resolveToolScope(stableFull, effectiveToolScope, trimEnabled)
++        // 补给 schedule_job 校验的名字集：模型实际看到的工具名（白名单过滤后、
++        // 不含 list_tools/get_tool_schema 等检索元工具）。工作区/技能/MCP
++        // 工具至此才组装完，此前只认本地工具名正是 -32601 的根因。
++        cronExtraKnownToolNames.addAll(listFiltered.map { it.name })
+         // 白名单里拼错/过期的名字不会报错, 只会静默失效; 统一算出未匹配项,
+         // 记一条日志并透出给 tool_surface_report, 便于事后自查。
+         val onlyToolsUnmatched =
+@@ -194,6 +202,7 @@ class ChatToolFactory(
+         )
+         trackUsage(measured)
+     }
++    }
+ 
+     /**
+      * 统一埋点：记录工具名/次数/失败/耗时（**不含参数**）。
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+index ec5796341..cb473720a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+@@ -205,9 +205,9 @@ class LocalTools(
+     }
+ 
+     // 拆分为域分组函数，拼接顺序与原来完全一致，仅为满足行数限制。
+-    private fun toolRegistry(): List<ToolEntry> =
++    private fun toolRegistry(cronExtraKnownToolNames: MutableSet<String> = mutableSetOf()): List<ToolEntry> =
+         coreDeviceToolEntries() +
+-            connectivityToolEntries() +
++            connectivityToolEntries(cronExtraKnownToolNames) +
+             fileAndManagementToolEntries() +
+             vaultAndWorkflowToolEntries() +
+             miscToolEntries()
+@@ -303,7 +303,7 @@ class LocalTools(
+     },
+     )
+ 
+-    private fun connectivityToolEntries(): List<ToolEntry> = listOf(
++    private fun connectivityToolEntries(cronExtraKnownToolNames: MutableSet<String> = mutableSetOf()): List<ToolEntry> = listOf(
+     ToolEntry(LocalToolOption.Ssh) { tools, _ ->
+         tools.add(sshExecTool(context, settingsStore))
+         tools.add(saveSshHostTool(sshHostRepository))
+@@ -334,10 +334,17 @@ class LocalTools(
+         tools.add(telegramDeleteCommandsTool(telegramBotPreferences, telegramBotClient))
+     },
+     ToolEntry(LocalToolOption.CronJobs) { tools, _ ->
++        // 校验用的名字集 = 本地工具 + 调用方在装配后补入的非本地工具名
++        // （工作区/技能/MCP）。provider 是懒求值：ChatToolFactory 在组装完
++        // 完整工具面后才填 cronExtraKnownToolNames，模型调 schedule_job
++        // 校验时已填好；直接走 getTools 的调用方（定时触发等）不传该参数，
++        // 仍只认本地工具名，行为不变。
++        val knownToolNamesProvider: () -> List<String> =
++            { tools.map { it.name } + cronExtraKnownToolNames }
+         tools.add(
+             me.rerere.rikkahub.data.ai.tools.local.scheduleJobDirectTool(
+                 scheduledJobRepository, cronJobScheduler, settingsStore,
+-                knownToolNamesProvider = { tools.map { it.name } },
++                knownToolNamesProvider = knownToolNamesProvider,
+                 approvalSnapshot = approvalSnapshot,
+             ),
+         )
+@@ -349,7 +356,7 @@ class LocalTools(
+         tools.add(
+             me.rerere.rikkahub.data.ai.tools.local.scheduleJobTool(
+                 scheduledJobRepository, cronJobScheduler, settingsStore,
+-                knownToolNamesProvider = { tools.map { it.name } },
++                knownToolNamesProvider = knownToolNamesProvider,
+                 approvalSnapshot = approvalSnapshot,
+             ),
+         )
+@@ -697,6 +704,9 @@ class LocalTools(
+     fun getTools(
+         options: List<LocalToolOption>,
+         invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
++        // 调用方在装配后补入的非本地工具名（工作区/技能/MCP），供 schedule_job
++        // 校验用；每次装配用一份新的集合，两个会话并发装配不会互相串名。
++        cronExtraKnownToolNames: MutableSet<String> = mutableSetOf(),
+     ): List<Tool> {
+         val tools = mutableListOf<Tool>()
+         val capabilities = ToolCapabilities.of(context)
+@@ -705,7 +715,7 @@ class LocalTools(
+             options.contains(option) && capabilities.satisfies(LocalToolCatalog.capabilityOf(option))
+ 
+         // 注册表驱动：遍历 toolRegistry()，授权门通过即构建；能力未就绪时记一条诊断日志而非完全静默。
+-        for (entry in toolRegistry()) {
++        for (entry in toolRegistry(cronExtraKnownToolNames)) {
+             val cap = LocalToolCatalog.capabilityOf(entry.option)
+             if (options.contains(entry.option) && !capabilities.satisfies(cap)) {
+                 me.rerere.rikkahub.data.log.AppLog.d(
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
+index c81a8bc3e..aa8aae6d2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/registry/ToolIndex.kt
+@@ -260,7 +260,7 @@ Entry("browser_back", "browser/BrowserToolDefaults.kt#ALL_TOOLS", "LocalToolOpti
+         Entry("transcribe_audio_file", "local/TranscribeAudioTool.kt#transcribeAudioFileTool", "LocalToolOption.Termux", "REMOTE", null, InvocationKind.STANDARD),
+         Entry("trigger_job_now", "local/CronJobTool.kt#triggerJobNowTool", "LocalToolOption.CronJobs", "AUTOMATION", null, InvocationKind.STANDARD),
+         Entry("unzip_file", "local/ArchiveTools.kt#unzipFileTool", "LocalToolOption.Archive", "FILES", "UnzipFileToolUI", InvocationKind.STANDARD),
+-        Entry("update_provider_icon", "local/ProviderIconTool.kt#updateProviderIconTool", "LocalToolOption.ProviderIcon", "DEVICE_INFO", null, InvocationKind.STANDARD),
++        Entry("update_provider_icon", "local/ProviderIconTool.kt#updateProviderIconTool", "LocalToolOption.ProviderIcon", "DEVICE_INFO", "ProviderIconToolUI", InvocationKind.STANDARD),
+         Entry("use_skill", "SkillsTools.kt#createSkillTools", "ChatToolFactory.workspaceAndSkillTools", "—", "UseSkillToolUI", InvocationKind.STANDARD),
+         Entry("vault_compare_loadcreds", "data/vault/VaultSyncTools.kt#vaultCompareLoadCredsTool", "LocalToolOption.VaultExportEnv", "VAULT", null, InvocationKind.STANDARD),
+         Entry("vault_credential_audit", "data/vault/VaultCrudTools.kt#vaultCredentialAuditTool", "LocalToolOption.VaultTools", "VAULT", null, InvocationKind.STANDARD),
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/sync/BackupEncryptionManager.kt b/app/src/main/java/me/rerere/rikkahub/data/sync/BackupEncryptionManager.kt
+index e88553b0a..554bd4511 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/sync/BackupEncryptionManager.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/sync/BackupEncryptionManager.kt
+@@ -17,9 +17,17 @@ import java.io.File
+  *   临时 zip 再交给 restoreFromBackupFile；明文 zip 原样放行。
+  *
+  * 口令来源：[Settings.backupEncryptionPasswordEnc]（AndroidKeyStore 包裹的"记住口令"）。
+- * 启用加密但本机无口令（新设备恢复/用户清除了记住）→ 抛 [IllegalStateException]，
++ * 启用加密但无可用口令（新设备恢复/用户清除了记住）→ 抛 [IllegalStateException]，
+  * 由 UI 捕获并弹框要求输入口令后重试（[decryptWithPassword] 走显式口令路径）。
+  */
++/**
++ * 备份加密已开启，但没有可用的记住口令（从未设置 / 对话框只开了开关未存口令 /
++ * KeyStore 密钥丢失导致记住的密文解不开）。调用方应把此异常转成"需输口令"状态，
++ * 弹框让用户设置口令后重试，而不是只弹一条 toast 了事。
++ */
++class BackupMissingPassphraseException :
++    IllegalStateException("Backup encryption is on, but no passphrase is stored on this device. Please set a passphrase in \"Backup & Restore → Encryption Settings\" first.")
++
+ class BackupEncryptionManager(
+     private val settingsStore: SettingsStore,
+ ) {
+@@ -44,7 +52,7 @@ class BackupEncryptionManager(
+         AppLog.i("BackupEnc", "maybeEncrypt: ${plainZip.name} enabled=${isEnabled}")
+         if (!isEnabled) return plainZip
+         val password = rememberedPassword
+-            ?: throw IllegalStateException("Backup encryption is on, but no passphrase is stored on this device. Please set a passphrase in \"Backup & Restore → Encryption Settings\" first.")
++            ?: throw BackupMissingPassphraseException()
+         val encFile = File(plainZip.parentFile, plainZip.name + ".enc")
+         BackupCrypto.encryptFile(plainZip, encFile, password)
+         return encFile
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/sync/S3Sync.kt b/app/src/main/java/me/rerere/rikkahub/data/sync/S3Sync.kt
+index 383e53f27..31de45333 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/sync/S3Sync.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/sync/S3Sync.kt
+@@ -71,6 +71,7 @@ class S3Sync(
+         val key = "rikkahub_backups/${file.name}"
+ 
+         try {
++            AppLog.i(TAG, "backupToS3: uploading ${file.name} (${file.length().fileSizeToString()})")
+             client.putObject(
+                 key = key,
+                 file = file,
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/sync/webdav/WebDavSync.kt b/app/src/main/java/me/rerere/rikkahub/data/sync/webdav/WebDavSync.kt
+index 5f97b23e0..0dddc4a1f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/sync/webdav/WebDavSync.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/sync/webdav/WebDavSync.kt
+@@ -82,7 +82,9 @@ class WebDavSync(
+ 
+         try {
+             // Ensure the backup directory exists
++            AppLog.i(TAG, "backup: ensuring collection exists for ${file.name}")
+             client.ensureCollectionExists().getOrThrow()
++            AppLog.i(TAG, "backup: collection ready, uploading ${file.name} (${file.length().fileSizeToString()})")
+ 
+             // Upload the backup file (加密时为 .zip.enc，明文时为原 .zip)
+             client.put(
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceAux.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceAux.kt
+index bcac68760..e5c666558 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceAux.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceAux.kt
+@@ -378,7 +378,11 @@ suspend fun ChatService.compressConversation(
+             requireConversationUnchanged(conversationId, allMessages)
+ 
+             saveConversation(conversationId, newConversation)
+-        }.onFailure { if (it is CancellationException) throw it }
++        }.onFailure {
++            if (it is CancellationException) throw it
++            // 失败只以 Result 回到调用方时毫无日志：手动/自动压缩都曾因此"点了没反应"。
++            AppLog.w(TAG, "compressConversation failed", it)
++        }
+ 
+ private suspend fun ChatService.seedLifetimeUsageBeforeCompaction(
+     conversationId: Uuid,
+@@ -451,6 +455,14 @@ private fun buildAgentExecutionTraceDigest(
+     return "[Agent Trace · $titleLabel] Executed ${executedTools.size} tool steps ($distinctChain)"
+ }
+ 
++/**
++ * 保留条数的有效值：不能超过"总数 - 1"（至少留一条可压缩），否则
++ * [splitForCompression] 会抛错。调用方（对话框/自动确认）在发起前钳制，
++ * splitForCompression 的抛错只作直接调用者的防御兜底。
++ */
++internal fun effectiveKeepRecent(totalMessages: Int, requested: Int = 32): Int =
++    requested.coerceIn(0, maxOf(totalMessages - 1, 0))
++
+ /** 压缩前切分：保留最近 N 条，其余参与压缩。条数不足时按调用方给的文案报错。 */
+ private fun splitForCompression(
+     all: List<UIMessage>,
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt b/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt
+index 068a07232..d4a7a8fe3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/CronJobWorker.kt
+@@ -19,10 +19,12 @@ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.rikkahub.data.agentrun.AgentRunKind
+ import me.rerere.rikkahub.data.agentrun.AgentRunRepository
+ import me.rerere.rikkahub.data.agentrun.AgentRunStatus
++import me.rerere.rikkahub.data.ai.tools.ChatToolFactory
+ import me.rerere.rikkahub.data.ai.tools.HeadlessConversations
+ import me.rerere.rikkahub.data.ai.tools.LocalTools
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.findAssistantById
++import me.rerere.rikkahub.data.datastore.findChatModelFor
+ import me.rerere.rikkahub.data.db.entity.ScheduledJobEntity
+ import me.rerere.rikkahub.data.db.entity.ScheduledJobRunEntity
+ import me.rerere.rikkahub.data.model.Conversation
+@@ -160,6 +162,7 @@ class CronJobWorker(
+     private val conversationRepo: ConversationRepository by inject()
+     private val settingsStore: SettingsStore by inject()
+     private val localTools: LocalTools by inject()
++    private val chatToolFactory: ChatToolFactory by inject()
+     private val directRunner: DirectModeActionRunner by inject()
+     private val agentRunRepo: AgentRunRepository by inject()
+ 
+@@ -408,15 +411,31 @@ class CronJobWorker(
+                 ?: return Triple("failed", "assistant_not_found", null)
+         // Headless context — sub-agent recursion guard fires from this dispatch path so
+         // a cron job's direct-mode action sequence cannot itself spawn a sub-agent.
+-        val tools =
+-            localTools.getTools(
+-                assistant.localTools,
+-                me.rerere.rikkahub.data.ai.tools.ToolInvocationContext(
+-                    callerAssistantId = assistantUuid.toString(),
+-                    callerConversationId = null, // direct-mode has no conversation
+-                    isHeadless = true,
+-                ),
++        val invocationCtx =
++            me.rerere.rikkahub.data.ai.tools.ToolInvocationContext(
++                callerAssistantId = assistantUuid.toString(),
++                callerConversationId = null, // direct-mode has no conversation
++                isHeadless = true,
+             )
++        // 工具面与聊天生成走同一条装配（ChatToolFactory.createTools），而非只取本地工具：
++        // 创建时校验已认工作区/技能/MCP 工具，触发时若仍只给本地工具，执行侧
++        // DirectModeActionRunner 会报工具不在列表——校验与执行必须同口径。
++        // 组装失败（如 MCP 服务器名非法、助手未配聊天模型）时回退本地工具并记 warning，
++        // 本地动作仍可执行，不因一个坏服务器名让整个任务失败。
++        val model = settings.findChatModelFor(null, assistantUuid)
++        val tools = if (model != null) {
++            runCatching {
++                chatToolFactory.createTools(settings, assistant, model, invocationCtx)
++            }.onFailure {
++                if (it is CancellationException) throw it
++                AppLog.w(TAG, "runDirect: full tool assembly failed, falling back to local tools", it)
++            }.getOrElse {
++                localTools.getTools(assistant.localTools, invocationCtx)
++            }
++        } else {
++            AppLog.w(TAG, "runDirect: no chat model for assistant $assistantUuid, using local tools only")
++            localTools.getTools(assistant.localTools, invocationCtx)
++        }
+         val seq = directRunner.run(parsed, tools)
+         return Triple(seq.finalOutcome, seq.errorMessage, null)
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/CompressContextDialog.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/CompressContextDialog.kt
+index 3c0930aeb..c341131c5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/CompressContextDialog.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/CompressContextDialog.kt
+@@ -66,10 +66,14 @@ private fun rememberBringIntoViewModifier(): Modifier {
+ fun CompressContextDialog(
+     onDismiss: () -> Unit,
+     onConfirm: (additionalPrompt: String, targetTokens: Int, keepRecentMessages: Int) -> Deferred<Result<Unit>>,
++    // 当前对话消息总数：保留条数不得超过 total - 1，否则压缩必抛错。
++    totalMessages: Int = Int.MAX_VALUE,
+ ) {
+     var additionalPrompt by remember { mutableStateOf("") }
+     var selectedTokens by remember { mutableIntStateOf(2000) }
+-    var keepRecentMessages by remember { mutableIntStateOf(32) }
++    // 上限 = total - 1（至少留一条可压缩）；total 未知时沿用旧默认 32。
++    val maxKeepRecent = maxOf(totalMessages - 1, 0)
++    var keepRecentMessages by remember(totalMessages) { mutableIntStateOf(minOf(32, maxKeepRecent)) }
+     val tokenOptions = listOf(500, 1000, 2000, 4000)
+     var currentDeferred by remember { mutableStateOf<Deferred<Result<Unit>>?>(null) }
+     val toaster = LocalToaster.current
+@@ -85,7 +89,12 @@ fun CompressContextDialog(
+                 onDismiss()
+                 toaster.show(compactedMessage, type = ToastType.Success)
+             },
+-            onFailure = { errorMessage = it.message ?: "Compression failed" },
++            onFailure = {
++                // 内联文案在 380dp 可滚动列的最底部，首屏看不见：同时弹 toast 才看得见。
++                val message = it.message ?: "Compression failed"
++                errorMessage = message
++                toaster.show(message, type = ToastType.Error)
++            },
+         )
+         currentDeferred = null
+     }
+@@ -168,7 +177,10 @@ fun CompressContextDialog(
+                             textAlign = TextAlign.Center,
+                             modifier = Modifier.widthIn(min = 40.dp),
+                         )
+-                        FilledTonalIconButton(onClick = { keepRecentMessages++ }) {
++                        FilledTonalIconButton(
++                            onClick = { if (keepRecentMessages < maxKeepRecent) keepRecentMessages++ },
++                            enabled = keepRecentMessages < maxKeepRecent,
++                        ) {
+                             Icon(HugeIcons.Add01, contentDescription = null)
+                         }
+                     }
+@@ -213,10 +225,14 @@ fun CompressContextDialog(
+                     Text(stringResource(R.string.cancel))
+                 }
+             } else {
+-                TextButton(onClick = {
+-                    errorMessage = null
+-                    currentDeferred = onConfirm(additionalPrompt, selectedTokens, keepRecentMessages)
+-                }) {
++                TextButton(
++                    onClick = {
++                        errorMessage = null
++                        currentDeferred = onConfirm(additionalPrompt, selectedTokens, keepRecentMessages)
++                    },
++                    // 空对话无事可压：禁用确认，避免发起必定失败的压缩。
++                    enabled = totalMessages > 0,
++                ) {
+                     Text(stringResource(R.string.confirm))
+                 }
+             }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt
+index 0c3a273f0..2442f4421 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/FilesPicker.kt
+@@ -536,6 +536,7 @@ internal fun FilesPicker(
+             onConfirm = { additionalPrompt, targetTokens, keepRecentMessages ->
+                 onCompressContext(additionalPrompt, targetTokens, keepRecentMessages)
+             },
++            totalMessages = conversation.currentMessages.size,
+         )
+     }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/BackupVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/BackupVM.kt
+index 37accb9c5..967e30990 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/BackupVM.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/BackupVM.kt
+@@ -14,8 +14,10 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.WebDavConfig
+ import me.rerere.rikkahub.data.files.FilesManager
+ import me.rerere.rikkahub.data.files.saveUploadFromBytes
++import me.rerere.rikkahub.data.log.AppLog
+ import me.rerere.rikkahub.data.repository.ConversationRepository
+ import me.rerere.rikkahub.data.sync.BackupEncryptionManager
++import me.rerere.rikkahub.data.sync.BackupMissingPassphraseException
+ import me.rerere.rikkahub.data.sync.BackupNeedsPasswordException
+ import me.rerere.rikkahub.data.sync.BackupPasswordCipher
+ import me.rerere.rikkahub.data.sync.BackupStats
+@@ -33,7 +35,6 @@ import me.rerere.rikkahub.data.sync.webdav.WebDavBackupItem
+ import me.rerere.rikkahub.data.sync.webdav.WebDavSync
+ import me.rerere.rikkahub.utils.UiState
+ import java.io.File
+-import me.rerere.rikkahub.data.log.AppLog
+ 
+ private const val TAG = "BackupVM"
+ 
+@@ -163,9 +164,16 @@ class BackupVM(
+                 loadBackupFileItems()
+                 stats
+             }.onFailure { if (it is CancellationException) throw it }
++            val ex = r.exceptionOrNull()
++            if (ex != null) AppLog.w(TAG, "runBackup failed", ex)
+             onState(
+-                if (r.isSuccess) BackupRunState.BackupSucceeded(r.getOrThrow())
+-                else BackupRunState.Failed(r.exceptionOrNull()),
++                when {
++                    r.isSuccess -> BackupRunState.BackupSucceeded(r.getOrThrow())
++                    // 缺记住口令不是普通失败：弹框让用户设口令后重试（此前只弹 toast，
++                    // 测试环境 toast 不可见时看起来像"加密后静默丢弃"）。
++                    ex is BackupMissingPassphraseException -> BackupRunState.NeedsPassword(null)
++                    else -> BackupRunState.Failed(ex)
++                },
+             )
+         }
+     }
+@@ -486,9 +494,14 @@ class BackupVM(
+                 loadS3BackupFileItems()
+                 stats
+             }.onFailure { if (it is CancellationException) throw it }
++            val ex = r.exceptionOrNull()
++            if (ex != null) AppLog.w(TAG, "runBackupToS3 failed", ex)
+             onState(
+-                if (r.isSuccess) BackupRunState.BackupSucceeded(r.getOrThrow())
+-                else BackupRunState.Failed(r.exceptionOrNull()),
++                when {
++                    r.isSuccess -> BackupRunState.BackupSucceeded(r.getOrThrow())
++                    ex is BackupMissingPassphraseException -> BackupRunState.NeedsPassword(null)
++                    else -> BackupRunState.Failed(ex)
++                },
+             )
+         }
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/components/BackupEncryptionSection.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/components/BackupEncryptionSection.kt
+index 8a28488dc..1cb9536b5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/components/BackupEncryptionSection.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/components/BackupEncryptionSection.kt
+@@ -126,9 +126,12 @@ private fun rememberBringIntoViewModifier(): Modifier {
+ }
+ 
+ @Composable
+-private fun BackupEncryptionDialog(
++internal fun BackupEncryptionDialog(
+     vm: BackupVM,
+     onDismiss: () -> Unit,
++    // 口令保存成功时回调：调用方（备份页）据此在口令落盘后自动重试备份。
++    // 与 onDismiss 区分开——用户点取消/点空白处关闭时不触发，不会误重试。
++    onPasswordSaved: (() -> Unit)? = null,
+ ) {
+     val settings by vm.settings.collectAsStateWithLifecycle()
+     val enabled = settings.backupEncryptionEnabled
+@@ -150,6 +153,7 @@ private fun BackupEncryptionDialog(
+             return
+         }
+         vm.setBackupEncryptionPassword(pwd)
++        onPasswordSaved?.invoke()
+         onDismiss()
+     }
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
+index e1fafbd2a..467241f7d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/S3Tab.kt
+@@ -39,6 +39,7 @@ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.material3.rememberBottomSheetState
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -50,6 +51,8 @@ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.dokar.sonner.ToastType
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.withTimeoutOrNull
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.PlusSign
+ import me.rerere.hugeicons.stroke.Upload02
+@@ -63,6 +66,7 @@ import me.rerere.rikkahub.ui.context.LocalToaster
+ import me.rerere.rikkahub.ui.pages.backup.BackupRunState
+ import me.rerere.rikkahub.ui.pages.backup.BackupVM
+ import me.rerere.rikkahub.ui.pages.backup.S3BackupItemsSelector
++import me.rerere.rikkahub.ui.pages.backup.components.BackupEncryptionDialog
+ import me.rerere.rikkahub.ui.pages.backup.components.PasswordPromptDialog
+ import me.rerere.rikkahub.utils.UiState
+ import me.rerere.rikkahub.utils.fileSizeToString
+@@ -92,6 +96,70 @@ fun S3Tab(
+     var pendingPasswordError by remember { mutableStateOf<String?>(null) }
+     var isBackingUp by remember { mutableStateOf(false) }
+     var configMenuExpanded by remember { mutableStateOf(false) }
++    // 备份缺口令：弹加密设置框；设好口令后自动重试备份
++    var showEncryptionDialog by remember { mutableStateOf(false) }
++    var pendingBackupRetryAfterPassword by remember { mutableStateOf(false) }
++
++    /** 发起一次 S3 备份（备份按钮与"设好口令后自动重试"共用）。 */
++    fun startBackup() {
++        isBackingUp = true
++        vm.runBackupToS3 { state ->
++            when (state) {
++                is BackupRunState.Running -> isBackingUp = true
++                is BackupRunState.BackupSucceeded -> {
++                    isBackingUp = false
++                    val undecryptable = state.stats.undecryptableCredentials
++                    if (undecryptable > 0) {
++                        toaster.show(
++                            resources.getString(
++                                R.string.backup_page_backup_success_partial_credentials,
++                                undecryptable,
++                            ),
++                            type = ToastType.Warning,
++                        )
++                    } else {
++                        toaster.show(
++                            resources.getString(R.string.backup_page_backup_success),
++                            type = ToastType.Success,
++                        )
++                    }
++                }
++
++                is BackupRunState.NeedsPassword -> {
++                    isBackingUp = false
++                    showEncryptionDialog = true
++                }
++                is BackupRunState.Failed -> {
++                    isBackingUp = false
++                    val error = state.error
++                    toaster.show(
++                        if (error.isOutOfMemory()) {
++                            resources.getString(R.string.backup_page_backup_oom)
++                        } else {
++                            resources.getString(
++                                R.string.backup_page_backup_failed,
++                                error?.message
++                                    ?: resources.getString(R.string.backup_page_unknown_error),
++                            )
++                        },
++                        type = ToastType.Error,
++                    )
++                }
++                else -> {}
++            }
++        }
++    }
++
++    // 设好口令后自动重试备份：等口令真正落盘（DataStore 写是异步的）再发起，
++    // 5 秒内没落盘就放弃重试（用户可手动再点备份），不留悬挂标志。
++    LaunchedEffect(pendingBackupRetryAfterPassword) {
++        if (!pendingBackupRetryAfterPassword) return@LaunchedEffect
++        val saved = withTimeoutOrNull(5_000L) {
++            vm.settings.first { it.backupEncryptionPasswordEnc.isNotBlank() }
++        } != null
++        pendingBackupRetryAfterPassword = false
++        if (saved) startBackup()
++    }
+ 
+     /** 编辑当前配置：同步到列表与单字段兼容槽。 */
+     fun updateS3Config(newConfig: S3Config) {
+@@ -149,8 +217,6 @@ fun S3Tab(
+                 Instant.ofEpochMilli(settings.backupReminderConfig.lastBackupTime).toLocalDateTime(),
+             )
+         }
+-    // 备份结果是异步回调，回调里不能再调 stringResource，组合期先取好
+-    val backupOomMessage = stringResource(R.string.backup_page_backup_oom)
+     val backupFileSummary =
+         when (val state = backupItemsState) {
+             is UiState.Success -> "${stringResource(R.string.backup_page_files)}: ${state.data.totalCount}" +
+@@ -378,51 +444,7 @@ fun S3Tab(
+             }
+ 
+             Button(
+-                onClick = {
+-                    isBackingUp = true
+-                    vm.runBackupToS3 { state ->
+-                        when (state) {
+-                            is BackupRunState.Running -> isBackingUp = true
+-                            is BackupRunState.BackupSucceeded -> {
+-                                isBackingUp = false
+-                                val undecryptable = state.stats.undecryptableCredentials
+-                                if (undecryptable > 0) {
+-                                    toaster.show(
+-                                        resources.getString(
+-                                            R.string.backup_page_backup_success_partial_credentials,
+-                                            undecryptable,
+-                                        ),
+-                                        type = ToastType.Warning,
+-                                    )
+-                                } else {
+-                                    toaster.show(
+-                                        resources.getString(R.string.backup_page_backup_success),
+-                                        type = ToastType.Success,
+-                                    )
+-                                }
+-                            }
+-
+-                            is BackupRunState.NeedsPassword -> isBackingUp = false
+-                            is BackupRunState.Failed -> {
+-                                isBackingUp = false
+-                                val error = state.error
+-                                toaster.show(
+-                                    if (error.isOutOfMemory()) {
+-                                        backupOomMessage
+-                                    } else {
+-                                        resources.getString(
+-                                            R.string.backup_page_backup_failed,
+-                                            error?.message
+-                                                ?: resources.getString(R.string.backup_page_unknown_error),
+-                                        )
+-                                    },
+-                                    type = ToastType.Error,
+-                                )
+-                            }
+-                            else -> {}
+-                        }
+-                    }
+-                },
++                onClick = { startBackup() },
+                 enabled = !isBackingUp,
+             ) {
+                 if (isBackingUp) {
+@@ -612,6 +634,15 @@ fun S3Tab(
+             errorMessage = pendingPasswordError,
+         )
+     }
++
++    // 备份缺口令：弹加密设置框让用户设口令，设好后自动重试备份。
++    if (showEncryptionDialog) {
++        BackupEncryptionDialog(
++            vm = vm,
++            onDismiss = { showEncryptionDialog = false },
++            onPasswordSaved = { pendingBackupRetryAfterPassword = true },
++        )
++    }
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
+index 59a88a27b..ec0c87147 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/backup/tabs/WebDavTab.kt
+@@ -39,6 +39,7 @@ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.material3.rememberBottomSheetState
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+@@ -52,6 +53,8 @@ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.dokar.sonner.ToastType
+ import kotlin.uuid.Uuid
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.withTimeoutOrNull
+ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.PlusSign
+ import me.rerere.hugeicons.stroke.Upload02
+@@ -66,6 +69,7 @@ import me.rerere.rikkahub.ui.context.LocalToaster
+ import me.rerere.rikkahub.ui.pages.backup.BackupRunState
+ import me.rerere.rikkahub.ui.pages.backup.BackupVM
+ import me.rerere.rikkahub.ui.pages.backup.WebDavBackupItemsSelector
++import me.rerere.rikkahub.ui.pages.backup.components.BackupEncryptionDialog
+ import me.rerere.rikkahub.ui.pages.backup.components.PasswordPromptDialog
+ import me.rerere.rikkahub.utils.UiState
+ import me.rerere.rikkahub.utils.fileSizeToString
+@@ -113,6 +117,61 @@ fun WebDavTab(
+     var pendingPasswordItem by remember { mutableStateOf<WebDavBackupItem?>(null) }
+     var pendingPasswordEncFile by remember { mutableStateOf<java.io.File?>(null) }
+     var pendingPasswordError by remember { mutableStateOf<String?>(null) }
++    // 备份缺口令：弹加密设置框；设好口令后自动重试备份
++    var showEncryptionDialog by remember { mutableStateOf(false) }
++    var pendingBackupRetryAfterPassword by remember { mutableStateOf(false) }
++
++    /** 发起一次 WebDAV 备份（备份按钮与"设好口令后自动重试"共用）。 */
++    fun startBackup() {
++        isBackingUp = true
++        vm.runBackup { state ->
++            when (state) {
++                is BackupRunState.Running -> isBackingUp = true
++                is BackupRunState.BackupSucceeded -> {
++                    isBackingUp = false
++                    val undecryptable = state.stats.undecryptableCredentials
++                    if (undecryptable > 0) {
++                        toaster.show(
++                            context.getString(
++                                R.string.backup_page_backup_success_partial_credentials,
++                                undecryptable,
++                            ),
++                            type = ToastType.Warning,
++                        )
++                    } else {
++                        toaster.show(
++                            context.getString(R.string.backup_page_backup_success),
++                            type = ToastType.Success,
++                        )
++                    }
++                }
++
++                is BackupRunState.NeedsPassword -> {
++                    isBackingUp = false
++                    showEncryptionDialog = true
++                }
++                is BackupRunState.Failed -> {
++                    isBackingUp = false
++                    toaster.show(
++                        webDavErrorText(resources, state.error),
++                        type = ToastType.Error,
++                    )
++                }
++                else -> {}
++            }
++        }
++    }
++
++    // 设好口令后自动重试备份：等口令真正落盘（DataStore 写是异步的）再发起，
++    // 5 秒内没落盘就放弃重试（用户可手动再点备份），不留悬挂标志。
++    LaunchedEffect(pendingBackupRetryAfterPassword) {
++        if (!pendingBackupRetryAfterPassword) return@LaunchedEffect
++        val saved = withTimeoutOrNull(5_000L) {
++            vm.settings.first { it.backupEncryptionPasswordEnc.isNotBlank() }
++        } != null
++        pendingBackupRetryAfterPassword = false
++        if (saved) startBackup()
++    }
+ 
+     /** 编辑当前配置：同步到列表（存在则更新，否则追加）与单字段兼容槽。 */
+     fun updateWebDavConfig(newConfig: WebDavConfig) {
+@@ -388,42 +447,7 @@ fun WebDavTab(
+                 Text(stringResource(R.string.backup_page_restore))
+             }
+             Button(
+-                onClick = {
+-                    isBackingUp = true
+-                    vm.runBackup { state ->
+-                        when (state) {
+-                            is BackupRunState.Running -> isBackingUp = true
+-                            is BackupRunState.BackupSucceeded -> {
+-                                isBackingUp = false
+-                                val undecryptable = state.stats.undecryptableCredentials
+-                                if (undecryptable > 0) {
+-                                    toaster.show(
+-                                        context.getString(
+-                                            R.string.backup_page_backup_success_partial_credentials,
+-                                            undecryptable,
+-                                        ),
+-                                        type = ToastType.Warning,
+-                                    )
+-                                } else {
+-                                    toaster.show(
+-                                        context.getString(R.string.backup_page_backup_success),
+-                                        type = ToastType.Success,
+-                                    )
+-                                }
+-                            }
+-
+-                            is BackupRunState.NeedsPassword -> isBackingUp = false
+-                            is BackupRunState.Failed -> {
+-                                isBackingUp = false
+-                                toaster.show(
+-                                    webDavErrorText(resources, state.error),
+-                                    type = ToastType.Error,
+-                                )
+-                            }
+-                            else -> {}
+-                        }
+-                    }
+-                },
++                onClick = { startBackup() },
+                 enabled = !isBackingUp,
+             ) {
+                 if (isBackingUp) {
+@@ -613,6 +637,15 @@ fun WebDavTab(
+             errorMessage = pendingPasswordError,
+         )
+     }
++
++    // 备份缺口令：弹加密设置框让用户设口令，设好后自动重试备份。
++    if (showEncryptionDialog) {
++        BackupEncryptionDialog(
++            vm = vm,
++            onDismiss = { showEncryptionDialog = false },
++            onPasswordSaved = { pendingBackupRetryAfterPassword = true },
++        )
++    }
+ }
+ 
+ @Composable
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+index 99dc01012..1d76b07cc 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+@@ -52,6 +52,7 @@ import me.rerere.rikkahub.service.ChatService
+ import me.rerere.rikkahub.service.clearTranslationField
+ import me.rerere.rikkahub.service.compressConversation
+ import me.rerere.rikkahub.service.deleteMessage
++import me.rerere.rikkahub.service.effectiveKeepRecent
+ import me.rerere.rikkahub.service.editMessage
+ import me.rerere.rikkahub.service.forkConversationAtMessage
+ import me.rerere.rikkahub.service.generateSuggestion
+@@ -387,13 +388,20 @@ class ChatVM(
+     fun confirmAutoCompress() {
+         pendingAutoCompressConfirm = false
+         viewModelScope.launch {
++            val totalMessages = conversation.value.currentMessages.size
++            if (totalMessages == 0) {
++                // 空对话无事可压：直接回落触发点，不发起必定失败的压缩。
++                autoCompressNextTriggerAt = autoCompressTriggerPoint(settings.value)
++                return@launch
++            }
+             chatService
+                 .compressConversation(
+                     _conversationId,
+                     conversation.value,
+                     additionalPrompt = "",
+                     targetTokens = 2000,
+-                    keepRecentMessages = 32,
++                    // 硬编码 32 在短对话上必抛错（keepRecent > total）：钳制到 total - 1。
++                    keepRecentMessages = effectiveKeepRecent(totalMessages, 32),
+                 ).onSuccess {
+                     // 压缩会重写历史，缓存前缀必然失效，提示用户下一条消息缓存将重置
+                     compressCacheResetNotice = true
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt
+index 72f465da1..c97b3f448 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingMcpPage.kt
+@@ -72,6 +72,7 @@ import me.rerere.rikkahub.data.ai.mcp.McpManager
+ import me.rerere.rikkahub.data.ai.mcp.LocalMcpProfile
+ import me.rerere.rikkahub.data.ai.mcp.McpServerConfig
+ import me.rerere.rikkahub.data.ai.mcp.McpStatus
++import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+ import me.rerere.rikkahub.ui.components.ai.ExtensionEmptyState
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.RikkaDeleteConfirmDialog
+@@ -91,10 +92,17 @@ fun SettingMcpPage(vm: SettingVM = koinViewModel()) {
+     val creationState =
+         useEditState<McpServerConfig> {
+             vm.updateSettings { current ->
+-            current.copy(
++                // 新服务器默认归属当前助手：只加配置不同步助手时，服务器能连接、
++                // 工具能列出，但模型调不到（mcp_add 的 #88 同款缺口；
++                // 助手 MCP 页的开关仍可随时取消归属）。
++                val currentAssistant = current.getCurrentAssistant()
++                current.copy(
+                     mcpServers = current.mcpServers + it,
++                    assistants = current.assistants.map { a ->
++                        if (a.id == currentAssistant.id) a.copy(mcpServers = a.mcpServers + it.id) else a
++                    },
+                 )
+-        }
++            }
+         }
+     val editState =
+         useEditState<McpServerConfig> { newConfig ->
+@@ -259,7 +267,14 @@ fun SettingMcpPage(vm: SettingVM = koinViewModel()) {
+                 vm.updateSettings { current ->
+                     val existingIds = current.mcpServers.map { it.commonOptions.name }.toSet()
+                     val toAdd = newConfigs.filter { it.commonOptions.name.isNotBlank() && it.commonOptions.name !in existingIds }
+-                    current.copy(mcpServers = current.mcpServers + toAdd)
++                    // 导入的服务器同样默认归属当前助手（与新建同款，见 creationState）。
++                    val currentAssistant = current.getCurrentAssistant()
++                    current.copy(
++                        mcpServers = current.mcpServers + toAdd,
++                        assistants = current.assistants.map { a ->
++                            if (a.id == currentAssistant.id) a.copy(mcpServers = a.mcpServers + toAdd.map { it.id }) else a
++                        },
++                    )
+                 }
+                 showImportDialog = false
+             },
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/ScheduleJobToolValidationTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/ScheduleJobToolValidationTest.kt
+index 52264b1e5..4e544c128 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/ScheduleJobToolValidationTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/tools/local/ScheduleJobToolValidationTest.kt
+@@ -139,6 +139,41 @@ class ScheduleJobToolValidationTest {
+         assertEquals("prompt_too_long", r!!.code)
+     }
+ 
++    @Test
++    fun `mode direct workspace tool accepted when assembly supplies its name`() {
++        // 定时任务 workspace_write_file -32601 的回归：校验用的名字集必须包含
++        // 工作区/技能/MCP 工具（由 ChatToolFactory 装配后补入），只含本地工具
++        // 的旧口径会把已注册的工具误判为未注册。
++        val known = knownTools + listOf("workspace_write_file", "skill_example_tool", "mcp__server__echo")
++        val r = ScheduleJobValidator.validate(buildJsonObject {
++            put("name", "x"); put("mode", "direct")
++            put("schedule_type", "once"); put("at_unix_ms", 100L)
++            put("actions", buildJsonArray {
++                add(buildJsonObject {
++                    put("tool", "workspace_write_file"); put("args", buildJsonObject { })
++                })
++                add(buildJsonObject {
++                    put("tool", "mcp__server__echo"); put("args", buildJsonObject { })
++                })
++            })
++        }, known, yolo)
++        assertNull(r)
++    }
++
++    @Test
++    fun `mode direct workspace tool rejected when assembly does not supply its name`() {
++        val r = ScheduleJobValidator.validate(buildJsonObject {
++            put("name", "x"); put("mode", "direct")
++            put("schedule_type", "once"); put("at_unix_ms", 100L)
++            put("actions", buildJsonArray {
++                add(buildJsonObject {
++                    put("tool", "workspace_write_file"); put("args", buildJsonObject { })
++                })
++            })
++        }, knownTools, yolo)
++        assertEquals("unknown_tool", r!!.code)
++    }
++
+     @Test
+     fun `prompt at limit accepted`() {
+         val r = ScheduleJobValidator.validate(buildJsonObject {
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/sync/BackupEncryptionManagerTest.kt b/app/src/test/java/me/rerere/rikkahub/data/sync/BackupEncryptionManagerTest.kt
+new file mode 100644
+index 000000000..f4694ab48
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/sync/BackupEncryptionManagerTest.kt
+@@ -0,0 +1,206 @@
++package me.rerere.rikkahub.data.sync
++
++import android.app.Application
++import android.os.Looper
++import androidx.datastore.core.DataStore
++import androidx.datastore.preferences.core.PreferenceDataStoreFactory
++import androidx.datastore.preferences.core.Preferences
++import androidx.datastore.preferences.core.edit
++import io.pebbletemplates.pebble.PebbleEngine
++import java.io.File
++import java.security.Security
++import javax.crypto.KeyGenerator
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.runBlocking
++import me.rerere.rikkahub.AppScope
++import me.rerere.rikkahub.data.datastore.SettingsStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsKeyStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsSecurityProvider
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotEquals
++import org.junit.Assert.assertTrue
++import org.junit.Assert.assertThrows
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.koin.core.context.startKoin
++import org.koin.core.context.stopKoin
++import org.koin.dsl.module
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++/**
++ * 备份加密"缺口令"路径：加密开关已开、但没有可用记住口令时，
++ * maybeEncrypt 必须抛 [BackupMissingPassphraseException]（调用方可据此
++ * 弹框让用户设口令后重试），而不是裸 IllegalStateException 淹没在
++ * toast 里——WebDAV Backup Now 4/4"加密后静默丢弃"正是这个状态。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [35], manifest = Config.NONE, application = Application::class)
++class BackupEncryptionManagerTest {
++    private lateinit var workers: CoroutineScope
++    private lateinit var dataStore: DataStore<Preferences>
++    private lateinit var settingsFile: File
++    private var activeScope: AppScope? = null
++    private var activeDataStoreScope: CoroutineScope? = null
++    private lateinit var securityProvider: SyntheticSettingsSecurityProvider
++
++    @Before
++    fun setUp() {
++        workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++        securityProvider = SyntheticSettingsSecurityProvider()
++        Security.insertProviderAt(securityProvider, 1)
++        SyntheticSettingsKeyStore.key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
++        SyntheticSettingsKeyStore.unavailable = false
++        stopKoin()
++        startKoin { modules(module { single { PebbleEngine.Builder().build() } }) }
++        val context: Application = RuntimeEnvironment.getApplication()
++        settingsFile = File(context.filesDir, "datastore/backup_enc_test_${System.nanoTime()}.preferences_pb")
++        val seedScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++        activeDataStoreScope = seedScope
++        dataStore = PreferenceDataStoreFactory.create(scope = seedScope, produceFile = { settingsFile })
++    }
++
++    @After
++    fun tearDown() {
++        stopCollector()
++        activeDataStoreScope?.let { scope ->
++            perform { scope.coroutineContext[Job]!!.cancelAndJoin() }.getOrThrow()
++            activeDataStoreScope = null
++        }
++        stopKoin()
++        workers.cancel()
++        SyntheticSettingsKeyStore.key = null
++        SyntheticSettingsKeyStore.unavailable = false
++        Security.removeProvider(securityProvider.name)
++        if (this::settingsFile.isInitialized && settingsFile.exists()) settingsFile.delete()
++    }
++
++    private fun <T> perform(block: suspend () -> T): Result<T> {
++        val task = workers.async { block() }
++        val deadline = System.nanoTime() + 30_000_000_000L
++        while (!task.isCompleted && System.nanoTime() < deadline) {
++            shadowOf(Looper.getMainLooper()).idle()
++            Thread.sleep(5)
++        }
++        check(task.isCompleted) { "Backup encryption test operation timed out" }
++        return runCatching { runBlocking { task.await() } }
++    }
++
++    private fun stopCollector() {
++        activeScope?.let { scope -> perform { scope.coroutineContext[Job]!!.cancelAndJoin() }.getOrThrow() }
++        activeScope = null
++    }
++
++    private fun openStore(): SettingsStore {
++        val scope = AppScope()
++        activeScope = scope
++        return SettingsStore(RuntimeEnvironment.getApplication(), scope, dataStore)
++    }
++
++    private fun seedEncryption(enabled: Boolean, passwordEnc: String?) {
++        perform {
++            dataStore.edit { prefs ->
++                prefs[SettingsStore.BACKUP_ENCRYPTION_ENABLED] = enabled
++                if (passwordEnc == null) {
++                    prefs.remove(SettingsStore.BACKUP_ENCRYPTION_PASSWORD_ENC)
++                } else {
++                    prefs[SettingsStore.BACKUP_ENCRYPTION_PASSWORD_ENC] = passwordEnc
++                }
++            }
++        }.getOrThrow()
++    }
++
++    private fun manager(): BackupEncryptionManager {
++        val store = openStore()
++        perform { store.awaitInitialized() }.getOrThrow()
++        return BackupEncryptionManager(store)
++    }
++
++    private fun tempZip(): File {
++        val dir = RuntimeEnvironment.getApplication().cacheDir
++        return File.createTempFile("backup_20261123_test_", ".zip", dir).apply { writeBytes(ByteArray(1024) { 0x41 }) }
++    }
++
++    @Test
++    fun `disabled returns plain file unchanged`() {
++        seedEncryption(enabled = false, passwordEnc = null)
++        val plain = tempZip()
++        try {
++            assertEquals(plain, manager().maybeEncrypt(plain))
++        } finally {
++            plain.delete()
++        }
++    }
++
++    @Test
++    fun `enabled without remembered password throws missing passphrase`() {
++        seedEncryption(enabled = true, passwordEnc = null)
++        val plain = tempZip()
++        try {
++            assertThrows(BackupMissingPassphraseException::class.java) {
++                manager().maybeEncrypt(plain)
++            }
++        } finally {
++            plain.delete()
++        }
++    }
++
++    @Test
++    fun `enabled with undecryptable stored password throws missing passphrase`() {
++        // 记住的密文解不开（KeyStore 密钥丢失/被替换）与"从未记住"同款：
++        // decrypt 返回 null，调用方同样应弹框让用户重输口令。
++        seedEncryption(enabled = true, passwordEnc = "not-valid-base64!!!")
++        val plain = tempZip()
++        try {
++            assertThrows(BackupMissingPassphraseException::class.java) {
++                manager().maybeEncrypt(plain)
++            }
++        } finally {
++            plain.delete()
++        }
++    }
++
++    @Test
++    fun `enabled with valid remembered password encrypts to enc file`() {
++        val enc = BackupPasswordCipher.encrypt("test-passphrase-123")
++        seedEncryption(enabled = true, passwordEnc = enc)
++        val plain = tempZip()
++        try {
++            val result = manager().maybeEncrypt(plain)
++            assertNotEquals(plain, result)
++            assertTrue(result.name.endsWith(".enc"))
++            assertTrue(result.exists())
++            assertTrue(result.length() > 0)
++            result.delete()
++        } finally {
++            plain.delete()
++        }
++    }
++
++    @Test
++    fun `remembered password is null when nothing stored`() {
++        seedEncryption(enabled = true, passwordEnc = null)
++        assertEquals(null, manager().rememberedPassword)
++    }
++
++    @Test
++    fun `settings flow sees seeded encryption flag`() {
++        seedEncryption(enabled = true, passwordEnc = null)
++        val store = openStore()
++        perform { store.awaitInitialized() }.getOrThrow()
++        val settings = runBlocking { store.settingsFlow.first() }
++        assertTrue(settings.backupEncryptionEnabled)
++        assertEquals("", settings.backupEncryptionPasswordEnc)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/service/CompressKeepRecentTest.kt b/app/src/test/java/me/rerere/rikkahub/service/CompressKeepRecentTest.kt
+new file mode 100644
+index 000000000..2850aa57c
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/service/CompressKeepRecentTest.kt
+@@ -0,0 +1,43 @@
++package me.rerere.rikkahub.service
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * 压缩保留条数的钳制规则：保留数不得超过"总数 - 1"（至少留一条可压缩），
++ * 否则 splitForCompression 会抛错——手动/自动压缩 2/2、1/1 卡死正是
++ * keepRecent=32 撞上 6 条 / 11 条消息的短对话。
++ */
++class CompressKeepRecentTest {
++
++    @Test
++    fun `short conversation clamps to total minus one`() {
++        assertEquals(5, effectiveKeepRecent(totalMessages = 6, requested = 32))
++        assertEquals(10, effectiveKeepRecent(totalMessages = 11, requested = 32))
++    }
++
++    @Test
++    fun `long conversation keeps requested value`() {
++        assertEquals(32, effectiveKeepRecent(totalMessages = 100, requested = 32))
++    }
++
++    @Test
++    fun `single message clamps to zero so it can still be compressed`() {
++        assertEquals(0, effectiveKeepRecent(totalMessages = 1, requested = 32))
++    }
++
++    @Test
++    fun `empty conversation clamps to zero`() {
++        assertEquals(0, effectiveKeepRecent(totalMessages = 0, requested = 32))
++    }
++
++    @Test
++    fun `requested below the cap passes through`() {
++        assertEquals(3, effectiveKeepRecent(totalMessages = 10, requested = 3))
++    }
++
++    @Test
++    fun `negative requested clamps to zero`() {
++        assertEquals(0, effectiveKeepRecent(totalMessages = 10, requested = -5))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt b/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt
+index 6cce05a65..982dabca3 100644
+--- a/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/ui/components/message/tools/ToolIconColorTest.kt
+@@ -38,7 +38,7 @@ class ToolIconColorTest {
+ 
+     @Test
+     fun `all registered renderers have a family color`() {
+-        assertEquals(110, ToolUIRegistry.rendererMap.size)
++        assertEquals(111, ToolUIRegistry.rendererMap.size)
+         for ((toolName, renderer) in ToolUIRegistry.rendererMap) {
+             val key = renderer.iconColorKey(contextFor(toolName))
+             assertTrue("渲染器无家族色（回退默认单色）: $toolName", key in familyGroups)
