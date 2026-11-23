@@ -1,0 +1,600 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverrides.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverrides.kt
+index 9a519ea12..4d723fa0c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverrides.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverrides.kt
+@@ -57,7 +57,7 @@ class ModelCapabilityOverrides(
+     @Volatile
+     private var loadedBaselineCount: Int = 0
+ 
+-    /** 载入两张表（本机表在前 → 同 modelId 命中时本机优先；表内先声明者优先）。 */
++    /** 载入两张表（本机表在前 → 同长命中平局时本机优先；查询取最长命中，表内先声明者优先）。 */
+     fun load() {
+         val local = readLocal()?.let { parseOverrideTable(it, "local") }.orEmpty()
+         val baseline = readBaseline()?.let { parseOverrideTable(it, "baseline") }.orEmpty()
+@@ -84,12 +84,21 @@ class ModelCapabilityOverrides(
+     /**
+      * 导入本机表：**先校验可解析**（非法则整体拒绝、不落盘），再写入 App 私有目录并重载。
+      *
++     * `models` 里有条目、却一条都没解析出来（如 `{"models":[{},{}]}`）也拒绝：
++     * 否则会把本机表写成一张空表，用户看到的是「导入成功」而覆盖全丢。
++     * `{"models":[]}` 是明确的清空意图，接受（等价于 [clearLocal]）。
++     *
+      * @return 是否导入成功；失败时调用方应提示用户检查 JSON 格式。
+      */
+     fun importLocal(text: String): Boolean {
+-        if (parseOverrideTable(text, "import") == null) return false
++        val entries = parseOverrideTable(text, "import") ?: return false
++        val slots = modelSlotCount(text) ?: 0
++        if (entries.isEmpty() && slots > 0) {
++            AppLog.w(TAG, "import local overrides rejected: 0 valid entries in $slots slots")
++            return false
++        }
+         return runCatching {
+-            File(context.filesDir, FILE_NAME).writeText(text)
++            writeLocalFileAtomic(text)
+             load()
+             true
+         }.onFailure { AppLog.w(TAG, "import local overrides failed: ${it.message}", it) }.getOrDefault(false)
+@@ -118,7 +127,7 @@ class ModelCapabilityOverrides(
+         load()
+         return runCatching {
+             val updated = upsertInList(localParsed, normalized)
+-            File(context.filesDir, FILE_NAME).writeText(serializeEntries(updated))
++            writeLocalFileAtomic(serializeEntries(updated))
+             load()
+             true
+         }.onFailure { AppLog.w(TAG, "upsert local override failed: ${it.message}", it) }.getOrDefault(false)
+@@ -133,7 +142,7 @@ class ModelCapabilityOverrides(
+         val updated = removeFromList(localParsed, match)
+         if (updated.size == localParsed.size) return false
+         return runCatching {
+-            File(context.filesDir, FILE_NAME).writeText(serializeEntries(updated))
++            writeLocalFileAtomic(serializeEntries(updated))
+             load()
+             true
+         }.onFailure { AppLog.w(TAG, "remove local override failed: ${it.message}", it) }.getOrDefault(false)
+@@ -150,10 +159,36 @@ class ModelCapabilityOverrides(
+     /** 当前条目数（供 UI 展示“外置表：N 条”）。 */
+     fun size(): Int = overrideEntries.size
+ 
+-    private fun lookup(modelId: String): Entry? {
+-        if (overrideEntries.isEmpty()) return null
+-        val id = modelId.lowercase()
+-        return overrideEntries.firstOrNull { it.match.isNotEmpty() && id.contains(it.match.lowercase()) }
++    /**
++     * 命中条目里取 `match` **最长**者（更具体的条目优先）；平局取先声明者
++     * （本机表整体在基线表前，故本机优先）。与 [ModelCapabilityResolver] 的
++     * 查询口径一致。
++     *
++     * 旧实现是 firstOrNull（首条命中即返回）：`deepseek` 会抢在更具体的
++     * `deepseek-flash` 之前生效，只因其声明在表内靠前。改为最长匹配后，
++     * 短前缀条目只兜底未被更具体条目覆盖的模型。
++     */
++    private fun lookup(modelId: String): Entry? =
++        longestMatch(overrideEntries, modelId)
++
++    /**
++     * 原子写本机表：先写临时文件再 rename 替换，进程中途被杀也不会留下半截 JSON
++     * （半截表会导致下次启动整表解析失败被忽略，用户覆盖静默丢失）。
++     */
++    private fun writeLocalFileAtomic(content: String) {
++        val target = File(context.filesDir, FILE_NAME)
++        val tmp = File(context.filesDir, "$FILE_NAME.tmp")
++        tmp.writeText(content)
++        if (tmp.renameTo(target)) return
++        // rename 失败（个别文件系统目标已存在等）：退化为先删目标再改名
++        if (target.exists() && !target.delete()) {
++            tmp.delete()
++            error("atomic replace failed: cannot delete $FILE_NAME")
++        }
++        if (!tmp.renameTo(target)) {
++            tmp.delete()
++            error("atomic replace failed: rename $FILE_NAME.tmp -> $FILE_NAME")
++        }
+     }
+ 
+     private fun readLocal(): String? =
+@@ -190,6 +225,29 @@ class ModelCapabilityOverrides(
+                 models.mapNotNull { (it as? JsonObject)?.toEntry() }
+             }.getOrNull()
+ 
++        /**
++         * 纯匹配（无 IO）：给定条目里命中 `modelId` 且 `match` **最长**的那条；
++         * 等长时取先声明者。见 [lookup] 的注释。
++         */
++        internal fun longestMatch(entries: List<Entry>, modelId: String): Entry? {
++            if (entries.isEmpty()) return null
++            val id = modelId.lowercase()
++            var best: Entry? = null
++            for (entry in entries) {
++                val match = entry.match
++                if (match.isEmpty() || !id.contains(match.lowercase())) continue
++                if (match.length > (best?.match?.length ?: -1)) best = entry
++            }
++            return best
++        }
++
++        /** 纯解析（无 IO）：`models` 数组的元素个数；整表非法返回 null。 */
++        internal fun modelSlotCount(text: String): Int? {
++            val root = runCatching { json.parseToJsonElement(text) as? JsonObject }.getOrNull()
++                ?: return null
++            return (root["models"] as? JsonArray)?.size
++        }
++
+         /** 纯序列化（无 IO）：与 [parseEntries] 互逆；空字段不写入（即该项不覆盖）。 */
+         internal fun serializeEntries(entries: List<Entry>): String {
+             val root = buildJsonObject {
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolver.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolver.kt
+index b172876ab..d319705e5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolver.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolver.kt
+@@ -36,8 +36,9 @@ data class ResolvedCapabilities(
+  * 模型能力解析：把“外置覆盖表 → 内置 ∪ 目录 → 默认”的解析口径按字段拆成
+  * “生效值 + 来源”，供能力编辑器展示。
+  *
+- * 覆盖语义与 [ModelCapabilityOverrides] 的查询一致：首条命中的条目（本机表在前）
+- * 其非空字段直接采用；该条目某字段为空时回落到并集，而不是去查基线表同字段。
++ * 覆盖语义与 [ModelCapabilityOverrides] 的查询一致：命中条目里 `match` 最长者
++ * （跨两表；平局本机表优先）其非空字段直接采用；该条目某字段为空时回落到并集，
++ * 而不是去查基线表同字段。
+  * 并集层与默认值的区分：输入/输出只有纯文本、能力为空、上下文为空时记为
+  * [CapabilitySource.DEFAULT]——登记表公开 API 无法区分“登记为纯文本”与
+  * “无任何登记时的回退纯文本”，此处按回退值处理。
+@@ -88,18 +89,24 @@ object ModelCapabilityResolver {
+         )
+     }
+ 
+-    /** 首条命中的覆盖条目及所在表（本机表在前），与 [ModelCapabilityOverrides] 的查询一致。 */
++    /**
++     * 命中的覆盖条目及所在表：跨本机表与基线表取 `match` **最长**者（更具体的条目优先），
++     * 平局本机表优先、表内先声明者优先，与 [ModelCapabilityOverrides] 的查询一致。
++     */
+     private fun matchingEntry(
+         modelId: String,
+         overrides: ModelCapabilityOverrides,
+     ): Pair<ModelCapabilityOverrides.Entry, CapabilitySource>? {
+-        val id = modelId.lowercase()
+-        overrides.localEntries()
+-            .firstOrNull { it.match.isNotEmpty() && id.contains(it.match.lowercase()) }
+-            ?.let { return it to CapabilitySource.LOCAL }
+-        overrides.baselineEntries()
+-            .firstOrNull { it.match.isNotEmpty() && id.contains(it.match.lowercase()) }
+-            ?.let { return it to CapabilitySource.BASELINE }
+-        return null
++        // 与 lookup 口径一致：跨两表取最长，平局本机表优先。
++        // 先各表内取最长，再取两者中更长者；等长时留本机表那条。
++        val localBest = ModelCapabilityOverrides.longestMatch(overrides.localEntries(), modelId)
++        val baselineBest = ModelCapabilityOverrides.longestMatch(overrides.baselineEntries(), modelId)
++        return when {
++            localBest == null -> baselineBest?.let { it to CapabilitySource.BASELINE }
++            baselineBest == null -> localBest to CapabilitySource.LOCAL
++            baselineBest.match.length > localBest.match.length ->
++                baselineBest to CapabilitySource.BASELINE
++            else -> localBest to CapabilitySource.LOCAL
++        }
+     }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceSearchTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceSearchTool.kt
+index d30b4d3fb..e1c3f8fa7 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceSearchTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceSearchTool.kt
+@@ -8,6 +8,9 @@ import kotlinx.serialization.json.put
+ import me.rerere.ai.core.InputSchema
+ import me.rerere.ai.core.Tool
+ import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.data.ai.tools.inject.BackgroundInjectedSecrets
++import me.rerere.rikkahub.data.ai.tools.inject.InjectedSecret
++import me.rerere.rikkahub.data.ai.tools.inject.maskInjectedValues
+ import me.rerere.rikkahub.data.repository.WorkspaceRepository
+ import me.rerere.workspace.WorkspaceCommandResult
+ import me.rerere.workspace.WorkspaceLayout
+@@ -48,9 +51,20 @@ internal fun createSearchCodeTool(
+ 
+         val cmd = buildSearchCodeCommand(pattern, relPath, glob, max)
+         val result = workspaceRepository.executeCommand(wsId, cmd, "")
++        // 搜索根落在后台任务日志目录（.rikkahub-bg）时，命中行可能带 `$$` 注入值明文：
++        // 与 read_file 同口径，按本 workspace 的注入值掩一遍，堵住绕过 background_status 的口子。
++        val bgLogSearch = isBackgroundTaskPath(rawPath) || isBackgroundTaskPath(relPath)
+         listOf(
+             UIMessagePart.Text(
+-                formatSearchCodeOutput(result, max, relPath, pattern, targetLayout.workspaceDir).toString(),
++                formatSearchCodeOutput(
++                    result,
++                    max,
++                    relPath,
++                    pattern,
++                    targetLayout.workspaceDir,
++                    injectedSecrets = if (bgLogSearch) BackgroundInjectedSecrets.allForWorkspace(wsId) else emptyList(),
++                    legacyRules = if (bgLogSearch) BackgroundInjectedSecrets.retainedRules() else emptyMap(),
++                ).toString(),
+             ),
+         )
+     },
+@@ -106,6 +120,8 @@ private fun formatSearchCodeOutput(
+     relPath: String,
+     pattern: String,
+     workspaceDir: String,
++    injectedSecrets: List<InjectedSecret> = emptyList(),
++    legacyRules: Map<String, String> = emptyMap(),
+ ): JsonObject {
+     val raw = result.stdout
+     val hitsIdx = raw.indexOf("---HITS---")
+@@ -123,7 +139,10 @@ private fun formatSearchCodeOutput(
+         if (exitIdx >= 0) raw.substring(exitIdx + "---EXIT---".length).trim().toIntOrNull() ?: 0 else 0
+     val hitLines = hitsPart.lines().filter { it.isNotBlank() }
+     val truncated = hitLines.size > max
+-    val matches = hitLines.take(max).mapNotNull(::parseGrepHitLine)
++    val maskText: ((String) -> String)? =
++        if (injectedSecrets.isEmpty() && legacyRules.isEmpty()) null
++        else { line -> maskInjectedValues(line, injectedSecrets, legacyRules) }
++    val matches = hitLines.take(max).mapNotNull { maskText?.let { fn -> fn(it) } ?: it }.mapNotNull(::parseGrepHitLine)
+     return buildJsonObject {
+         put("matches", buildJsonArray { matches.forEach { add(it) } })
+         put("returned", matches.size)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt
+index 6b9da9baa..25bf80d7f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceTools.kt
+@@ -14,6 +14,7 @@ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.ai.ui.toMetadata
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.ai.tools.inject.BackgroundInjectedSecrets
++import me.rerere.rikkahub.data.ai.tools.inject.maskInjectedValues
+ import me.rerere.rikkahub.data.repository.WorkspaceRepository
+ import me.rerere.rikkahub.utils.generateUnifiedDiff
+ import me.rerere.workspace.WorkspaceLayout
+@@ -190,7 +191,16 @@ private fun createReadFileTool(
+             val rawText = bytes.toString(Charsets.UTF_8)
+             // 凭证类文件（.env / 私钥 / .ssh 下等）只掩「值」，见 isSensitiveCredentialPath。
+             val sensitive = isSensitiveCredentialPath(path)
+-            val text = if (sensitive) redactCredentialFileText(rawText) else rawText
++            var text = if (sensitive) redactCredentialFileText(rawText) else rawText
++            // 后台任务日志（.rikkahub-bg/<id>/log）是命令 stdout 的回显，可能含 `$$` 注入值：
++            // 非敏感分支也要按本 workspace 的注入值掩一遍，堵住绕过 background_status 掩码的口子。
++            if (!sensitive && isBackgroundTaskPath(path)) {
++                text = maskInjectedValues(
++                    text,
++                    BackgroundInjectedSecrets.allForWorkspace(targetWorkspaceId),
++                    BackgroundInjectedSecrets.retainedRules(),
++                )
++            }
+             val result = formatReadFileTextResult(
+                 path = path,
+                 text = text,
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
+index f11475e52..85a3a0af2 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/WorkspaceToolsHelpers.kt
+@@ -30,6 +30,7 @@ import me.rerere.workspace.WorkspaceLayout
+ import me.rerere.workspace.WorkspaceStorageArea
+ import me.rerere.workspace.WorkspaceTreeResult
+ import me.rerere.workspace.normalizeWorkspacePath
++import me.rerere.workspace.ssh.REMOTE_BG_DIR_NAME
+ import org.koin.java.KoinJavaComponent.getKoin
+ import java.io.ByteArrayOutputStream
+ import java.nio.ByteBuffer
+@@ -581,6 +582,16 @@ private val SENSITIVE_FILE_NAMES = listOf(
+ )
+ private val SENSITIVE_FILE_SUFFIXES = listOf(".pem", ".key", ".p12", ".pfx", ".jks", ".keystore")
+ 
++/**
++ * 后台任务日志路径判定：远程后台任务的日志固定写在
++ * `$workspaceDir/.rikkahub-bg/<taskId>/log`（目录名见 workspace 模块的
++ * [REMOTE_BG_DIR_NAME]）。这类日志是命令 stdout 的回显，可能含 `$$` 注入值明文，
++ * read_file / search_code 命中时须按本 workspace 的注入值掩一遍——
++ * 否则绕过 workspace_background_status 的掩码就能把注入值带进模型上下文。
++ * 宽松包含匹配即可：误命中只会多做一次掩码替换，方向安全。
++ */
++internal fun isBackgroundTaskPath(path: String): Boolean = path.contains(REMOTE_BG_DIR_NAME)
++
+ internal fun isSensitiveCredentialPath(path: String): Boolean {
+     val normalized = path.replace('\\', '/')
+     val name = normalized.substringAfterLast('/')
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/inject/EnvInjectionSafety.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/inject/EnvInjectionSafety.kt
+index 46e2a8ccf..5cc10f41b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/inject/EnvInjectionSafety.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/inject/EnvInjectionSafety.kt
+@@ -170,6 +170,17 @@ internal object BackgroundInjectedSecrets {
+     fun get(workspaceId: String, taskId: String): List<InjectedSecret> =
+         byTask[key(workspaceId, taskId)].orEmpty()
+ 
++    /**
++     * 该 workspace 全部任务的注入值（供 read_file / search_code 掩后台任务日志：
++     * 日志路径形如 `$workspaceDir/.rikkahub-bg/<taskId>/log`，工具侧只看得到路径、
++     * 不知道 taskId，按 workspace 维度取全集兜底）。
++     */
++    @Synchronized
++    fun allForWorkspace(workspaceId: String): List<InjectedSecret> {
++        val prefix = "$workspaceId\u0000"
++        return byTask.entries.filter { it.key.startsWith(prefix) }.flatMap { it.value }
++    }
++
+     @Synchronized
+     fun remove(workspaceId: String, taskId: String) {
+         byTask.remove(key(workspaceId, taskId))
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt
+index 7ac55e944..3981758e9 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ai/ChatInput.kt
+@@ -741,8 +741,10 @@ private fun TextInputRow(
+                 .debounce(COMPLETION_DEBOUNCE_MILLIS)
+                 .collectLatest { context ->
+                     // 补全求值（含磁盘 I/O）放后台线程，主线程只留合并与状态写回。
++                    // 用 IO 而非 Default：@ 补全会走工作区文件扫描（磁盘 I/O），
++                    // Default 的线程数等于 CPU 核数，阻塞读文件会拖慢其他并行计算。
+                     val lists =
+-                        withContext(Dispatchers.Default) {
++                        withContext(Dispatchers.IO) {
+                             completionProviders.mapNotNull { provider ->
+                                 try {
+                                     provider
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverridesTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverridesTest.kt
+index 030a0fdcf..6ab203645 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverridesTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityOverridesTest.kt
+@@ -130,4 +130,40 @@ class ModelCapabilityOverridesTest {
+         assertEquals(listOf(base[1]), removed)
+         assertEquals(base, ModelCapabilityOverrides.removeFromList(base, "not-there"))
+     }
++
++    @Test
++    fun longestMatchWinsOverEarlierShortPrefix() {
++        // 短串排在前、长串排在后：命中最长，而不是数组第一条。
++        val short = ModelCapabilityOverrides.Entry(match = "mimo", abilities = setOf(ModelAbility.TOOL))
++        val long = ModelCapabilityOverrides.Entry(
++            match = "mimo-v2.5-pro",
++            abilities = setOf(ModelAbility.TOOL, ModelAbility.REASONING),
++        )
++        val picked = ModelCapabilityOverrides.longestMatch(listOf(short, long), "mimo-v2.5-pro")
++        assertEquals(long, picked)
++    }
++
++    @Test
++    fun longestMatchBreaksTieByDeclarationOrder() {
++        // 等长（同为子串命中）时保留先声明者，语义与本机表在前的拼接顺序一致。
++        val first = ModelCapabilityOverrides.Entry(match = "aa-bb", abilities = setOf(ModelAbility.TOOL))
++        val second = ModelCapabilityOverrides.Entry(match = "bb-cc", abilities = setOf(ModelAbility.REASONING))
++        val picked = ModelCapabilityOverrides.longestMatch(listOf(first, second), "aa-bb-cc")
++        assertEquals(first, picked)
++    }
++
++    @Test
++    fun longestMatchIgnoresNonMatchingEntries() {
++        val entries = listOf(ModelCapabilityOverrides.Entry(match = "kimi-k3", contextLength = 1))
++        assertNull(ModelCapabilityOverrides.longestMatch(entries, "gpt-4o"))
++    }
++
++    @Test
++    fun modelSlotCountSeesEntriesEvenWhenAllInvalid() {
++        // 导入校验依赖它区分「显式空表」与「有槽位但全非法」。
++        assertEquals(0, ModelCapabilityOverrides.modelSlotCount("""{"models":[]}""") ?: -1)
++        assertEquals(2, ModelCapabilityOverrides.modelSlotCount("""{"models":[{},{"input":["text"]}]}""") ?: -1)
++        assertNull(ModelCapabilityOverrides.modelSlotCount("not json"))
++        assertNull(ModelCapabilityOverrides.modelSlotCount("""{"noModels":[]}"""))
++    }
+ }
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolverTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolverTest.kt
+index 5d792d0a6..ee97b626f 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolverTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/catalog/ModelCapabilityResolverTest.kt
+@@ -282,4 +282,125 @@ class ModelCapabilityResolverTest {
+         assertEquals(emptySet<ModelAbility>(), resolved.abilities)
+         assertEquals(CapabilitySource.LOCAL, resolved.abilitiesSource)
+     }
++
++    @Test
++    fun longestMatchWinsWithinLocalTable() {
++        // 同表两条都命中时取 match 最长者：短前缀 "deepseek" 不得抢在
++        // 更具体的 "deepseek-flash" 之前生效（旧 firstOrNull 行为）。
++        assertTrue(overrides.upsertLocal(ModelCapabilityOverrides.Entry(match = "deepseek", contextLength = 111)))
++        assertTrue(overrides.upsertLocal(ModelCapabilityOverrides.Entry(match = "deepseek-flash", contextLength = 222)))
++        val resolved = ModelCapabilityResolver.resolve("deepseek-flash", overrides)
++        assertEquals(222, resolved.contextLength)
++        assertEquals(CapabilitySource.LOCAL, resolved.contextLengthSource)
++        // 未被长条目覆盖的模型仍由短条目兜底
++        val fallback = ModelCapabilityResolver.resolve("deepseek-other-variant", overrides)
++        assertEquals(111, fallback.contextLength)
++    }
++
++    @Test
++    fun longerBaselineEntryBeatsShorterLocalEntry() {
++        assumeTrue("baseline table not loaded under this runner", overrides.baselineEntryCount() == 19)
++        // 跨表最长匹配：本机表短条目 "deepseek" 不再因“本机优先”抢在基线表
++        // 更具体的 "deepseek-flash" 之前（旧行为）。
++        assertTrue(overrides.upsertLocal(ModelCapabilityOverrides.Entry(match = "deepseek", contextLength = 111)))
++        val resolved = ModelCapabilityResolver.resolve("deepseek-flash", overrides)
++        assertEquals(1048576, resolved.contextLength)
++        assertEquals(CapabilitySource.BASELINE, resolved.contextLengthSource)
++    }
++
++    @Test
++    fun localShortMatchDoesNotShadowBaselineSpecificEntry() {
++        // 本机表加一条短串 `mimo`，不应把基线表里更具体的 `mimo-v2.6` 挡在后面。
++        // 基线条目对 mimo-v2.6 的输入是文本+图像；短串若抢占，会得到纯文本（LOCAL）。
++        assumeTrue("baseline table not loaded under this runner", overrides.baselineEntryCount() == 19)
++        assertTrue(
++            overrides.upsertLocal(
++                ModelCapabilityOverrides.Entry(match = "mimo", input = setOf(Modality.TEXT)),
++            ),
++        )
++        overrides.load()
++        val specific = ModelCapabilityResolver.resolve("mimo-v2.6", overrides)
++        assertEquals(setOf(Modality.TEXT, Modality.IMAGE), specific.input)
++        assertEquals(CapabilitySource.BASELINE, specific.inputSource)
++        // 短串本身仍然生效：没有更长条目命中的型号走本机表
++        val shortOnly = ModelCapabilityResolver.resolve("mimo-unknown", overrides)
++        assertEquals(setOf(Modality.TEXT), shortOnly.input)
++        assertEquals(CapabilitySource.LOCAL, shortOnly.inputSource)
++        overrides.removeLocal("mimo")
++    }
++
++    @Test
++    fun importRejectsTableWhoseEntriesAreAllInvalid() {
++        // 有槽位但一条都解析不出来：拒绝，不能把本机表写成空表。
++        assertTrue(
++            overrides.upsertLocal(
++                ModelCapabilityOverrides.Entry(match = "keep-me", contextLength = 4096),
++            ),
++        )
++        overrides.load()
++        assertEquals(1, overrides.localEntryCount())
++        val rejected = overrides.importLocal("""{"version":1,"models":[{},{"input":["text"]}]}""")
++        assertTrue(!rejected)
++        assertEquals(1, overrides.localEntryCount())
++        assertEquals("keep-me", overrides.localEntries().single().match)
++    }
++
++    @Test
++    fun importAcceptsExplicitEmptyTable() {
++        // 显式空表是明确的“清空”意图，应当接受（等价于 clearLocal）。
++        assertTrue(
++            overrides.upsertLocal(ModelCapabilityOverrides.Entry(match = "temp", contextLength = 1)),
++        )
++        overrides.load()
++        assertTrue(overrides.importLocal("""{"version":1,"models":[]}"""))
++        assertEquals(0, overrides.localEntryCount())
++    }
++
++    @Test
++    fun writesLeaveNoStaleTempFile() {
++        // 原子写：落盘后不应残留 .tmp；目标文件内容与解析结果一致。
++        assertTrue(
++            overrides.upsertLocal(
++                ModelCapabilityOverrides.Entry(match = "atomic-check", contextLength = 2048),
++            ),
++        )
++        val tmp = context.filesDir.resolve("model-capabilities.json.tmp")
++        assertTrue("temp file should be gone after rename", !tmp.exists())
++        val target = context.filesDir.resolve("model-capabilities.json")
++        assertTrue("target should exist", target.exists())
++        assertEquals(1, overrides.localEntryCount())
++        assertEquals(2048, overrides.localEntries().single().contextLength)
++    }
++
++    @Test
++    fun editorViewAgreesWithEffectiveLookup() {
++        // 编辑器展示（resolve）与模型实际取值（overrides.*）必须同源。
++        // 两处若一个「本机表优先」、一个「合并后最长」，下面两组对照就会分叉。
++        assumeTrue("baseline table not loaded under this runner", overrides.baselineEntryCount() == 19)
++        assertTrue(
++            overrides.upsertLocal(
++                ModelCapabilityOverrides.Entry(match = "mimo", input = setOf(Modality.TEXT)),
++            ),
++        )
++        overrides.load()
++        // 基线条目更长：两边都取基线
++        val specific = ModelCapabilityResolver.resolve("mimo-v2.6", overrides)
++        assertEquals(setOf(Modality.TEXT, Modality.IMAGE), specific.input)
++        assertEquals(setOf(Modality.TEXT, Modality.IMAGE), overrides.inputModalities("mimo-v2.6"))
++
++        // 本机条目更长：两边都取本机
++        assertTrue(
++            overrides.upsertLocal(
++                ModelCapabilityOverrides.Entry(match = "kimi-k3", contextLength = 500_000),
++            ),
++        )
++        overrides.load()
++        val kimi = ModelCapabilityResolver.resolve("kimi-k3", overrides)
++        assertEquals(CapabilitySource.LOCAL, kimi.contextLengthSource)
++        assertEquals(500_000, kimi.contextLength ?: -1)
++        assertEquals(500_000, overrides.contextLength("kimi-k3") ?: -1)
++
++        overrides.removeLocal("mimo")
++        overrides.removeLocal("kimi-k3")
++    }
+ }
+diff --git a/speech/src/main/java/me/rerere/asr/providers/DeepSeekASRController.kt b/speech/src/main/java/me/rerere/asr/providers/DeepSeekASRController.kt
+index 5486af7a9..753645036 100644
+--- a/speech/src/main/java/me/rerere/asr/providers/DeepSeekASRController.kt
++++ b/speech/src/main/java/me/rerere/asr/providers/DeepSeekASRController.kt
+@@ -126,6 +126,13 @@ class DeepSeekASRController(
+         releaseRecorder()
+         _state.update { it.copy(status = ASRStatus.Stopping) }
+ 
++        // scope 已取消（dispose 先于 stop）时 launch 不会执行，状态会永远卡在 Stopping：
++        // 此时尾段已无从上传，直接回 Idle。
++        if (!scope.isActive) {
++            _state.update { it.copy(status = ASRStatus.Idle, errorMessage = null) }
++            return
++        }
++
+         scope.launch(Dispatchers.IO) {
+             try {
+                 flushJob?.join()
+@@ -219,7 +226,12 @@ class DeepSeekASRController(
+         if (flushJob?.isActive == true) return
+         flushJob =
+             scope.launch(Dispatchers.IO) {
+-                runCatching { flushSegment() }.onFailure { e ->
++                try {
++                    flushSegment()
++                } catch (ce: kotlinx.coroutines.CancellationException) {
++                    // 取消要重抛：吞掉会破坏结构化并发（如 stop() 里 flushJob?.join() 等的取消语义）
++                    throw ce
++                } catch (e: Exception) {
+                     AppLogger.e(TAG, "Segment flush failed", e)
+                     setError(e.message ?: "DeepSeek ASR segment flush failed")
+                 }
+diff --git a/speech/src/main/java/me/rerere/tts/provider/providers/DeepSeekTTSProvider.kt b/speech/src/main/java/me/rerere/tts/provider/providers/DeepSeekTTSProvider.kt
+index c5333e458..c9b76235c 100644
+--- a/speech/src/main/java/me/rerere/tts/provider/providers/DeepSeekTTSProvider.kt
++++ b/speech/src/main/java/me/rerere/tts/provider/providers/DeepSeekTTSProvider.kt
+@@ -67,32 +67,34 @@ class DeepSeekTTSProvider : TTSProvider<TTSProviderSetting.DeepSeek> {
+                     .post(requestBody.toString().toRequestBody("application/json".toMediaType()))
+                     .build()
+ 
+-            val response = httpClient.newCall(httpRequest).execute()
++            // use{} 确保错误分支与读流后都关闭连接：泄漏的连接会占满 OkHttp 连接池，
++            // 连续失败几次后后续请求全部排队超时。
++            httpClient.newCall(httpRequest).execute().use { response ->
++                if (!response.isSuccessful) {
++                    val errorBody = response.body?.string()
++                    AppLogger.e(TAG, "generateSpeech: ${response.code} ${response.message}")
++                    AppLogger.e(TAG, "generateSpeech: $errorBody")
++                    throw TTSProviderException(
++                        message = "DeepSeek TTS request failed: ${response.code} ${response.message}",
++                        statusCode = response.code,
++                    )
++                }
++
++                val audioData = response.body.readBoundedBytes(MAX_TTS_AUDIO_BYTES)
+ 
+-            if (!response.isSuccessful) {
+-                val errorBody = response.body?.string()
+-                AppLogger.e(TAG, "generateSpeech: ${response.code} ${response.message}")
+-                AppLogger.e(TAG, "generateSpeech: $errorBody")
+-                throw TTSProviderException(
+-                    message = "DeepSeek TTS request failed: ${response.code} ${response.message}",
+-                    statusCode = response.code,
++                emit(
++                    AudioChunk(
++                        data = audioData,
++                        format = AudioFormat.PCM,
++                        sampleRate = 24000,
++                        isLast = true,
++                        metadata =
++                            mapOf(
++                                "provider" to "deepseek",
++                                "voiceId" to providerSetting.voiceId,
++                            ),
++                    ),
+                 )
+             }
+-
+-            val audioData = response.body.readBoundedBytes(MAX_TTS_AUDIO_BYTES)
+-
+-            emit(
+-                AudioChunk(
+-                    data = audioData,
+-                    format = AudioFormat.PCM,
+-                    sampleRate = 24000,
+-                    isLast = true,
+-                    metadata =
+-                        mapOf(
+-                            "provider" to "deepseek",
+-                            "voiceId" to providerSetting.voiceId,
+-                        ),
+-                ),
+-            )
+         }
+ }
