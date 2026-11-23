@@ -1,0 +1,12 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 1de65552c..266d6de9f 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -149,6 +149,7 @@
+     android:theme="@style/Theme.Rikkahub"
+     android:usesCleartextTraffic="true"
+     tools:targetApi="33">
++    <!-- 明文流量：端点由用户配置，多为可信网络上的局域网/尾网服务。 -->
+     <!--
+       Game Mode preferences. Declares to the OEM Game Mode framework (Pixel, Samsung,
+       Asus, Nothing, Xiaomi, etc.) that this app accepts PERFORMANCE and BATTERY mode
