@@ -1,0 +1,713 @@
+diff --git a/README_EN.md b/README_EN.md
+index 490226442..be8c62de9 100644
+--- a/README_EN.md
++++ b/README_EN.md
+@@ -222,11 +222,12 @@ Get a token from [@BotFather](https://t.me/BotFather) and tell the assistant to
+ 
+ ### 6. Build from Source (Optional)
+ 
+-Prerequisites: **JDK 17+** and Android SDK (**API 37**).
++Prerequisites: **JDK 17+**, Android SDK (**API 37**), and Android NDK (**28.2.13676358**; the `llama-cpp` module contains C++ code built with CMake; the repo does not pin `ndkVersion`, so AGP 9.3's default is used).
+ 
+ ```bash
+ git clone https://github.com/xiwangone/rikkahub-agents.git
+ cd rikkahub-agents
++git submodule update --init --recursive   # Submodules: material3/material-color-utilities, llama-cpp/native/llama.cpp
+ ./gradlew :app:assembleDebug          # output: app/build/outputs/apk/debug/
+ adb install app/build/outputs/apk/debug/app-debug.apk   # install to a connected device
+ ```
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridge.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridge.kt
+index 6749b5a52..d365c2f87 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridge.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridge.kt
+@@ -171,7 +171,10 @@ class LocalApprovalBridge(
+             .setPriority(NotificationCompat.PRIORITY_HIGH)
+             .setCategory(NotificationCompat.CATEGORY_CALL)
+             .setAutoCancel(true)
+-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
++            // 审批通知内容是工具入参摘要（锁屏可见即泄露）：必须 PRIVATE，随系统
++            // “锁屏隐藏敏感内容”遮蔽；全仓唯一需要改的 PUBLIC，另一处是仅含
++            // 标题/艺人的媒体播放通知（良性）。
++            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+             .addAction(0, context.getString(R.string.approve), approvePi)
+             .addAction(0, context.getString(R.string.deny), denyPi)
+             .build()
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TelegramTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TelegramTool.kt
+index e398adf73..d6669512b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TelegramTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TelegramTool.kt
+@@ -26,7 +26,9 @@ private inline fun safeApi(block: () -> JsonObject): JsonObject = try {
+ } catch (e: TelegramApiException) {
+     ToolErrors.envelopeFor(error = "invalid_argument", message = "telegram api ${e.errorCode}: ${e.description}", hint = "Check the parameter values and retry with corrected arguments.")
+ } catch (e: Throwable) {
+-    ToolErrors.envelopeFor(error = "internal_error", message = e.message ?: e::class.simpleName ?: "Unknown error")
++    // 工具错误信封直接返回给模型：无 Context 可取资源，且同文件其余错误文案
++    // 本就是英文；兜底用异常类名，不留硬编码字面量。
++    ToolErrors.envelopeFor(error = "internal_error", message = e.message ?: e::class.simpleName ?: e.toString())
+ }
+ 
+ /**
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/api/HuggingFaceModelSearch.kt b/app/src/main/java/me/rerere/rikkahub/data/api/HuggingFaceModelSearch.kt
+index f1a9f60ea..9cf36eecb 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/api/HuggingFaceModelSearch.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/api/HuggingFaceModelSearch.kt
+@@ -52,7 +52,8 @@ object HuggingFaceModelSearch {
+         // Anything else the Retrofit/kotlinx-serialization call can throw (e.g. a
+         // SerializationException from a captive portal or proxy returning HTTP 200 with a
+         // non-JSON body) maps to a plain error rather than crashing the caller.
+-        FilesResult.Error(e.message ?: e::class.simpleName ?: "Unknown error")
++        // 错误载荷返回给调用方、无 Context 可取资源：兜底用异常类名，不留硬编码字面量。
++        FilesResult.Error(e.message ?: e::class.simpleName ?: e.toString())
+     }
+ 
+     /**
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/ProviderDescriptorRegistry.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/ProviderDescriptorRegistry.kt
+index 6331046c1..e0396ba80 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/ProviderDescriptorRegistry.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/ProviderDescriptorRegistry.kt
+@@ -62,6 +62,12 @@ object ProviderDescriptors {
+                                 append("https://aihubmix.com")
+                             }
+                         }
++                        // 返佣披露：链接带 aff 参数，界面只显示裸域名、用户看不到返佣；
++                        // 在链接后明示，避免“显示文本与实际 href 不一致”。
++                        append(" ")
++                        withStyle(SpanStyle(MaterialTheme.colorScheme.onSurfaceVariant)) {
++                            append(stringResource(R.string.provider_affiliate_disclosure))
++                        }
+                         appendLine()
+                         append(stringResource(R.string.aihubmix_provider_topup))
+                         withLink(LinkAnnotation.Url("https://console.aihubmix.com/topup")) {
+@@ -144,6 +150,12 @@ object ProviderDescriptors {
+                                 append("https://ackai.fun")
+                             }
+                         }
++                        // 返佣披露：链接带 aff 参数，界面只显示裸域名、用户看不到返佣；
++                        // 在链接后明示，避免“显示文本与实际 href 不一致”。
++                        append(" ")
++                        withStyle(SpanStyle(MaterialTheme.colorScheme.onSurfaceVariant)) {
++                            append(stringResource(R.string.provider_affiliate_disclosure))
++                        }
+                     }
+                 )
+             },
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+index 0ab17c3d0..42dbbb186 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatService.kt
+@@ -749,6 +749,13 @@ class ChatService(
+         regenerateAssistantMsg: Boolean = true,
+     ) = regenerateAtMessageImpl(conversationId, message, regenerateAssistantMsg)
+ 
++    /**
++     * 错误卡片「重试」入口：按会话重发最后一条用户消息。复用 [regenerateAtMessage]
++     * 的截断到该消息后重新生成逻辑，因此正在进行的生成会被取消、队首排队消息按
++     * 既有规则处理。会话里没有用户消息时静默跳过，不报错。
++     */
++    fun retryLastGeneration(conversationId: Uuid) = retryLastGenerationImpl(conversationId)
++
+ 
+     /** Scope of an "approve" decision. Once = this single tool call only. ChatScope =
+      *  every future call of the same tool name in this conversation (until /new). Always =
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt
+index f336de138..5a295a360 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt
+@@ -403,7 +403,29 @@ internal fun ChatService.preprocessUserInputParts(
+ 
+     // ---- 重新生成消息 ----
+ 
+-internal fun ChatService.regenerateAtMessageImpl(
++    /**
++     * 会话里最后一条用户消息（重试的锚点）。空消息节点跳过；消息分支取当前选中
++     * 的那条。纯函数，便于单测。
++     */
++    internal fun findLastUserMessage(conversation: Conversation): UIMessage? =
++        conversation.messageNodes.asReversed()
++            .firstOrNull { it.messages.isNotEmpty() && it.currentMessage.role == MessageRole.USER }
++            ?.currentMessage
++
++    /**
++     * [ChatService.retryLastGeneration] 的实现：找到最后一条用户消息后复用
++     * [regenerateAtMessageImpl] 重新生成；没有用户消息时静默跳过。
++     */
++    internal fun ChatService.retryLastGenerationImpl(conversationId: Uuid) {
++        val message = findLastUserMessage(getOrCreateSession(conversationId).state.value)
++        if (message == null) {
++            AppLog.i(TAG, "retryLastGeneration: no user message in conv=$conversationId; skipping")
++            return
++        }
++        regenerateAtMessage(conversationId, message)
++    }
++
++    internal fun ChatService.regenerateAtMessageImpl(
+         conversationId: Uuid,
+         message: UIMessage,
+         regenerateAssistantMsg: Boolean = true,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt
+index 18b35ac9e..4dcd76177 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/ui/ErrorCard.kt
+@@ -38,6 +38,7 @@ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.Cancel01
+ import me.rerere.hugeicons.stroke.Copy01
+ import me.rerere.hugeicons.stroke.Delete01
++import me.rerere.hugeicons.stroke.Refresh01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.ai.FailureKind
+ import me.rerere.rikkahub.Screen
+@@ -51,6 +52,7 @@ fun ErrorCardsDisplay(
+     errors: List<ChatError>,
+     onDismissError: (Uuid) -> Unit,
+     onClearAllErrors: () -> Unit,
++    onRetryError: (ChatError) -> Unit = {},
+     modifier: Modifier = Modifier,
+ ) {
+     AnimatedVisibility(
+@@ -95,6 +97,8 @@ fun ErrorCardsDisplay(
+                 ErrorCard(
+                     error = error,
+                     onDismiss = { onDismissError(error.id) },
++                    // 只有带会话 id 的错误才能重试：重试按会话重发最后一条用户消息。
++                    onRetry = if (error.conversationId != null) ({ onRetryError(error) }) else null,
+                 )
+             }
+         }
+@@ -105,11 +109,15 @@ fun ErrorCardsDisplay(
+ fun ErrorCard(
+     error: ChatError,
+     onDismiss: () -> Unit,
++    onRetry: (() -> Unit)? = null,
+     modifier: Modifier = Modifier,
+ ) {
+     val clipboard = LocalClipboard.current
+     val navController = LocalNavController.current
+     val scope = rememberCoroutineScope()
++    // 兜底文案先在组合上下文里取好：复制按钮的 onClick 不在 @Composable 上下文里，
++    // 不能在里面直接调 stringResource。
++    val unknownErrorText = stringResource(R.string.error_unknown)
+     val checkTitleModelSettings = stringResource(R.string.chat_page_check_title_model_settings)
+     val selectModelLabel = stringResource(R.string.error_select_model)
+     // 两种可操作建议共用同一套链接渲染：都是跳模型设置
+@@ -150,7 +158,7 @@ fun ErrorCard(
+                     )
+                 }
+                 Text(
+-                    text = error.error.message ?: "Unknown error",
++                    text = error.error.message ?: unknownErrorText,
+                     style = MaterialTheme.typography.bodySmall,
+                     color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.8f),
+                     overflow = TextOverflow.Ellipsis,
+@@ -212,12 +220,26 @@ fun ErrorCard(
+                     )
+                 }
+             }
++            // 重试：按会话重发最后一条用户消息（复用 regenerate 的截断后重新生成逻辑）。
++            if (onRetry != null) {
++                IconButton(
++                    onClick = onRetry,
++                    modifier = Modifier.size(32.dp),
++                ) {
++                    Icon(
++                        imageVector = HugeIcons.Refresh01,
++                        contentDescription = stringResource(R.string.common_retry),
++                        tint = MaterialTheme.colorScheme.onErrorContainer,
++                        modifier = Modifier.size(18.dp),
++                    )
++                }
++            }
+             IconButton(
+                 onClick = {
+                     scope.launch {
+                         clipboard.setClipEntry(
+                             ClipEntry(
+-                                clipData = ClipData.newPlainText("Error", error.error.message ?: "Unknown error"),
++                                clipData = ClipData.newPlainText("Error", error.error.message ?: unknownErrorText),
+                             ),
+                         )
+                     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatList.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatList.kt
+index 3495ebb2a..346bde11a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatList.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatList.kt
+@@ -116,6 +116,7 @@ fun ChatList(
+     errors: List<ChatError> = emptyList(),
+     onDismissError: (Uuid) -> Unit = {},
+     onClearAllErrors: () -> Unit = {},
++    onRetryError: (ChatError) -> Unit = {},
+     onRegenerate: (UIMessage) -> Unit = {},
+     onEdit: (UIMessage) -> Unit = {},
+     onForkMessage: (UIMessage) -> Unit = {},
+@@ -166,6 +167,7 @@ fun ChatList(
+                 errors = errors,
+                 onDismissError = onDismissError,
+                 onClearAllErrors = onClearAllErrors,
++                onRetryError = onRetryError,
+                 onRegenerate = onRegenerate,
+                 onEdit = onEdit,
+                 onForkMessage = onForkMessage,
+@@ -219,6 +221,7 @@ private fun ChatListNormal(
+     errors: List<ChatError>,
+     onDismissError: (Uuid) -> Unit,
+     onClearAllErrors: () -> Unit,
++    onRetryError: (ChatError) -> Unit,
+     onRegenerate: (UIMessage) -> Unit,
+     onEdit: (UIMessage) -> Unit,
+     onForkMessage: (UIMessage) -> Unit,
+@@ -552,6 +555,7 @@ private fun ChatListNormal(
+                 errors = errors,
+                 onDismissError = onDismissError,
+                 onClearAllErrors = onClearAllErrors,
++                onRetryError = onRetryError,
+                 modifier =
+                     Modifier
+                         .align(Alignment.BottomCenter)
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
+index 4c17113cd..d8afd95ec 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatPage.kt
+@@ -227,6 +227,7 @@ fun ChatPage(
+                     errors = errors,
+                     onDismissError = { vm.dismissError(it) },
+                     onClearAllErrors = { vm.clearAllErrors() },
++                    onRetryError = { vm.retryError(it) },
+                 )
+             }
+         }
+@@ -260,6 +261,7 @@ fun ChatPage(
+                     errors = errors,
+                     onDismissError = { vm.dismissError(it) },
+                     onClearAllErrors = { vm.clearAllErrors() },
++                    onRetryError = { vm.retryError(it) },
+                 )
+             }
+             BackHandler(drawerState.isOpen) {
+@@ -319,6 +321,7 @@ private fun ChatPageContent(
+     errors: List<ChatError>,
+     onDismissError: (Uuid) -> Unit,
+     onClearAllErrors: () -> Unit,
++    onRetryError: (ChatError) -> Unit,
+ ) {
+     val sessionTotals by vm.sessionTotals.collectAsStateWithLifecycle()
+     val lifetimeTotals by vm.lifetimeTotals.collectAsStateWithLifecycle()
+@@ -612,6 +615,7 @@ private fun ChatPageContent(
+                 errors = errors,
+                 onDismissError = onDismissError,
+                 onClearAllErrors = onClearAllErrors,
++                onRetryError = onRetryError,
+                 onRegenerate = {
+                     vm.regenerateAtMessage(it)
+                 },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+index 1d76b07cc..b78b07869 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/chat/ChatVM.kt
+@@ -481,6 +481,18 @@ class ChatVM(
+         chatService.regenerateAtMessage(_conversationId, message, regenerateAssistantMsg)
+     }
+ 
++    /**
++     * 错误卡片「重试」：只处理属于当前会话的错误——跨会话的错误卡片（后台其他
++     * 会话的生成失败）不静默重发别的会话。重试触发后关闭该错误卡片；新的生成
++     * 失败时会在原地产生新的错误卡片。
++     */
++    fun retryError(error: ChatError) {
++        val conversationId = error.conversationId ?: return
++        if (conversationId != _conversationId) return
++        chatService.retryLastGeneration(conversationId)
++        dismissError(error.id)
++    }
++
+     fun handleToolApproval(
+         toolCallId: String,
+         approved: Boolean,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/skills/SkillsVM.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/skills/SkillsVM.kt
+index baa60ff01..0ffd29115 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/skills/SkillsVM.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/extensions/skills/SkillsVM.kt
+@@ -36,6 +36,7 @@ import java.net.URL
+ import java.nio.file.Files
+ import java.util.LinkedHashMap
+ import kotlin.collections.iterator
++import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.log.AppLog
+ 
+ class SkillsVM(
+@@ -190,7 +191,7 @@ class SkillsVM(
+             } catch (e: CancellationException) {
+                 throw e
+             } catch (e: Exception) {
+-                withContext(Dispatchers.Main) { onResult(false, e.message ?: "Unknown error") }
++                withContext(Dispatchers.Main) { onResult(false, e.message ?: context.getString(R.string.error_unknown)) }
+             }
+         }
+     }
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index a3ee67633..720b7df02 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -1811,6 +1811,7 @@
+     <string name="error_kind_storage">مساحة التخزين ممتلئة أو الملف غير قابل للكتابة</string>
+     <string name="error_kind_unsupported">التنسيق أو المعامل غير مدعوم</string>
+     <string name="error_kind_unknown">خطأ غير معروف (راجع نص الخادم أدناه)</string>
++    <string name="error_unknown">خطأ غير معروف</string>
+     <string name="error_context_injected">فشل التوليد: %1$s. الرد الأصلي: %2$s</string>
+     <string name="error_context_retry_succeeded">نجحت إعادة المحاولة. الخطأ السابق: %1$s. الرد الأصلي: %2$s</string>
+   <string name="provider_display_name_aicore">AICore (على الجهاز)</string>
+@@ -4216,6 +4217,7 @@
+   <string name="suixiang_provider_website">الموقع:</string>
+   <string name="suixiang_provider_short_description">تحويل Claude وCodex وGemini وغيرها — رصيد شحن 1:1</string>
+   <string name="ackai_provider_description">جميع نماذج الذكاء الاصطناعي الرئيسية متاحة! بلا VPN والسعر نصف الرسمي!\nالموقع:</string>
++  <string name="provider_affiliate_disclosure">رابط إحالة — قد يحصل المشروع على عمولة.</string>
+   <string name="unifyllm_provider_description">موقع مصدر موحد لمنصات تحويل LLM API\nالموقع:</string>
+   <string name="search_detail_tavily_include_answer">تضمين الإجابة</string>
+   <string name="search_detail_tavily_include_answer_desc">السماح لـ Tavily بإنشاء ملخص للإجابة إلى جانب نتائج البحث</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 5678877d1..a7b41a677 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -3210,6 +3210,7 @@
+     <string name="error_kind_storage">儲存空間不足或檔案無法寫入</string>
+     <string name="error_kind_unsupported">格式或參數不受支援</string>
+     <string name="error_kind_unknown">未能辨識的錯誤（詳見下方伺服器原話）</string>
++    <string name="error_unknown">未知錯誤</string>
+     <string name="error_context_injected">生成失敗：%1$s。返回原文：%2$s</string>
+     <string name="error_context_retry_succeeded">重試成功。之前失敗：%1$s。返回原文：%2$s</string>
+   <string name="imggen_page_delete_images_title">刪除圖片</string>
+@@ -4208,6 +4209,7 @@
+   <string name="suixiang_provider_website">官網：</string>
+   <string name="suixiang_provider_short_description">Claude、Codex、Gemini 等中繼服務，1:1 充值</string>
+   <string name="ackai_provider_description">所有AI大模型全都可以用！無需翻牆！價格是官方5折！\n官網：</string>
++  <string name="provider_affiliate_disclosure">推薦連結（含返傭）</string>
+   <string name="unifyllm_provider_description">一站式LLM API中轉平台貨源站\n官網：</string>
+   <string name="search_detail_tavily_include_answer">包含答案</string>
+   <string name="search_detail_tavily_include_answer_desc">允許 Tavily 在搜尋結果旁產生答案摘要</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index f2217850b..bd802873e 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -2232,6 +2232,7 @@
+     <string name="error_kind_storage">ストレージ不足、またはファイルに書き込めません</string>
+     <string name="error_kind_unsupported">形式またはパラメータが未対応です</string>
+     <string name="error_kind_unknown">判別できないエラーです（下のサーバー原文を参照）</string>
++    <string name="error_unknown">不明なエラー</string>
+     <string name="error_context_injected">生成失敗：%1$s。元の応答：%2$s</string>
+     <string name="error_context_retry_succeeded">再試行成功。以前の失敗：%1$s。元の応答：%2$s</string>
+   <string name="imggen_page_delete_images_title">画像を削除</string>
+@@ -4209,6 +4210,7 @@
+   <string name="suixiang_provider_website">公式サイト:</string>
+   <string name="suixiang_provider_short_description">Claude、Codex、Gemini などの中継サービス、チャージ1:1</string>
+   <string name="ackai_provider_description">主要AIモデルがすべて利用可能！VPN不要！価格は公式の半額！\n公式サイト:</string>
++  <string name="provider_affiliate_disclosure">紹介リンク（アフィリエイト）</string>
+   <string name="unifyllm_provider_description">LLM API中継プラットフォームのワンストップ調達サイト\n公式サイト:</string>
+   <string name="search_detail_tavily_include_answer">回答を含める</string>
+   <string name="search_detail_tavily_include_answer_desc">Tavily に検索結果とともに回答の要約を生成させます</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 707425019..bb369266a 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -2229,6 +2229,7 @@
+     <string name="error_kind_storage">저장 공간 부족 또는 파일 쓰기 불가</string>
+     <string name="error_kind_unsupported">형식 또는 매개변수가 지원되지 않습니다</string>
+     <string name="error_kind_unknown">식별할 수 없는 오류입니다(아래 서버 원문 참조)</string>
++    <string name="error_unknown">알 수 없는 오류</string>
+     <string name="error_context_injected">생성 실패: %1$s. 원본 응답: %2$s</string>
+     <string name="error_context_retry_succeeded">재시도 성공. 이전 실패: %1$s. 원본 응답: %2$s</string>
+   <string name="imggen_page_delete_images_title">이미지 삭제</string>
+@@ -4209,6 +4210,7 @@
+   <string name="suixiang_provider_website">공식 사이트:</string>
+   <string name="suixiang_provider_short_description">Claude, Codex, Gemini 등 중계 서비스, 충전 1:1</string>
+   <string name="ackai_provider_description">모든 주요 AI 모델을 한곳에! VPN 불필요, 가격은 공식의 절반!\n공식 사이트:</string>
++  <string name="provider_affiliate_disclosure">추천 링크(제휴 수수료 포함)</string>
+   <string name="unifyllm_provider_description">LLM API 중계 플랫폼 원스톱 소싱 사이트\n공식 사이트:</string>
+   <string name="search_detail_tavily_include_answer">답변 포함</string>
+   <string name="search_detail_tavily_include_answer_desc">Tavily가 검색 결과와 함께 답변 요약을 생성하도록 합니다</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 42384c83f..0af1a9ed2 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -2227,6 +2227,7 @@
+     <string name="error_kind_storage">Недостаточно места или файл недоступен для записи</string>
+     <string name="error_kind_unsupported">Формат или параметр не поддерживается</string>
+     <string name="error_kind_unknown">Неопознанная ошибка (см. ответ сервера ниже)</string>
++    <string name="error_unknown">Неизвестная ошибка</string>
+     <string name="error_context_injected">Сбой генерации: %1$s. Исходный ответ: %2$s</string>
+     <string name="error_context_retry_succeeded">Повтор успешен. Предыдущая ошибка: %1$s. Исходный ответ: %2$s</string>
+   <string name="imggen_page_delete_images_title">Удалить изображения</string>
+@@ -4213,6 +4214,7 @@
+   <string name="suixiang_provider_website">Сайт:</string>
+   <string name="suixiang_provider_short_description">Релей Claude, Codex, Gemini и др. — пополнение 1:1</string>
+   <string name="ackai_provider_description">Все крупные AI-модели доступны! Без VPN, цена — 50% от официальной!\nСайт:</string>
++  <string name="provider_affiliate_disclosure">Реферальная ссылка — проект может получить комиссию.</string>
+   <string name="unifyllm_provider_description">Комплексный сайт-источник платформ-релеев LLM API\nСайт:</string>
+   <string name="search_detail_tavily_include_answer">Включать ответ</string>
+   <string name="search_detail_tavily_include_answer_desc">Позволяет Tavily создавать краткий ответ вместе с результатами поиска</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index de030bb81..42409d95f 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -3362,6 +3362,7 @@
+     <string name="error_kind_storage">存储空间不足或文件不可写</string>
+     <string name="error_kind_unsupported">格式或参数不受支持</string>
+     <string name="error_kind_unknown">未能识别的错误（详见下方服务端原话）</string>
++    <string name="error_unknown">未知错误</string>
+     <string name="error_context_injected">生成失败：%1$s。返回原文：%2$s</string>
+     <string name="error_context_retry_succeeded">重试成功。之前失败：%1$s。返回原文：%2$s</string>
+   <string name="doctor_msg_tool_groups">%1$s 个工具组已启用。</string>
+@@ -4295,6 +4296,7 @@
+   <string name="suixiang_provider_website">官网：</string>
+   <string name="suixiang_provider_short_description">Claude、Codex、Gemini 等中继服务，1:1 充值</string>
+   <string name="ackai_provider_description">所有AI大模型全都可以用！无需翻墙！价格是官方5折！\n官网：</string>
++  <string name="provider_affiliate_disclosure">推荐链接（含返佣）</string>
+   <string name="unifyllm_provider_description">一站式LLM API中转平台货源站\n官网：</string>
+   <string name="search_detail_tavily_include_answer">包含答案</string>
+   <string name="search_detail_tavily_include_answer_desc">允许 Tavily 在搜索结果旁生成答案摘要</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 22cf6ddda..040acdddb 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -3329,6 +3329,7 @@
+     <string name="error_kind_storage">Storage full or file not writable</string>
+     <string name="error_kind_unsupported">Format or parameter not supported</string>
+     <string name="error_kind_unknown">Unrecognized error (see the raw server message below)</string>
++    <string name="error_unknown">Unknown error</string>
+     <string name="error_context_injected">Generation failed: %1$s. Raw response: %2$s</string>
+     <string name="error_context_retry_succeeded">Retry succeeded. Previous failure: %1$s. Raw response: %2$s</string>
+   <string name="doctor_msg_tool_groups">%1$s tool group(s) enabled.</string>
+@@ -4295,6 +4296,7 @@
+   <string name="suixiang_provider_website">Website:</string>
+   <string name="suixiang_provider_short_description">Relay services for Claude, Codex, Gemini &amp; more — 1:1 top-up credit</string>
+   <string name="ackai_provider_description">Every major AI model, all in one — no VPN needed, half the official price!\nWebsite:</string>
++  <string name="provider_affiliate_disclosure">Referral link — the project may earn a commission.</string>
+   <string name="unifyllm_provider_description">One-stop sourcing site for LLM API relay platforms\nWebsite:</string>
+   <string name="search_detail_tavily_include_answer">Include Answer</string>
+   <string name="search_detail_tavily_include_answer_desc">Let Tavily generate an answer summary alongside the search results</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridgeVisibilityTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridgeVisibilityTest.kt
+new file mode 100644
+index 000000000..04ebb5480
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/server/LocalApprovalBridgeVisibilityTest.kt
+@@ -0,0 +1,63 @@
++package me.rerere.rikkahub.data.ai.mcp.server
++
++import android.Manifest
++import android.app.Application
++import android.app.Notification
++import android.app.NotificationManager
++import android.content.Context
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import me.rerere.ai.core.Tool
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++/**
++ * 审批通知的锁屏可见性回归测试。
++ *
++ * [LocalApprovalBridge] 的通知内容是工具入参摘要——VISIBILITY_PUBLIC 时锁屏上
++ * 明文可见工具参数。断言发出的通知是 VISIBILITY_PRIVATE，随系统“锁屏隐藏敏感
++ * 内容”遮蔽。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [34], application = Application::class)
++class LocalApprovalBridgeVisibilityTest {
++    @Test
++    fun `approval notification is private on the lock screen`() = runTest {
++        val context = RuntimeEnvironment.getApplication()
++        // SDK 34 上 postApprovalNotification 先查 POST_NOTIFICATIONS 权限，未授
++        // 权时直接返回不发通知：测试里先授给应用，否则断言不到任何通知。
++        shadowOf(context).grantPermissions(Manifest.permission.POST_NOTIFICATIONS)
++        val bridge = LocalApprovalBridge(context)
++        val tool = Tool(
++            name = "visibility_probe_tool",
++            description = "probe",
++            needsApproval = { true },
++            execute = { emptyList() },
++        )
++        // requireApproval 在发通知后挂起等决策：先让它跑到发通知处，断言后再取消。
++        val job = launch {
++            bridge.requireApproval(
++                tool,
++                buildJsonObject { put("secret_arg", "do-not-show-on-lock-screen") },
++                "req-visibility-1",
++            )
++        }
++        runCurrent()
++
++        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
++        val posted = shadowOf(nm).allNotifications
++        assertEquals(1, posted.size)
++        assertEquals(Notification.VISIBILITY_PRIVATE, posted.single().visibility)
++
++        job.cancelAndJoin()
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/service/RetryLastGenerationTest.kt b/app/src/test/java/me/rerere/rikkahub/service/RetryLastGenerationTest.kt
+new file mode 100644
+index 000000000..bb674e915
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/service/RetryLastGenerationTest.kt
+@@ -0,0 +1,76 @@
++package me.rerere.rikkahub.service
++
++import kotlin.uuid.Uuid
++import me.rerere.ai.core.MessageRole
++import me.rerere.ai.ui.UIMessage
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.data.model.Conversation
++import me.rerere.rikkahub.data.model.MessageNode
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * [findLastUserMessage]：错误卡片「重试」的锚点查找。纯函数，不碰 ChatService。
++ */
++class RetryLastGenerationTest {
++    private fun user(text: String) =
++        UIMessage(role = MessageRole.USER, parts = listOf(UIMessagePart.Text(text)))
++
++    private fun assistant(text: String) =
++        UIMessage(role = MessageRole.ASSISTANT, parts = listOf(UIMessagePart.Text(text)))
++
++    private fun conversation(vararg nodes: MessageNode) =
++        Conversation(assistantId = Uuid.random(), messageNodes = nodes.toList())
++
++    @Test
++    fun `single user message is returned`() {
++        val message = user("hello")
++        assertEquals(message, findLastUserMessage(conversation(MessageNode.of(message))))
++    }
++
++    @Test
++    fun `assistant reply after user message does not shadow it`() {
++        val message = user("hello")
++        val found = findLastUserMessage(
++            conversation(MessageNode.of(message), MessageNode.of(assistant("hi"))),
++        )
++        assertEquals(message, found)
++    }
++
++    @Test
++    fun `last user message wins among several turns`() {
++        val first = user("first")
++        val second = user("second")
++        val found = findLastUserMessage(
++            conversation(
++                MessageNode.of(first),
++                MessageNode.of(assistant("reply 1")),
++                MessageNode.of(second),
++                MessageNode.of(assistant("reply 2")),
++            ),
++        )
++        assertEquals(second, found)
++    }
++
++    @Test
++    fun `no user message returns null`() {
++        assertNull(
++            findLastUserMessage(conversation(MessageNode.of(assistant("hi")))),
++        )
++    }
++
++    @Test
++    fun `empty conversation returns null`() {
++        assertNull(findLastUserMessage(conversation()))
++    }
++
++    @Test
++    fun `empty node is skipped instead of throwing`() {
++        val message = user("hello")
++        val found = findLastUserMessage(
++            conversation(MessageNode(messages = emptyList()), MessageNode.of(message)),
++        )
++        assertEquals(message, found)
++    }
++}
+diff --git a/docs/index.html b/docs/index.html
+index 88bdd7fad..5beb41eae 100644
+--- a/docs/index.html
++++ b/docs/index.html
+@@ -1063,6 +1063,7 @@
+     <li><a href="#providers">Models</a></li>
+     <li><a href="#quickstart">Quick start</a></li>
+     <li><a href="#faq">FAQ</a></li>
++    <li><a href="#privacy">Privacy</a></li>
+     <li><a href="https://github.com/xiwangone/rikkahub-agents">GitHub</a></li>
+   </ul>
+   <a href="https://github.com/xiwangone/rikkahub-agents/releases/latest" class="nav-cta">
+@@ -1433,6 +1434,57 @@
+   </div>
+ </section>
+ 
++<!-- PRIVACY POLICY -->
++<!-- Mirrors the in-app policy (Settings > About > Privacy Policy, privacy_policy_* strings). -->
++<section id="privacy">
++  <div class="container">
++    <div class="reveal" style="text-align: center;">
++      <span class="section-label">Privacy</span>
++      <h2>Privacy Policy</h2>
++      <p class="section-sub" style="margin: 0 auto 3rem;">This app runs on your device. It has no account system and no first-party server that receives your data.</p>
++    </div>
++
++    <div class="faq-list reveal">
++
++      <details>
++        <summary>What data the app handles</summary>
++        <div class="faq-answer">
++          Conversations, settings, and provider credentials you enter are stored on your device. The app collects no telemetry and includes no analytics or crash-reporting SDK.
++        </div>
++      </details>
++
++      <details>
++        <summary>Where your data goes</summary>
++        <div class="faq-answer">
++          Chat content is sent only to the AI provider you configure, using the credentials you provide. Optional network features, such as remote access and tunneling, connect only as you configure them.
++        </div>
++      </details>
++
++      <details>
++        <summary>Storage and deletion</summary>
++        <div class="faq-answer">
++          Deleting a conversation removes its messages, search index, and chat files from the device. Backups are created only when you start one, to a destination you choose, protected by a password you set.
++        </div>
++      </details>
++
++      <details>
++        <summary>Permissions and approvals</summary>
++        <div class="faq-answer">
++          Permissions are used only when you enable the feature that needs them. Reading sensitive on-device data, such as contacts, messages, or call history, always asks for your approval first.
++        </div>
++      </details>
++
++      <details>
++        <summary>Open source</summary>
++        <div class="faq-answer">
++          The source code is public under the AGPLv3 license. You can inspect exactly what the app does with your data.
++        </div>
++      </details>
++
++    </div>
++  </div>
++</section>
++
+ <!-- FOOTER -->
+ <footer>
+   <div class="footer-grid">
+@@ -1451,6 +1503,7 @@
+         <li><a href="https://github.com/xiwangone/rikkahub-agents/releases">Releases</a></li>
+         <li><a href="https://github.com/xiwangone/rikkahub-agents/issues">Issues</a></li>
+         <li><a href="https://github.com/xiwangone/rikkahub-agents/blob/master/LICENSE">License</a></li>
++        <li><a href="#privacy">Privacy Policy</a></li>
+       </ul>
+     </div>
+ 
