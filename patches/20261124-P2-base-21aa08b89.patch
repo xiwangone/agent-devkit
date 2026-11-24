@@ -1,0 +1,1797 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt
+index 6d5cbf412..345528b52 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistry.kt
+@@ -224,7 +224,10 @@ internal class McpSessionRegistry(
+     suspend fun forceResync(serverId: Uuid) {
+         val config = settingsStore.settingsFlow.value.mcpServers.firstOrNull { it.id == serverId } ?: return
+         val session = sessions.computeIfAbsent(serverId) { McpSession(config) }
+-        session.config = config
++        // 与 addClient 的快路径同款：在 lifecycleMutex 内认领新配置，再调 connectSession。
++        // 写在锁外时，若落在 in-flight connectSession 的比对之后、写回之前，
++        // connectSession 会用旧的 syncedConfig 把刚写入的配置覆盖掉（tools-only 变更静默丢失）。
++        session.lifecycleMutex.withLock { session.config = config }
+         connectSession(
+             session = session,
+             requestedConfig = config,
+@@ -422,7 +425,9 @@ internal class McpSessionRegistry(
+                     it.commonOptions.enable &&
+                     it.commonOptions.name.isNotBlank()
+             } ?: return
+-            session.config = latestConfig
++            // 同 forceResync：在锁内认领最新配置，否则 in-flight connectSession
++            // 可能随后用旧的 syncedConfig 把它覆盖掉。
++            session.lifecycleMutex.withLock { session.config = latestConfig }
+             retry = connectSession(
+                 session = session,
+                 requestedConfig = latestConfig,
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
+index 3d2276590..77b96d934 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/PreferencesStore.kt
+@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.first
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.collect
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.CancellationException
+@@ -296,6 +297,18 @@ class SettingsStore(
+ 
+     }
+ 
++    // 隔离状态由 SettingsQuarantineState 持有（放这里会让类超 detekt LargeClass 阈值）。
++    private val quarantineState = SettingsQuarantineState(appContext)
++
++    /** 本次启动里被隔离的损坏字段；为空表示没有。 */
++    val quarantinedFields: StateFlow<List<QuarantinedField>> get() = quarantineState.quarantinedFields
++
++    /** 隔离时写下的原始值快照；没有隔离过时为 null。 */
++    val quarantineSnapshot: StateFlow<File?> get() = quarantineState.quarantineSnapshot
++
++    /** 字段清掉后（见 [resetStoredField]），同步去掉它的隔离记录，横幅随即消失。 */
++    fun clearQuarantinedField(keyName: String) = quarantineState.clearQuarantinedField(keyName)
++
+     // Do not turn a failed disk read into emptyPreferences(): that makes defaults look
+     // authoritative and a subsequent edit can overwrite the user's real settings.
+     val settingsFlowRaw = dataStore.data
+@@ -318,171 +331,176 @@ class SettingsStore(
+                     settingsFlow.value = preview
+                 }
+             }
+-            Settings(
+-                favoriteModels = decodePrefOrDefault(preferences[FAVORITE_MODELS], emptyList()),
+-                chatModelId = parseUuidPrefOrNull(preferences[SELECT_MODEL])
+-                    ?: DEFAULT_AUTO_MODEL_ID,
+-                fastModelId = parseUuidPrefOrNull(preferences[FAST_MODEL])
+-                    ?: DEFAULT_AUTO_MODEL_ID,
+-                titleModelId = parseUuidPrefOrNull(preferences[TITLE_MODEL]),
+-                translateModeId = parseUuidPrefOrNull(preferences[TRANSLATE_MODEL])
+-                    ?: DEFAULT_AUTO_MODEL_ID,
+-                enableSuggestion = preferences[ENABLE_SUGGESTION] != false,
+-                autoGenerateTitle = preferences[AUTO_GENERATE_TITLE] != false,
+-                responseStreamMaxRetries = preferences[RESPONSE_STREAM_MAX_RETRIES] ?: 5,
+-                enableAutoRetry = preferences[ENABLE_AUTO_RETRY] != false,
+-                suggestionModelId = parseUuidPrefOrNull(preferences[SUGGESTION_MODEL]),
+-                imageGenerationModelId = parseUuidPrefOrNull(preferences[IMAGE_GENERATION_MODEL])
+-                    ?: DEFAULT_AUTO_MODEL_ID,
+-                titlePrompt = preferences[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
+-                translatePrompt = preferences[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
+-                translateThinkingBudget = preferences[TRANSLATE_THINKING_BUDGET] ?: 0,
+-                suggestionPrompt = preferences[SUGGESTION_PROMPT] ?: DEFAULT_SUGGESTION_PROMPT,
+-                ocrModelId = parseUuidPrefOrNull(preferences[OCR_MODEL]) ?: DEFAULT_AUTO_MODEL_ID,
+-                ocrLocalEnabled = preferences[OCR_LOCAL_ENABLED] ?: true,
+-                ocrPrompt = preferences[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
+-                compressModelId = parseUuidPrefOrNull(preferences[COMPRESS_MODEL]) ?: DEFAULT_AUTO_MODEL_ID,
+-                compressPrompt = preferences[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
+-                autoCompressEnabled = preferences[AUTO_COMPRESS_ENABLED] ?: false,
+-                autoCompressThreshold = preferences[AUTO_COMPRESS_THRESHOLD] ?: 80,
+-                autoCompressTokenLimit = preferences[AUTO_COMPRESS_TOKEN_LIMIT] ?: 0L,
+-                autoCompressTokenBase = preferences[AUTO_COMPRESS_TOKEN_BASE] ?: 1_000L * 1000L,
+-                autoCompressMode = preferences[AUTO_COMPRESS_MODE] ?: 0,
+-                contextWindowSize = preferences[CONTEXT_WINDOW_SIZE] ?: 0L,
+-                toolOutputEnabled = preferences[TOOL_OUTPUT_ENABLED] ?: true,
+-                toolOutputMaxChars = preferences[TOOL_OUTPUT_MAX_CHARS] ?: 8 * 1000,
+-                toolOutputCompactMaxChars = preferences[TOOL_OUTPUT_COMPACT_MAX_CHARS] ?: 2 * 1000,
+-                assistantId = parseUuidPrefOrNull(preferences[SELECT_ASSISTANT])
+-                    ?: DEFAULT_ASSISTANT_ID,
+-                assistantTags = decodePrefOrDefault(preferences[ASSISTANT_TAGS], emptyList()),
+-                mediaGenerationProviders = decodeEncryptedPrefOrDefault(preferences[MEDIA_GENERATION_PROVIDERS], emptyList()),
+-                providers = decodeProvidersFieldEncrypted(preferences[PROVIDERS]),
+-                deletedBuiltInProviderIds = preferences[DELETED_BUILTIN_PROVIDER_IDS]
+-                    ?.let { raw ->
+-                        JsonInstant.decodeFromString<Set<String>>(raw).map { Uuid.parse(it) }.toSet()
+-                    } ?: emptySet(),
+-                autoEnabledDefaultSkills = preferences[AUTO_ENABLED_DEFAULT_SKILLS]
+-                    ?.let { raw ->
++            // 整份 Settings 的解码体：单个字段损坏即抛，由 quarantineState 隔离处理
++            // （见 SettingsQuarantine）。保持为 lambda 而不是具名函数：
++            // 具名函数超 detekt LongMethod 阈值（120 行），原始 inline 形态不触发。
++            quarantineState.decodeOrQuarantine(preferences) { prefs ->
++                Settings(
++                    favoriteModels = decodePrefOrDefault(prefs[FAVORITE_MODELS], emptyList()),
++                    chatModelId = parseUuidPrefOrNull(prefs[SELECT_MODEL])
++                        ?: DEFAULT_AUTO_MODEL_ID,
++                    fastModelId = parseUuidPrefOrNull(prefs[FAST_MODEL])
++                        ?: DEFAULT_AUTO_MODEL_ID,
++                    titleModelId = parseUuidPrefOrNull(prefs[TITLE_MODEL]),
++                    translateModeId = parseUuidPrefOrNull(prefs[TRANSLATE_MODEL])
++                        ?: DEFAULT_AUTO_MODEL_ID,
++                    enableSuggestion = prefs[ENABLE_SUGGESTION] != false,
++                    autoGenerateTitle = prefs[AUTO_GENERATE_TITLE] != false,
++                    responseStreamMaxRetries = prefs[RESPONSE_STREAM_MAX_RETRIES] ?: 5,
++                    enableAutoRetry = prefs[ENABLE_AUTO_RETRY] != false,
++                    suggestionModelId = parseUuidPrefOrNull(prefs[SUGGESTION_MODEL]),
++                    imageGenerationModelId = parseUuidPrefOrNull(prefs[IMAGE_GENERATION_MODEL])
++                        ?: DEFAULT_AUTO_MODEL_ID,
++                    titlePrompt = prefs[TITLE_PROMPT] ?: DEFAULT_TITLE_PROMPT,
++                    translatePrompt = prefs[TRANSLATION_PROMPT] ?: DEFAULT_TRANSLATION_PROMPT,
++                    translateThinkingBudget = prefs[TRANSLATE_THINKING_BUDGET] ?: 0,
++                    suggestionPrompt = prefs[SUGGESTION_PROMPT] ?: DEFAULT_SUGGESTION_PROMPT,
++                    ocrModelId = parseUuidPrefOrNull(prefs[OCR_MODEL]) ?: DEFAULT_AUTO_MODEL_ID,
++                    ocrLocalEnabled = prefs[OCR_LOCAL_ENABLED] ?: true,
++                    ocrPrompt = prefs[OCR_PROMPT] ?: DEFAULT_OCR_PROMPT,
++                    compressModelId = parseUuidPrefOrNull(prefs[COMPRESS_MODEL]) ?: DEFAULT_AUTO_MODEL_ID,
++                    compressPrompt = prefs[COMPRESS_PROMPT] ?: DEFAULT_COMPRESS_PROMPT,
++                    autoCompressEnabled = prefs[AUTO_COMPRESS_ENABLED] ?: false,
++                    autoCompressThreshold = prefs[AUTO_COMPRESS_THRESHOLD] ?: 80,
++                    autoCompressTokenLimit = prefs[AUTO_COMPRESS_TOKEN_LIMIT] ?: 0L,
++                    autoCompressTokenBase = prefs[AUTO_COMPRESS_TOKEN_BASE] ?: 1_000L * 1000L,
++                    autoCompressMode = prefs[AUTO_COMPRESS_MODE] ?: 0,
++                    contextWindowSize = prefs[CONTEXT_WINDOW_SIZE] ?: 0L,
++                    toolOutputEnabled = prefs[TOOL_OUTPUT_ENABLED] ?: true,
++                    toolOutputMaxChars = prefs[TOOL_OUTPUT_MAX_CHARS] ?: 8 * 1000,
++                    toolOutputCompactMaxChars = prefs[TOOL_OUTPUT_COMPACT_MAX_CHARS] ?: 2 * 1000,
++                    assistantId = parseUuidPrefOrNull(prefs[SELECT_ASSISTANT])
++                        ?: DEFAULT_ASSISTANT_ID,
++                    assistantTags = decodePrefOrDefault(prefs[ASSISTANT_TAGS], emptyList()),
++                    mediaGenerationProviders = decodeEncryptedPrefOrDefault(prefs[MEDIA_GENERATION_PROVIDERS], emptyList()),
++                    providers = decodeProvidersFieldEncrypted(prefs[PROVIDERS]),
++                    deletedBuiltInProviderIds = prefs[DELETED_BUILTIN_PROVIDER_IDS]
++                        ?.let { raw ->
++                            JsonInstant.decodeFromString<Set<String>>(raw).map { Uuid.parse(it) }.toSet()
++                        } ?: emptySet(),
++                    autoEnabledDefaultSkills = prefs[AUTO_ENABLED_DEFAULT_SKILLS]
++                        ?.let { raw ->
++                            JsonInstant.decodeFromString<Set<String>>(raw)
++                        } ?: emptySet(),
++                    deletedBundledSkills = prefs[DELETED_BUNDLED_SKILLS]?.let { raw ->
+                         JsonInstant.decodeFromString<Set<String>>(raw)
+                     } ?: emptySet(),
+-                deletedBundledSkills = preferences[DELETED_BUNDLED_SKILLS]?.let { raw ->
+-                    JsonInstant.decodeFromString<Set<String>>(raw)
+-                } ?: emptySet(),
+-                assistants = decodePrefOrDefault(preferences[ASSISTANTS], emptyList()),
+-                dynamicColor = preferences[DYNAMIC_COLOR] != false,
+-                themeId = preferences[THEME_ID] ?: PresetThemes[0].id,
+-                customThemes = decodePrefOrDefault(preferences[CUSTOM_THEMES], emptyList()),
+-                developerMode = preferences[DEVELOPER_MODE] == true,
+-                displaySetting = decodePrefOrDefault(preferences[DISPLAY_SETTING], DisplaySetting()),
+-                networkSetting = decodeEncryptedPrefOrDefault(preferences[NETWORK_SETTING], NetworkSetting()),
+-                executionBackend = preferences[EXECUTION_BACKEND] ?: "local",
+-                backendConnections = preferences[BACKEND_CONNECTIONS]?.let {
+-                    JsonInstant.decodeFromString<kotlin.collections.List<me.rerere.rikkahub.data.model.BackendConnection>>(it)
+-                } ?: emptyList(),
+-                // 显式类型实参：不能让 T 由 default 实参推。DEFAULT 一旦声明成具体子类
+-                // （DuckDuckGoOptions），T 就窄化成 List<DuckDuckGoOptions>，多态判别键 `type`
+-                // 被 ignoreUnknownKeys 吞掉 → 所有搜索服务静默解成 DuckDuckGo。
+-                // SearchServiceOptions.DEFAULT 已修声明类型，这里再钉一次作双保险。
+-                searchServices = decodeEncryptedPrefOrDefault<List<SearchServiceOptions>>(
+-                    preferences[SEARCH_SERVICES],
+-                    listOf(SearchServiceOptions.DEFAULT),
+-                ).also {
+-                    logSearchServicesDecode(
+-                        preferences[SEARCH_SERVICES]?.let(::decryptPrefValue),
+-                        it,
+-                    )
+-                }, // TEMP-DIAG(SearchTypeDiag)：验收后删掉这个 .also{} 片段
+-                searchCommonOptions = decodePrefOrDefault(preferences[SEARCH_COMMON], SearchCommonOptions()),
+-                searchServiceSelected = preferences[SEARCH_SELECTED] ?: 0,
+-                mcpServers = decodeEncryptedPrefOrDefault(preferences[MCP_SERVERS], emptyList()),
+-subAgents = preferences[SUB_AGENTS]?.let { raw ->
+-                    JsonInstant.decodeFromString<List<SubAgentProfile>>(raw)
+-                } ?: emptyList(),
+-                subAgentDefaultWorkspaceId = preferences[SUB_AGENT_DEFAULT_WORKSPACE]?.let { raw ->
+-                    Uuid.parse(raw)
+-                },
+-                subAgentForegroundReceipt = preferences[SUB_AGENT_FOREGROUND_RECEIPT] ?: false,
+-                webDavConfig = decodeEncryptedPrefOrDefault(preferences[WEBDAV_CONFIG], WebDavConfig()),
+-                s3Config = decodeEncryptedPrefOrDefault(preferences[S3_CONFIG], S3Config()),
+-                uploadS3Config = decodeEncryptedPrefOrDefault(preferences[UPLOAD_S3_CONFIG], S3Config()),
+-                webDavConfigs = preferences[WEBDAV_CONFIGS]?.let { raw ->
+-                    JsonInstant.decodeFromString<List<WebDavConfig>>(decryptPrefValue(raw))
+-                } ?: emptyList(),
+-                activeWebDavConfigId = preferences[ACTIVE_WEBDAV_CONFIG_ID],
+-                s3Configs = preferences[S3_CONFIGS]?.let { raw ->
+-                    JsonInstant.decodeFromString<List<S3Config>>(decryptPrefValue(raw))
+-                } ?: emptyList(),
+-                activeS3ConfigId = preferences[ACTIVE_S3_CONFIG_ID],
+-                ttsProviders = decodeEncryptedPrefOrDefault(preferences[TTS_PROVIDERS], emptyList()),
+-                selectedTTSProviderId = parseUuidPrefOrNull(preferences[SELECTED_TTS_PROVIDER])
+-                    ?: DEFAULT_SYSTEM_TTS_ID,
+-                defaultTTSPlaybackSpeed = preferences[DEFAULT_TTS_PLAYBACK_SPEED]?.coerceIn(0.5f, 2.0f) ?: 1.0f,
+-                asrProviders = decodeEncryptedPrefOrDefault(preferences[ASR_PROVIDERS], emptyList()),
+-                selectedASRProviderId = parseUuidPrefOrNull(preferences[SELECTED_ASR_PROVIDER]),
+-                modeInjections = decodePrefOrDefault(preferences[MODE_INJECTIONS], emptyList()),
+-                lorebooks = decodePrefOrDefault(preferences[LOREBOOKS], emptyList()),
+-                quickMessages = decodePrefOrDefault(preferences[QUICK_MESSAGES], emptyList()),
+-                webServerEnabled = preferences[WEB_SERVER_ENABLED] == true,
+-                webServerPort = preferences[WEB_SERVER_PORT] ?: 8080,
+-                localMcpServerEnabled = preferences[LOCAL_MCP_SERVER_ENABLED] == true,
+-                localMcpProfiles = preferences[LOCAL_MCP_PROFILES]?.let {
+-                    JsonInstant.decodeFromString<List<LocalMcpProfile>>(it)
+-                } ?: emptyList(),
+-                activeLocalMcpProfileId = preferences[LOCAL_MCP_ACTIVE_PROFILE_ID],
+-                webBridgeEcsHost = preferences[WEB_BRIDGE_ECS_HOST] ?: "",
+-                webBridgeEcsUser = preferences[WEB_BRIDGE_ECS_USER] ?: "root",
+-                webBridgeEcsPort = preferences[WEB_BRIDGE_ECS_PORT] ?: 22,
+-                webBridgeRemotePort = preferences[WEB_BRIDGE_REMOTE_PORT] ?: 8080,
+-                webBridgeLocalPort = preferences[WEB_BRIDGE_LOCAL_PORT] ?: 8080,
+-                webBridgePrivateKeyPath = preferences[WEB_BRIDGE_PRIVATE_KEY_PATH] ?: "",
+-                webBridgePassword = preferences[WEB_BRIDGE_PASSWORD]?.let(::decryptPrefValue) ?: "",
+-                webBridgeCredentialRef = preferences[WEB_BRIDGE_CREDENTIAL_REF] ?: "",
+-                webServerJwtEnabled = preferences[WEB_SERVER_JWT_ENABLED] == true,
+-                webServerListenScope = preferences[WEB_SERVER_LISTEN_SCOPE] ?: "loopback",
+-                webServerAllowedNetworks = preferences[WEB_SERVER_ALLOWED_NETWORKS] ?: "",
+-                webServerAccessPassword = preferences[WEB_SERVER_ACCESS_PASSWORD]?.let(::decryptPrefValue) ?: "",
+-                networkCidrPresets =
+-                    preferences[NETWORK_CIDR_PRESETS]?.let {
+-                        JsonInstant.decodeFromString<List<String>>(it)
++                    assistants = decodePrefOrDefault(prefs[ASSISTANTS], emptyList()),
++                    dynamicColor = prefs[DYNAMIC_COLOR] != false,
++                    themeId = prefs[THEME_ID] ?: PresetThemes[0].id,
++                    customThemes = decodePrefOrDefault(prefs[CUSTOM_THEMES], emptyList()),
++                    developerMode = prefs[DEVELOPER_MODE] == true,
++                    displaySetting = decodePrefOrDefault(prefs[DISPLAY_SETTING], DisplaySetting()),
++                    networkSetting = decodeEncryptedPrefOrDefault(prefs[NETWORK_SETTING], NetworkSetting()),
++                    executionBackend = prefs[EXECUTION_BACKEND] ?: "local",
++                    backendConnections = prefs[BACKEND_CONNECTIONS]?.let {
++                        JsonInstant.decodeFromString<kotlin.collections.List<me.rerere.rikkahub.data.model.BackendConnection>>(it)
+                     } ?: emptyList(),
+-                settingShortcutIds =
+-                    preferences[SETTING_SHORTCUT_IDS]
+-                        ?.split('\u0001')
+-                        ?.filter { it.isNotBlank() }
+-                        ?: emptyList(),
+-                workspaceApkMirror = preferences[WORKSPACE_APK_MIRROR] ?: "",
+-                workspaceAptMirror = preferences[WORKSPACE_APT_MIRROR] ?: "",
+-                workspacePipMirror = preferences[WORKSPACE_PIP_MIRROR] ?: "",
+-                workspaceNpmMirror = preferences[WORKSPACE_NPM_MIRROR] ?: "",
+-                workspaceSdcardEnabled = preferences[WORKSPACE_SDCARD_ENABLED] ?: false,
+-                workspaceChrootEnabled =
+-                    WorkspaceShellBackend.fromPreference(
+-                        rawBackend = preferences[WORKSPACE_SHELL_BACKEND],
+-                        legacyChrootEnabled = preferences[WORKSPACE_CHROOT_ENABLED],
+-                    ) == WorkspaceShellBackend.ROOT_CHROOT,
+-                workspaceShellBackend =
+-                    WorkspaceShellBackend.fromPreference(
+-                        rawBackend = preferences[WORKSPACE_SHELL_BACKEND],
+-                        legacyChrootEnabled = preferences[WORKSPACE_CHROOT_ENABLED],
+-                    ),
+-                shellDnsMode = ShellDnsConfig.normalizeMode(preferences[SHELL_DNS_MODE]),
+-                shellDnsServers =
+-                    preferences[SHELL_DNS_SERVERS]?.let { raw ->
+-                        runCatching { JsonInstant.decodeFromString<List<String>>(raw) }
+-                            .getOrElse { ShellDnsConfig.parseServers(raw) }
+-                            .let { list -> ShellDnsConfig.parseServers(list.joinToString("\n")) }
++                    // 显式类型实参：不能让 T 由 default 实参推。DEFAULT 一旦声明成具体子类
++                    // （DuckDuckGoOptions），T 就窄化成 List<DuckDuckGoOptions>，多态判别键 `type`
++                    // 被 ignoreUnknownKeys 吞掉 → 所有搜索服务静默解成 DuckDuckGo。
++                    // SearchServiceOptions.DEFAULT 已修声明类型，这里再钉一次作双保险。
++                    searchServices = decodeEncryptedPrefOrDefault<List<SearchServiceOptions>>(
++                        prefs[SEARCH_SERVICES],
++                        listOf(SearchServiceOptions.DEFAULT),
++                    ).also {
++                        logSearchServicesDecode(
++                            prefs[SEARCH_SERVICES]?.let(::decryptPrefValue),
++                            it,
++                        )
++                    }, // TEMP-DIAG(SearchTypeDiag)：验收后删掉这个 .also{} 片段
++                    searchCommonOptions = decodePrefOrDefault(prefs[SEARCH_COMMON], SearchCommonOptions()),
++                    searchServiceSelected = prefs[SEARCH_SELECTED] ?: 0,
++                    mcpServers = decodeEncryptedPrefOrDefault(prefs[MCP_SERVERS], emptyList()),
++                    subAgents = prefs[SUB_AGENTS]?.let { raw ->
++                        JsonInstant.decodeFromString<List<SubAgentProfile>>(raw)
+                     } ?: emptyList(),
+-                workspaceStatsCache = preferences[WORKSPACE_STATS_CACHE] ?: "{}",
+-                webServerLocalhostOnly = preferences[WEB_SERVER_LOCALHOST_ONLY] == true,
+-                aiLogLevel = AiLogLevel.fromPreference(preferences[AI_LOG_LEVEL]),
+-                defaultSshPlatform = SshPlatform.fromPreference(preferences[DEFAULT_SSH_PLATFORM]),
+-                sshHostProbe = SshHostProbeMode.fromPreference(preferences[SSH_HOST_PROBE]),
+-                backupReminderConfig = decodePrefOrDefault(preferences[BACKUP_REMINDER_CONFIG], BackupReminderConfig()),
+-                backupEncryptionEnabled = preferences[BACKUP_ENCRYPTION_ENABLED] ?: false,
+-                backupEncryptionPasswordEnc = preferences[BACKUP_ENCRYPTION_PASSWORD_ENC] ?: "",
+-                launchCount = preferences[LAUNCH_COUNT] ?: 0,
+-                usagePricing = decodePrefOrDefault(preferences[USAGE_PRICING], UsagePricingSettings()),
+-            )
++                    subAgentDefaultWorkspaceId = prefs[SUB_AGENT_DEFAULT_WORKSPACE]?.let { raw ->
++                        Uuid.parse(raw)
++                    },
++                    subAgentForegroundReceipt = prefs[SUB_AGENT_FOREGROUND_RECEIPT] ?: false,
++                    webDavConfig = decodeEncryptedPrefOrDefault(prefs[WEBDAV_CONFIG], WebDavConfig()),
++                    s3Config = decodeEncryptedPrefOrDefault(prefs[S3_CONFIG], S3Config()),
++                    uploadS3Config = decodeEncryptedPrefOrDefault(prefs[UPLOAD_S3_CONFIG], S3Config()),
++                    webDavConfigs = prefs[WEBDAV_CONFIGS]?.let { raw ->
++                        JsonInstant.decodeFromString<List<WebDavConfig>>(decryptPrefValue(raw))
++                    } ?: emptyList(),
++                    activeWebDavConfigId = prefs[ACTIVE_WEBDAV_CONFIG_ID],
++                    s3Configs = prefs[S3_CONFIGS]?.let { raw ->
++                        JsonInstant.decodeFromString<List<S3Config>>(decryptPrefValue(raw))
++                    } ?: emptyList(),
++                    activeS3ConfigId = prefs[ACTIVE_S3_CONFIG_ID],
++                    ttsProviders = decodeEncryptedPrefOrDefault(prefs[TTS_PROVIDERS], emptyList()),
++                    selectedTTSProviderId = parseUuidPrefOrNull(prefs[SELECTED_TTS_PROVIDER])
++                        ?: DEFAULT_SYSTEM_TTS_ID,
++                    defaultTTSPlaybackSpeed = prefs[DEFAULT_TTS_PLAYBACK_SPEED]?.coerceIn(0.5f, 2.0f) ?: 1.0f,
++                    asrProviders = decodeEncryptedPrefOrDefault(prefs[ASR_PROVIDERS], emptyList()),
++                    selectedASRProviderId = parseUuidPrefOrNull(prefs[SELECTED_ASR_PROVIDER]),
++                    modeInjections = decodePrefOrDefault(prefs[MODE_INJECTIONS], emptyList()),
++                    lorebooks = decodePrefOrDefault(prefs[LOREBOOKS], emptyList()),
++                    quickMessages = decodePrefOrDefault(prefs[QUICK_MESSAGES], emptyList()),
++                    webServerEnabled = prefs[WEB_SERVER_ENABLED] == true,
++                    webServerPort = prefs[WEB_SERVER_PORT] ?: 8080,
++                    localMcpServerEnabled = prefs[LOCAL_MCP_SERVER_ENABLED] == true,
++                    localMcpProfiles = prefs[LOCAL_MCP_PROFILES]?.let {
++                        JsonInstant.decodeFromString<List<LocalMcpProfile>>(it)
++                    } ?: emptyList(),
++                    activeLocalMcpProfileId = prefs[LOCAL_MCP_ACTIVE_PROFILE_ID],
++                    webBridgeEcsHost = prefs[WEB_BRIDGE_ECS_HOST] ?: "",
++                    webBridgeEcsUser = prefs[WEB_BRIDGE_ECS_USER] ?: "root",
++                    webBridgeEcsPort = prefs[WEB_BRIDGE_ECS_PORT] ?: 22,
++                    webBridgeRemotePort = prefs[WEB_BRIDGE_REMOTE_PORT] ?: 8080,
++                    webBridgeLocalPort = prefs[WEB_BRIDGE_LOCAL_PORT] ?: 8080,
++                    webBridgePrivateKeyPath = prefs[WEB_BRIDGE_PRIVATE_KEY_PATH] ?: "",
++                    webBridgePassword = prefs[WEB_BRIDGE_PASSWORD]?.let(::decryptPrefValue) ?: "",
++                    webBridgeCredentialRef = prefs[WEB_BRIDGE_CREDENTIAL_REF] ?: "",
++                    webServerJwtEnabled = prefs[WEB_SERVER_JWT_ENABLED] == true,
++                    webServerListenScope = prefs[WEB_SERVER_LISTEN_SCOPE] ?: "loopback",
++                    webServerAllowedNetworks = prefs[WEB_SERVER_ALLOWED_NETWORKS] ?: "",
++                    webServerAccessPassword = prefs[WEB_SERVER_ACCESS_PASSWORD]?.let(::decryptPrefValue) ?: "",
++                    networkCidrPresets =
++                        prefs[NETWORK_CIDR_PRESETS]?.let {
++                            JsonInstant.decodeFromString<List<String>>(it)
++                        } ?: emptyList(),
++                    settingShortcutIds =
++                        prefs[SETTING_SHORTCUT_IDS]
++                            ?.split('\u0001')
++                            ?.filter { it.isNotBlank() }
++                            ?: emptyList(),
++                    workspaceApkMirror = prefs[WORKSPACE_APK_MIRROR] ?: "",
++                    workspaceAptMirror = prefs[WORKSPACE_APT_MIRROR] ?: "",
++                    workspacePipMirror = prefs[WORKSPACE_PIP_MIRROR] ?: "",
++                    workspaceNpmMirror = prefs[WORKSPACE_NPM_MIRROR] ?: "",
++                    workspaceSdcardEnabled = prefs[WORKSPACE_SDCARD_ENABLED] ?: false,
++                    workspaceChrootEnabled =
++                        WorkspaceShellBackend.fromPreference(
++                            rawBackend = prefs[WORKSPACE_SHELL_BACKEND],
++                            legacyChrootEnabled = prefs[WORKSPACE_CHROOT_ENABLED],
++                        ) == WorkspaceShellBackend.ROOT_CHROOT,
++                    workspaceShellBackend =
++                        WorkspaceShellBackend.fromPreference(
++                            rawBackend = prefs[WORKSPACE_SHELL_BACKEND],
++                            legacyChrootEnabled = prefs[WORKSPACE_CHROOT_ENABLED],
++                        ),
++                    shellDnsMode = ShellDnsConfig.normalizeMode(prefs[SHELL_DNS_MODE]),
++                    shellDnsServers =
++                        prefs[SHELL_DNS_SERVERS]?.let { raw ->
++                            runCatching { JsonInstant.decodeFromString<List<String>>(raw) }
++                                .getOrElse { ShellDnsConfig.parseServers(raw) }
++                                .let { list -> ShellDnsConfig.parseServers(list.joinToString("\n")) }
++                        } ?: emptyList(),
++                    workspaceStatsCache = prefs[WORKSPACE_STATS_CACHE] ?: "{}",
++                    webServerLocalhostOnly = prefs[WEB_SERVER_LOCALHOST_ONLY] == true,
++                    aiLogLevel = AiLogLevel.fromPreference(prefs[AI_LOG_LEVEL]),
++                    defaultSshPlatform = SshPlatform.fromPreference(prefs[DEFAULT_SSH_PLATFORM]),
++                    sshHostProbe = SshHostProbeMode.fromPreference(prefs[SSH_HOST_PROBE]),
++                    backupReminderConfig = decodePrefOrDefault(prefs[BACKUP_REMINDER_CONFIG], BackupReminderConfig()),
++                    backupEncryptionEnabled = prefs[BACKUP_ENCRYPTION_ENABLED] ?: false,
++                    backupEncryptionPasswordEnc = prefs[BACKUP_ENCRYPTION_PASSWORD_ENC] ?: "",
++                    launchCount = prefs[LAUNCH_COUNT] ?: 0,
++                    usagePricing = decodePrefOrDefault(prefs[USAGE_PRICING], UsagePricingSettings()),
++                )
++            }
+         }
+         .map {
+             val deletedDefaultIds = it.deletedBuiltInProviderIds
+@@ -640,6 +658,8 @@ subAgents = preferences[SUB_AGENTS]?.let { raw ->
+         // Preference decoding includes provider/model JSON and must not run on Main.
+         .flowOn(Dispatchers.IO)
+ 
++
++
+     private val transformLock = kotlinx.coroutines.sync.Mutex()
+     private val memoryRevision = AtomicLong(0)
+     private val initialization = CompletableDeferred<Unit>()
+@@ -716,6 +736,8 @@ subAgents = preferences[SUB_AGENTS]?.let { raw ->
+     )
+ 
+     /** 单个已存设置字段（键名，字符数），供安全模式列出超大字段。 */
++    /** 解析失败后被隔离的单个已存字段（用默认值代替，原始值见恢复快照）。 */
++
+     data class LargeStoredField(val keyName: String, val charCount: Int)
+ 
+     /** 订阅盘上超大字符串字段（默认 ≥ 1_000_000 字符），从大到小排序。实现见 OversizedStoredFields。 */
+@@ -728,6 +750,10 @@ subAgents = preferences[SUB_AGENTS]?.let { raw ->
+     private suspend fun persistSettings(settings: Settings, forceFullWrite: Boolean = false) {
+         if (settings.init) error("Cannot persist dummy Settings")
+         val previous = settingsFlow.value
++        // 内存基线仍是 warm seed（磁盘从未成功解码）时绝不能落盘：此时的 Settings
++        // 全是默认值，全量写回会把用户真实设置覆盖掉。调用方都应先 await 初始化，
++        // 走到这里说明已有别的环节出错，大声失败比静默毁数据好。
++        if (previous.init) error("Refusing to persist settings over an uninitialized (warm-seed) baseline")
+         memoryRevision.incrementAndGet()
+         settingsFlow.value = settings
+         saveWarmUiSettings(appContext, settings)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsQuarantine.kt b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsQuarantine.kt
+new file mode 100644
+index 000000000..1b2efe510
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/datastore/SettingsQuarantine.kt
+@@ -0,0 +1,215 @@
++package me.rerere.rikkahub.data.datastore
++
++import android.content.Context
++import androidx.datastore.preferences.core.Preferences
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++import me.rerere.rikkahub.data.log.AppLog
++import me.rerere.rikkahub.utils.JsonInstant
++import java.io.File
++import java.text.SimpleDateFormat
++import java.util.Date
++import java.util.Locale
++
++private const val TAG = "SettingsQuarantine"
++
++/** 恢复快照目录：隔离时把解码前的原始 prefs 原样拷贝一份，供人工恢复。 */
++private const val RECOVERY_DIR_NAME = "settings-recovery"
++
++/** 快照只留最近 5 份，避免坏字段反复触发时无界增长。 */
++private const val MAX_SNAPSHOTS_KEPT = 5
++
++/** 单个快照值最多记这么多字符，超大字段只留头部（仍可定位是哪个字段坏了）。 */
++private const val MAX_SNAPSHOT_VALUE_CHARS = 65_536
++
++/** 逐字段隔离的上限：超过这么多个坏字段就不再逐个试，直接按原来 fail-loud 处理。 */
++private const val MAX_QUARANTINED_FIELDS = 8
++
++/**
++ * 永不隔离的字段：值在落盘时走加密的键。
++ *
++ * 解密失败可能是暂时的（key 不可用、key 错了），密文本身可能完好、可恢复；把这类字段
++ * 按缺失处理（走默认值），随后一次写盘就会用默认值覆盖掉尚可恢复的密文——这正是
++ * `MediaGenerationSettingsPersistenceTest` 钉死的 destructive default fallback。
++ * 因此探针跳过这些键：它们坏了就按原来 fail-loud 处理（初始化失败、停在 warm seed，
++ * 更新与替换一律拒绝），而不是隔离。
++ * 清单口径 = 解码体里走 `decryptPrefValue` / `decodeEncryptedPrefOrDefault` /
++ * `decodeProvidersFieldEncrypted` 的键（见 PreferencesStore 解码体）；新增加密字段时
++ * 同步加进这里，否则它会默认可隔离。
++ */
++private val QUARANTINE_EXCLUDED_KEYS: Set<Preferences.Key<*>> =
++    setOf(
++        SettingsStore.MEDIA_GENERATION_PROVIDERS,
++        SettingsStore.PROVIDERS,
++        SettingsStore.NETWORK_SETTING,
++        SettingsStore.SEARCH_SERVICES,
++        SettingsStore.MCP_SERVERS,
++        SettingsStore.WEBDAV_CONFIG,
++        SettingsStore.S3_CONFIG,
++        SettingsStore.UPLOAD_S3_CONFIG,
++        SettingsStore.WEBDAV_CONFIGS,
++        SettingsStore.S3_CONFIGS,
++        SettingsStore.TTS_PROVIDERS,
++        SettingsStore.ASR_PROVIDERS,
++        SettingsStore.WEB_BRIDGE_PASSWORD,
++        SettingsStore.WEB_SERVER_ACCESS_PASSWORD,
++    )
++
++/** 一个被隔离的损坏字段：键名 + 解码失败原因 + 隔离时间。 */
++data class QuarantinedField(
++    val keyName: String,
++    val error: String,
++    val quarantinedAtMs: Long,
++)
++
++/**
++ * 隔离状态的持有者：放在 SettingsStore 外，避免它继续变大（detekt LargeClass）。
++ * SettingsStore 只留一个实例与几行委托。
++ */
++internal class SettingsQuarantineState(
++    private val context: Context,
++) {
++    private val _quarantinedFields = MutableStateFlow<List<QuarantinedField>>(emptyList())
++
++    /** 本次启动里被隔离的损坏字段；为空表示没有。 */
++    val quarantinedFields: StateFlow<List<QuarantinedField>> = _quarantinedFields.asStateFlow()
++
++    private val _quarantineSnapshot = MutableStateFlow<File?>(null)
++
++    /** 隔离时写下的原始值快照；没有隔离过时为 null。 */
++    val quarantineSnapshot: StateFlow<File?> = _quarantineSnapshot.asStateFlow()
++
++    /** 字段清掉后（见 [SettingsStore.resetStoredField]），同步去掉它的隔离记录，横幅随即消失。 */
++    fun clearQuarantinedField(keyName: String) {
++        _quarantinedFields.value = _quarantinedFields.value.filterNot { it.keyName == keyName }
++    }
++
++    /**
++     * 解码整份设置；单个字段损坏时不让整个加载失败。
++     *
++     * 正常情况直接返回 [decode] 的结果；单个（或少数几个）已存字段损坏时，先把原始 prefs
++     * 快照到恢复目录，再逐个试出坏字段（拿掉它就解得出来、或失败原因变了），坏字段按缺失
++     * 处理（走 schema 默认值），其余字段照常解码。隔离后初始化仍能成功，App 用真实设置
++     * （坏字段为默认值）运行，而不是停在 warm seed 上。
++     *
++     * fail-loud 语义保留在三处：[decodePersistedSetting] 本身仍对损坏的 present 值抛错；
++     * 坏字段太多、或失败与任何单个字段无关时，这里原样重抛，调用方按原来的降级路径处理；
++     * 解密类字段（[QUARANTINE_EXCLUDED_KEYS]）一律不隔离：解密失败可能是暂时的，
++     * 密文本身可能可恢复，默认回退 + 随后写盘会销毁它。
++     */
++    fun <T> decodeOrQuarantine(
++        preferences: Preferences,
++        decode: (Preferences) -> T,
++    ): T {
++        val result =
++            runCatching { decode(preferences) }.fold(
++                onSuccess = { QuarantinedDecode(it, emptyList(), null) },
++                onFailure = { failure ->
++                    if (failure is CancellationException) throw failure
++                    quarantineAfterFailure(context, preferences, decode, failure)
++                },
++            )
++        if (result.quarantined.isNotEmpty()) {
++            _quarantinedFields.value = result.quarantined
++            _quarantineSnapshot.value = result.snapshotFile
++            AppLog.e(
++                TAG,
++                "Settings decode quarantined fields: ${result.quarantined.map { it.keyName }}; " +
++                    "snapshot=${result.snapshotFile?.path}",
++            )
++        }
++        return result.value
++    }
++}
++
++/** 一次隔离解码的结果：解码出的设置 + 被隔离的字段 + 原始值快照（未隔离时为空 / null）。 */
++internal data class QuarantinedDecode<T>(
++    val value: T,
++    val quarantined: List<QuarantinedField>,
++    val snapshotFile: File?,
++)
++
++private fun <T> quarantineAfterFailure(
++    context: Context,
++    preferences: Preferences,
++    decode: (Preferences) -> T,
++    firstFailure: Throwable,
++): QuarantinedDecode<T> {
++    val snapshot = snapshotRawPreferences(context, preferences)
++    // toMutablePreferences 是 Preferences 接口的成员函数（DataStore 1.3），不用 import。
++    val remaining = preferences.toMutablePreferences()
++    val quarantined = mutableListOf<QuarantinedField>()
++    var lastFailure: Throwable = firstFailure
++    while (quarantined.size < MAX_QUARANTINED_FIELDS) {
++        runCatching { decode(remaining) }.fold(
++            onSuccess = { return QuarantinedDecode(it, quarantined, snapshot) },
++            onFailure = { failure ->
++                if (failure is CancellationException) throw failure
++                lastFailure = failure
++                val badKey = findImplicatedKey(remaining, decode, failure) ?: throw failure
++                remaining.remove(badKey)
++                quarantined +=
++                    QuarantinedField(
++                        keyName = badKey.name,
++                        error = failure.toString(),
++                        quarantinedAtMs = System.currentTimeMillis(),
++                    )
++            },
++        )
++    }
++    throw lastFailure
++}
++
++/**
++ * 在 [preferences] 里找出导致解码失败的那个键：逐个拿掉重解，
++ * 拿掉后能解出来、或失败原因变了（解码按固定顺序进行，先坏的字段先抛错），
++ * 就说明这个键是坏的。返回 null 表示失败与任何单个字段无关。
++ * 加密类字段（[QUARANTINE_EXCLUDED_KEYS]）不参与探针：它们坏了必须 fail-loud。
++ */
++private fun <T> findImplicatedKey(
++    preferences: Preferences,
++    decode: (Preferences) -> T,
++    baselineFailure: Throwable,
++): Preferences.Key<*>? {
++    val baseline = baselineFailure.toString()
++    for (key in preferences.asMap().keys) {
++        if (key in QUARANTINE_EXCLUDED_KEYS) continue
++        val trial = preferences.toMutablePreferences().apply { remove(key) }
++        val attempt = runCatching { decode(trial) }
++        if (attempt.isSuccess) return key
++        val trialFailure = attempt.exceptionOrNull() ?: continue
++        if (trialFailure is CancellationException) throw trialFailure
++        if (trialFailure.toString() != baseline) return key
++    }
++    return null
++}
++
++/**
++ * 把解码前的原始 prefs 原样拷贝到恢复目录（`filesDir/settings-recovery/`），
++ * 供人工恢复。只做最佳努力：快照失败绝不能再挡住解码本身。
++ */
++internal fun snapshotRawPreferences(context: Context, preferences: Preferences): File? =
++    runCatching {
++        val dir = File(context.filesDir, RECOVERY_DIR_NAME).apply { mkdirs() }
++        dir.listFiles()
++            ?.sortedByDescending { it.lastModified() }
++            ?.drop(MAX_SNAPSHOTS_KEPT - 1)
++            ?.forEach { it.delete() }
++        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
++        val file = File(dir, "settings-$stamp.json")
++        val entries =
++            preferences.asMap().entries.joinToString(",\n") { (key, value) ->
++                val raw =
++                    when (value) {
++                        is String -> value.take(MAX_SNAPSHOT_VALUE_CHARS)
++                        else -> value.toString()
++                    }
++                "\"${key.name}\": ${JsonInstant.encodeToString(raw)}"
++            }
++        file.writeText("{\n$entries\n}")
++        file
++    }.onFailure {
++        AppLog.e(TAG, "Failed to snapshot raw settings for quarantine", it)
++    }.getOrNull()
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt
+index 320044015..dc18ae333 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceCompletion.kt
+@@ -859,26 +859,38 @@ internal fun ChatService.cancelToolByUser(tool: UIMessagePart.Tool): UIMessagePa
+             approvalState = ToolApprovalState.Denied("Generation cancelled by user"),
+         )
+ 
+-internal suspend fun ChatService.finishInterruptedPendingTools(conversationId: Uuid) {
+-        val currentConversation = getConversationFlow(conversationId).value
+-        val lastNode = currentConversation.messageNodes.lastOrNull() ?: return
+-        val lastMessage = lastNode.currentMessage
+-        val updatedMessage = lastMessage.finishPendingTools(::cancelToolByUser)
+-        if (updatedMessage == lastMessage) {
+-            return
++/**
++ * 把一次中断里所有节点上悬挂的 Pending/Approved 工具定案为 Denied（取消）。
++ *
++ * 必须走遍全部节点、不能只处理末尾节点：分支 / regenerate 之后 Pending 工具可能
++ * 落在非末尾节点上；只定案末尾节点会让那些工具在历史里永远挂着 Pending，
++ * 与「已中断」的实际状态脱节。遍历口径与 [ChatService.stopGenerationImpl] 一致。
++ *
++ * 纯函数：返回 null 表示没有任何消息被改动，调用方无需落库。
++ */
++internal fun Conversation.finalizeInterruptedPendingTools(
++    finalize: (UIMessagePart.Tool) -> UIMessagePart.Tool,
++): Conversation? {
++    var finalizedMessages = 0
++    val updatedNodes =
++        messageNodes.map { node ->
++            node.copy(
++                messages =
++                    node.messages.map { message ->
++                        val next = message.finishPendingTools(finalize)
++                        if (next !== message) finalizedMessages++
++                        next
++                    },
++            )
+         }
++    return if (finalizedMessages == 0) null else copy(messageNodes = updatedNodes)
++}
+ 
+-        val updatedConversation =
+-            currentConversation.copy(
+-                messageNodes =
+-                    currentConversation.messageNodes.dropLast(1) +
+-                        lastNode.copy(
+-                            messages =
+-                                lastNode.messages.map { message ->
+-                                    if (message.id == lastMessage.id) updatedMessage else message
+-                                },
+-                        ),
+-            )
+-        saveConversation(conversationId, updatedConversation)
+-    }
++internal suspend fun ChatService.finishInterruptedPendingTools(conversationId: Uuid) {
++    val currentConversation = getConversationFlow(conversationId).value
++    val updatedConversation =
++        currentConversation.finalizeInterruptedPendingTools(::cancelToolByUser) ?: return
++    AppLog.i(TAG, "finishInterruptedPendingTools: finalized interrupted pending tools in $conversationId")
++    saveConversation(conversationId, updatedConversation)
++}
+ 
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/activity/SafeModeActivity.kt b/app/src/main/java/me/rerere/rikkahub/ui/activity/SafeModeActivity.kt
+index 06ce6fc3c..a2b375c6c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/activity/SafeModeActivity.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/activity/SafeModeActivity.kt
+@@ -8,6 +8,7 @@ import android.os.Bundle
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.activity.enableEdgeToEdge
++import androidx.core.content.FileProvider
+ import androidx.compose.foundation.horizontalScroll
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
+@@ -54,6 +55,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import kotlinx.coroutines.launch
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.RouteActivity
++import me.rerere.rikkahub.data.datastore.QuarantinedField
+ import me.rerere.rikkahub.data.datastore.Settings
+ import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.getCurrentAssistant
+@@ -62,6 +64,7 @@ import me.rerere.rikkahub.ui.hooks.writeStringPreference
+ import me.rerere.rikkahub.ui.theme.RikkahubTheme
+ import me.rerere.rikkahub.utils.CrashHandler
+ import org.koin.android.ext.android.inject
++import java.io.File
+ import kotlin.uuid.Uuid
+ 
+ class SafeModeActivity : ComponentActivity() {
+@@ -78,8 +81,13 @@ class SafeModeActivity : ComponentActivity() {
+                 val settings by settingsStore.settingsFlow.collectAsStateWithLifecycle()
+                 val largeFields by settingsStore.largeStoredFieldsFlow()
+                     .collectAsStateWithLifecycle(initialValue = emptyList())
++                val quarantinedFields by settingsStore.quarantinedFields
++                    .collectAsStateWithLifecycle(initialValue = emptyList())
++                val quarantineSnapshot by settingsStore.quarantineSnapshot
++                    .collectAsStateWithLifecycle(initialValue = null)
+                 var showAssistantPicker by remember { mutableStateOf(false) }
+                 var fieldToClear by remember { mutableStateOf<SettingsStore.LargeStoredField?>(null) }
++                var fieldToClearQuarantined by remember { mutableStateOf<QuarantinedField?>(null) }
+                 val scope = rememberCoroutineScope()
+                 val context = LocalContext.current
+ 
+@@ -140,6 +148,15 @@ class SafeModeActivity : ComponentActivity() {
+                             )
+                         }
+ 
++                        if (quarantinedFields.isNotEmpty()) {
++                            QuarantinedFieldsSection(
++                                quarantinedFields = quarantinedFields,
++                                snapshotFile = quarantineSnapshot,
++                                onClearRequest = { fieldToClearQuarantined = it },
++                                onExportSnapshot = { file -> shareSnapshot(context, file) },
++                            )
++                        }
++
+                         if (stackTrace != null) {
+                             CrashReportSection(stackTrace = stackTrace)
+                         }
+@@ -160,11 +177,26 @@ class SafeModeActivity : ComponentActivity() {
+ 
+                 fieldToClear?.let { field ->
+                     ClearFieldConfirmDialog(
+-                        field = field,
++                        fieldLabel = storedFieldLabel(field.keyName),
++                        textRes = R.string.safe_mode_clear_text,
+                         onConfirm = { scope.launch { settingsStore.resetStoredField(field.keyName) } },
+                         onDismiss = { fieldToClear = null },
+                     )
+                 }
++
++                fieldToClearQuarantined?.let { field ->
++                    ClearFieldConfirmDialog(
++                        fieldLabel = storedFieldLabel(field.keyName),
++                        textRes = R.string.safe_mode_quarantined_clear_text,
++                        onConfirm = {
++                            scope.launch {
++                                settingsStore.resetStoredField(field.keyName)
++                                settingsStore.clearQuarantinedField(field.keyName)
++                            }
++                        },
++                        onDismiss = { fieldToClearQuarantined = null },
++                    )
++                }
+             }
+         }
+     }
+@@ -248,18 +280,80 @@ private fun OversizedFieldsSection(
+     }
+ }
+ 
++@Composable
++private fun QuarantinedFieldsSection(
++    quarantinedFields: List<QuarantinedField>,
++    snapshotFile: File?,
++    onClearRequest: (QuarantinedField) -> Unit,
++    onExportSnapshot: (File) -> Unit,
++) {
++    Column(
++        modifier = Modifier.fillMaxWidth(),
++        verticalArrangement = Arrangement.spacedBy(8.dp),
++    ) {
++        Text(
++            text = stringResource(R.string.safe_mode_quarantined_desc),
++            style = MaterialTheme.typography.bodyMedium,
++            color = MaterialTheme.colorScheme.onSurfaceVariant,
++        )
++        CardGroup(
++            modifier = Modifier.fillMaxWidth(),
++            title = { Text(stringResource(R.string.safe_mode_quarantined_title)) },
++        ) {
++            quarantinedFields.forEach { field ->
++                item(
++                    onClick = { onClearRequest(field) },
++                    supportingContent = {
++                        Text(stringResource(R.string.safe_mode_quarantined_default))
++                    },
++                    trailingContent = {
++                        Text(
++                            stringResource(R.string.safe_mode_clear),
++                            color = MaterialTheme.colorScheme.error,
++                        )
++                    },
++                ) {
++                    Text(storedFieldLabel(field.keyName))
++                }
++            }
++            if (snapshotFile != null) {
++                item(
++                    onClick = { onExportSnapshot(snapshotFile) },
++                    supportingContent = {
++                        Text(snapshotFile.name)
++                    },
++                ) {
++                    Text(stringResource(R.string.safe_mode_quarantined_export))
++                }
++            }
++        }
++    }
++}
++
++private fun shareSnapshot(context: Context, file: File) {
++    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
++    val intent =
++        Intent(Intent.ACTION_SEND).apply {
++            type = "application/json"
++            putExtra(Intent.EXTRA_STREAM, uri)
++            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
++        }
++    context.startActivity(Intent.createChooser(intent, null))
++}
++
+ @Composable
+ private fun ClearFieldConfirmDialog(
+-    field: SettingsStore.LargeStoredField,
++    fieldLabel: String,
++    textRes: Int,
+     onConfirm: () -> Unit,
+     onDismiss: () -> Unit,
+ ) {
+     AlertDialog(
+         onDismissRequest = onDismiss,
+         title = {
+-            Text(stringResource(R.string.safe_mode_clear_title, storedFieldLabel(field.keyName)))
++            Text(stringResource(R.string.safe_mode_clear_title, fieldLabel))
+         },
+-        text = { Text(stringResource(R.string.safe_mode_clear_text)) },
++        text = { Text(stringResource(textRes)) },
+         confirmButton = {
+             TextButton(
+                 onClick = {
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+index dda0ccad5..ec5590d7d 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt
+@@ -65,10 +65,13 @@ import me.rerere.hugeicons.stroke.SmartPhone01
+ import me.rerere.hugeicons.stroke.Sun01
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.Screen
++import me.rerere.rikkahub.data.datastore.QuarantinedField
+ import me.rerere.rikkahub.data.datastore.Settings
++import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.datastore.isNotConfigured
+ import me.rerere.rikkahub.data.files.FilesManager
+ import me.rerere.rikkahub.skills.js.SkillSecretsStore
++import me.rerere.rikkahub.ui.activity.SafeModeActivity
+ import me.rerere.rikkahub.ui.components.nav.BackButton
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.cardGroupItemShape
+@@ -108,6 +111,9 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
+     val shortcutEntries by vm.shortcutEntries.collectAsStateWithLifecycle(initialValue = vm.shortcutEntriesNow())
+     val filesManager: FilesManager = koinInject()
+     val secretsStore: SkillSecretsStore = koinInject()
++    val settingsStore: SettingsStore = koinInject()
++    val quarantinedFields by settingsStore.quarantinedFields.collectAsStateWithLifecycle(initialValue = emptyList())
++    val context = LocalContext.current
+ 
+     Scaffold(
+         topBar = {
+@@ -164,6 +170,14 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
+                 }
+             }
+ 
++            if (quarantinedFields.isNotEmpty()) {
++                item {
++                    SettingsQuarantineWarningCard(fields = quarantinedFields) {
++                        context.startActivity(Intent(context, SafeModeActivity::class.java))
++                    }
++                }
++            }
++
+             item("settingsShortcuts") {
+                 SettingsShortcutBar(
+                     settings = settings,
+@@ -304,6 +318,28 @@ private fun SecurityDegradedWarningCard() {
+     }
+ }
+ 
++@Composable
++private fun SettingsQuarantineWarningCard(
++    fields: List<QuarantinedField>,
++    onReview: () -> Unit,
++) {
++    CardGroup {
++        item(
++            onClick = onReview,
++            colors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.errorContainer),
++            headlineContent = {
++                Text(stringResource(R.string.setting_page_settings_quarantined_title))
++            },
++            supportingContent = {
++                Text(stringResource(R.string.setting_page_settings_quarantined_desc, fields.size))
++            },
++            leadingContent = {
++                Icon(HugeIcons.Alert01, null)
++            },
++        )
++    }
++}
++
+ @Composable
+ private fun CardGroupScope.ColorModeRow(
+     containerColor: Color,
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index 114dc329a..881ba3bd5 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -1914,6 +1914,8 @@
+   <string name="setting_files_page_folder_avatars">الصور الرمزية</string>
+   <string name="setting_page_security_degraded_title">الجهاز لا يدعم التشفير الآمن</string>
+   <string name="setting_page_security_degraded_desc">جهازك لا يدعم التشفير الآمن بالعتاد، لذا تُخزَّن البيانات السرية بتشفير ضعيف</string>
++  <string name="setting_page_settings_quarantined_title">تعذّر تحميل بعض الإعدادات وتم عزلها</string>
++  <string name="setting_page_settings_quarantined_desc">تمت إعادة %1$d من الحقول التالفة إلى القيم الافتراضية. وتم حفظ القيم الأصلية — ويمكن مراجعتها في الوضع الآمن.</string>
+   <string name="setting_page_section_tools">أدوات خارجية</string>
+   <string name="setting_page_section_connection">الاتصال والواجهة الخلفية</string>
+   <string name="setting_page_section_security">الأمان والبيانات السرية</string>
+@@ -1957,6 +1959,11 @@
+   <string name="local_llm_vision_unavailable_caption">الجهاز لا يدعم الرؤية — وضع النص فقط</string>
+   <string name="safe_mode_enter_app">الدخول إلى التطبيق</string>
+   <string name="safe_mode_oversized_data">بيانات كبيرة الحجم</string>
++  <string name="safe_mode_quarantined_title">الإعدادات المعزولة</string>
++  <string name="safe_mode_quarantined_desc">تعذّر تحميل هذه الحقول، ويتم استخدام القيم الافتراضية. القيم الأصلية محفوظة في لقطة الاسترداد.</string>
++  <string name="safe_mode_quarantined_default">يتم استخدام القيمة الافتراضية</string>
++  <string name="safe_mode_quarantined_export">تصدير لقطة الاسترداد</string>
++  <string name="safe_mode_quarantined_clear_text">تعذّر تحميل هذا الحقل، ويتم استخدام قيمته الافتراضية بالفعل. سيؤدي المسح إلى حذف القيمة المخزنة التالفة نهائيًا.</string>
+   <string name="safe_mode_oversized_size">%1$.1f مليون حرف</string>
+   <string name="setting_browser_per_tool_timeout_desc">ميزانية زمنية صارمة لكل استدعاء لأداة المتصفح. النطاق من 10 ثوانٍ إلى 10 دقائق.</string>
+   <string name="setting_browser_per_tool_timeout_unit">ثانية</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 05139af73..c48f6d826 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -992,6 +992,8 @@
+   <string name="setting_page_config_api_title">請配置API和模型</string>
+   <string name="setting_page_security_degraded_title">裝置不支援安全加密</string>
+   <string name="setting_page_security_degraded_desc">你的裝置不支援硬件安全加密，憑證以弱加密方式儲存</string>
++  <string name="setting_page_settings_quarantined_title">部分設定已損壞並被隔離</string>
++  <string name="setting_page_settings_quarantined_desc">已將 %1$d 個損壞欄位恢復為預設值，原始值已儲存，可在安全模式中查看。</string>
+   <string name="setting_page_data_backup">資料備份</string>
+   <string name="setting_page_data_backup_desc">備份和恢復應用資料</string>
+   <string name="setting_page_data_settings">資料設定</string>
+@@ -2737,6 +2739,11 @@
+     <string name="local_llm_vision_unavailable_caption">此裝置不支援視覺功能 — 僅文字模式執行</string>
+     <string name="safe_mode_enter_app">進入應用</string>
+   <string name="safe_mode_oversized_data">超大設定資料</string>
++  <string name="safe_mode_quarantined_title">已隔離的設定</string>
++  <string name="safe_mode_quarantined_desc">以下欄位載入失敗，已使用預設值，原始值儲存在復原快照中。</string>
++  <string name="safe_mode_quarantined_default">已使用預設值</string>
++  <string name="safe_mode_quarantined_export">匯出復原快照</string>
++  <string name="safe_mode_quarantined_clear_text">該欄位載入失敗，目前已使用預設值。清除將永久刪除損壞的儲存值。</string>
+   <string name="safe_mode_oversized_size">%1$.1f 百萬字元</string>
+     <string name="setting_browser_per_tool_timeout_desc">每次瀏覽器工具呼叫的硬性時間預算。範圍 10 秒至 10 分鐘。</string>
+     <string name="setting_browser_per_tool_timeout_unit">秒</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index 7660de7c2..1ea7cc6d1 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -2397,6 +2397,8 @@
+   <string name="setting_files_page_folder_avatars">アバター</string>
+   <string name="setting_page_security_degraded_title">端末が安全な暗号化に対応していません</string>
+   <string name="setting_page_security_degraded_desc">お使いの端末はハードウェアセキュリティ暗号化に対応していないため、資格情報は弱い暗号化で保存されます</string>
++  <string name="setting_page_settings_quarantined_title">一部の設定が破損し隔離されました</string>
++  <string name="setting_page_settings_quarantined_desc">%1$d 件の破損した項目を既定値に戻しました。元の値は保存済みです。セーフモードで確認できます。</string>
+   <string name="setting_page_section_tools">外部ツール</string>
+   <string name="setting_page_section_connection">接続とバックエンド</string>
+   <string name="setting_page_section_security">セキュリティと資格情報</string>
+@@ -2440,6 +2442,11 @@
+   <string name="local_llm_vision_unavailable_caption">この端末は視覚機能に非対応 — テキストのみで動作</string>
+   <string name="safe_mode_enter_app">アプリを開く</string>
+   <string name="safe_mode_oversized_data">容量超過のデータ</string>
++  <string name="safe_mode_quarantined_title">隔離された設定</string>
++  <string name="safe_mode_quarantined_desc">これらの項目は読み込めなかったため既定値を使用しています。元の値は復旧スナップショットに保存されています。</string>
++  <string name="safe_mode_quarantined_default">既定値を使用中</string>
++  <string name="safe_mode_quarantined_export">復旧スナップショットを書き出す</string>
++  <string name="safe_mode_quarantined_clear_text">この項目は読み込めなかったため既定値を使用しています。消去すると損傷した保存値は完全に削除されます。</string>
+   <string name="safe_mode_oversized_size">%1$.1f 百万文字</string>
+   <string name="setting_browser_per_tool_timeout_desc">ブラウザツール呼び出し1回あたりの厳格な時間上限。範囲は 10 秒〜10 分。</string>
+   <string name="setting_browser_per_tool_timeout_unit">秒</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 7c7c41a68..ec3072dcf 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -2397,6 +2397,8 @@
+   <string name="setting_files_page_folder_avatars">아바타</string>
+   <string name="setting_page_security_degraded_title">기기가 안전한 암호화를 지원하지 않습니다</string>
+   <string name="setting_page_security_degraded_desc">기기가 하드웨어 보안 암호화를 지원하지 않아 자격 증명이 약한 암호화로 저장됩니다</string>
++  <string name="setting_page_settings_quarantined_title">일부 설정이 손상되어 격리되었습니다</string>
++  <string name="setting_page_settings_quarantined_desc">손상된 항목 %1$d개를 기본값으로 되돌렸습니다. 원래 값은 저장되어 있으며 안전 모드에서 확인할 수 있습니다.</string>
+   <string name="setting_page_section_tools">외부 도구</string>
+   <string name="setting_page_section_connection">연결 및 백엔드</string>
+   <string name="setting_page_section_security">보안 및 자격 증명</string>
+@@ -2440,6 +2442,11 @@
+   <string name="local_llm_vision_unavailable_caption">이 기기는 비전 기능을 지원하지 않음 — 텍스트 전용 모드</string>
+   <string name="safe_mode_enter_app">앱 열기</string>
+   <string name="safe_mode_oversized_data">대용량 데이터</string>
++  <string name="safe_mode_quarantined_title">격리된 설정</string>
++  <string name="safe_mode_quarantined_desc">이 항목들을 불러오지 못해 기본값을 사용하고 있습니다. 원래 값은 복구 스냅샷에 저장되어 있습니다.</string>
++  <string name="safe_mode_quarantined_default">기본값 사용 중</string>
++  <string name="safe_mode_quarantined_export">복구 스냅샷 내보내기</string>
++  <string name="safe_mode_quarantined_clear_text">이 항목을 불러오지 못해 기본값을 사용하고 있습니다. 지우면 손상된 저장 값이 영구히 삭제됩니다.</string>
+   <string name="safe_mode_oversized_size">%1$.1f백만 자</string>
+   <string name="setting_browser_per_tool_timeout_desc">브라우저 도구 호출 1회당 강제 시간 예산. 범위 10초~10분.</string>
+   <string name="setting_browser_per_tool_timeout_unit">초</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 27f01c442..a306fab27 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -2392,6 +2392,8 @@
+   <string name="setting_files_page_folder_avatars">Аватары</string>
+   <string name="setting_page_security_degraded_title">Устройство не поддерживает надёжное шифрование</string>
+   <string name="setting_page_security_degraded_desc">Устройство не поддерживает аппаратное шифрование — учётные данные хранятся со слабым шифрованием</string>
++  <string name="setting_page_settings_quarantined_title">Некоторые настройки повреждены и помещены в карантин</string>
++  <string name="setting_page_settings_quarantined_desc">Повреждённых полей сброшено к значениям по умолчанию: %1$d. Исходные значения сохранены — их можно посмотреть в безопасном режиме.</string>
+   <string name="setting_page_section_tools">Внешние инструменты</string>
+   <string name="setting_page_section_connection">Подключение и бэкенд</string>
+   <string name="setting_page_section_security">Безопасность и учётные данные</string>
+@@ -2435,6 +2437,11 @@
+   <string name="local_llm_vision_unavailable_caption">Устройство не поддерживает зрение — только текст</string>
+   <string name="safe_mode_enter_app">Открыть приложение</string>
+   <string name="safe_mode_oversized_data">Слишком большие данные</string>
++  <string name="safe_mode_quarantined_title">Настройки в карантине</string>
++  <string name="safe_mode_quarantined_desc">Эти поля не удалось загрузить, используются значения по умолчанию. Исходные значения сохранены в снимке восстановления.</string>
++  <string name="safe_mode_quarantined_default">Используется значение по умолчанию</string>
++  <string name="safe_mode_quarantined_export">Экспортировать снимок восстановления</string>
++  <string name="safe_mode_quarantined_clear_text">Это поле не удалось загрузить, уже используется значение по умолчанию. Очистка навсегда удалит повреждённое сохранённое значение.</string>
+   <string name="safe_mode_oversized_size">%1$.1f млн символов</string>
+   <string name="setting_browser_per_tool_timeout_desc">Жёсткий лимит времени на один вызов браузерного инструмента. От 10 секунд до 10 минут.</string>
+   <string name="setting_browser_per_tool_timeout_unit">сек</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index 01184eba6..7722deb6b 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -1181,6 +1181,8 @@
+   <string name="setting_page_config_api_title">请配置API和模型</string>
+   <string name="setting_page_security_degraded_title">设备不支持安全加密</string>
+   <string name="setting_page_security_degraded_desc">你的设备不支持硬件安全加密，凭据以弱加密方式存储</string>
++  <string name="setting_page_settings_quarantined_title">部分设置已损坏并被隔离</string>
++  <string name="setting_page_settings_quarantined_desc">已将 %1$d 个损坏字段恢复为默认值，原始值已保存，可在安全模式中查看。</string>
+   <string name="setting_page_data_backup">数据备份</string>
+   <string name="setting_page_data_backup_desc">备份和恢复应用数据</string>
+   <string name="setting_page_data_settings">数据设置</string>
+@@ -2616,6 +2618,11 @@
+   <string name="local_llm_vision_unavailable_caption">此设备不支持视觉功能 — 仅文本模式运行</string>
+   <string name="safe_mode_enter_app">进入应用</string>
+   <string name="safe_mode_oversized_data">超大设置数据</string>
++  <string name="safe_mode_quarantined_title">已隔离的设置</string>
++  <string name="safe_mode_quarantined_desc">以下字段加载失败，已使用默认值，原始值保存在恢复快照中。</string>
++  <string name="safe_mode_quarantined_default">已使用默认值</string>
++  <string name="safe_mode_quarantined_export">导出恢复快照</string>
++  <string name="safe_mode_quarantined_clear_text">该字段加载失败，目前已使用默认值。清除将永久删除损坏的存储值。</string>
+   <string name="safe_mode_oversized_size">%1$.1f 百万字符</string>
+   <string name="setting_browser_per_tool_timeout_desc">每次浏览器工具调用的硬性时间预算。范围 10 秒至 10 分钟。</string>
+   <string name="setting_browser_per_tool_timeout_unit">秒</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index a07307dd8..dd217ca7c 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -799,6 +799,11 @@
+   <string name="safe_mode_description">The app crashed on the last launch.</string>
+   <string name="safe_mode_enter_app">Enter App</string>
+   <string name="safe_mode_oversized_data">Oversized data</string>
++  <string name="safe_mode_quarantined_title">Quarantined settings</string>
++  <string name="safe_mode_quarantined_desc">These fields failed to load and are using defaults. The original values are saved in a recovery snapshot.</string>
++  <string name="safe_mode_quarantined_default">Using default value</string>
++  <string name="safe_mode_quarantined_export">Export recovery snapshot</string>
++  <string name="safe_mode_quarantined_clear_text">This field failed to load and is already using its default. Clearing removes the damaged stored value permanently.</string>
+   <string name="safe_mode_oversized_size">%1$.1f million characters</string>
+   <string name="safe_mode_switch_assistant">Switch Assistant</string>
+   <string name="safe_mode_title">Safe Mode</string>
+@@ -1195,6 +1200,8 @@
+   <string name="setting_page_config_api_title">Please configure API and model</string>
+   <string name="setting_page_security_degraded_title">Weak encryption in use</string>
+   <string name="setting_page_security_degraded_desc">Your device doesn\'t support hardware-backed encryption; credentials are stored with weak obfuscation</string>
++  <string name="setting_page_settings_quarantined_title">Some settings were damaged and quarantined</string>
++  <string name="setting_page_settings_quarantined_desc">%1$d damaged field(s) were reset to defaults. The original values were saved — review them in Safe Mode.</string>
+   <string name="setting_page_data_backup">Data Backup</string>
+   <string name="setting_page_data_backup_desc">Backup and restore app data</string>
+   <string name="setting_page_data_settings">Data Settings</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistryConfigLockTest.kt b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistryConfigLockTest.kt
+new file mode 100644
+index 000000000..aeedfb07c
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/ai/mcp/McpSessionRegistryConfigLockTest.kt
+@@ -0,0 +1,336 @@
++package me.rerere.rikkahub.data.ai.mcp
++
++import android.app.Application
++import android.os.Looper
++import androidx.datastore.core.DataStore
++import androidx.datastore.preferences.core.PreferenceDataStoreFactory
++import androidx.datastore.preferences.core.Preferences
++import androidx.datastore.preferences.core.edit
++import io.ktor.client.HttpClient
++import io.ktor.client.engine.okhttp.OkHttp
++import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
++import io.ktor.client.plugins.sse.SSE
++import io.ktor.serialization.kotlinx.json.json
++import io.pebbletemplates.pebble.PebbleEngine
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
++import kotlinx.serialization.json.Json
++import me.rerere.oauth.OAuthAuthorizationLauncher
++import me.rerere.oauth.OAuthHttpClient
++import me.rerere.oauth.OAuthLoopbackCallbackServer
++import me.rerere.rikkahub.AppScope
++import me.rerere.rikkahub.data.datastore.SettingsStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsKeyStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsSecurityProvider
++import me.rerere.rikkahub.utils.JsonInstant
++import okhttp3.OkHttpClient
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.koin.core.context.startKoin
++import org.koin.core.context.stopKoin
++import org.koin.dsl.module
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++import java.io.File
++import java.security.Security
++import java.util.concurrent.ConcurrentHashMap
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import javax.crypto.KeyGenerator
++import javax.crypto.SecretKey
++import kotlin.coroutines.Continuation
++import kotlin.coroutines.resumeWithException
++import kotlin.coroutines.suspendCoroutine
++import kotlin.uuid.Uuid
++
++/**
++ * 深挖-C7：`forceResync` 与 `reconnectAfterDelay` 对 `session.config` 的写
++ * 必须在 `lifecycleMutex` 内，否则 in-flight connectSession 会用旧的 syncedConfig
++ * 把刚写入的配置覆盖掉（tools-only 变更静默丢失）。
++ *
++ * 竞争本身不可靠复现，这里直接钉死不变量：测试先占住目标 session 的 lifecycleMutex，
++ * 再跑写配置的操作——锁没放之前配置必须纹丝不动，放锁之后才允许变新。
++ * 写在锁外时第一步断言即失败（配置已提前变成新值）。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [35], manifest = Config.NONE, application = Application::class)
++class McpSessionRegistryConfigLockTest {
++    private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var activeScope: AppScope? = null
++    private var activeDataStoreScope: CoroutineScope? = null
++    private lateinit var dataStore: DataStore<Preferences>
++    private lateinit var settingsFile: File
++    private lateinit var registry: McpSessionRegistry
++    private lateinit var store: SettingsStore
++    private var securityProvider: SyntheticSettingsSecurityProvider? = null
++
++    private val serverId = Uuid.parse("11111111-2222-4333-8444-555555555555")
++
++    private fun configA() =
++        McpServerConfig.SseTransportServer(
++            id = serverId,
++            commonOptions = McpCommonOptions(enable = true, name = "s1"),
++            url = "http://127.0.0.1:1/mcp",
++        )
++
++    private fun configB() =
++        McpServerConfig.SseTransportServer(
++            id = serverId,
++            commonOptions = McpCommonOptions(enable = true, name = "s1-renamed"),
++            url = "http://127.0.0.1:1/mcp",
++        )
++
++    /** Pump Android Main while real DataStore work proceeds on IO. No coroutine implementation is mocked. */
++    private fun <T> perform(block: suspend () -> T): Result<T> {
++        val task = workers.async { block() }
++        val deadline = System.nanoTime() + 30_000_000_000L
++        while (!task.isCompleted && System.nanoTime() < deadline) {
++            shadowOf(Looper.getMainLooper()).idle()
++            Thread.sleep(5)
++        }
++        check(task.isCompleted) { "Synthetic settings operation timed out" }
++        return runCatching { runBlocking { task.await() } }
++    }
++
++    private fun stopCollector() {
++        activeScope?.let { scope -> perform { scope.coroutineContext[Job]!!.cancelAndJoin() }.getOrThrow() }
++        activeScope = null
++    }
++
++    private fun stopDataStoreScope() {
++        activeDataStoreScope?.let { scope -> perform { scope.coroutineContext[Job]!!.cancelAndJoin() }.getOrThrow() }
++        activeDataStoreScope = null
++    }
++
++    private fun openStore(): SettingsStore {
++        val scope = AppScope()
++        activeScope = scope
++        return SettingsStore(RuntimeEnvironment.getApplication(), scope, dataStore)
++    }
++
++    private fun buildRegistry(store: SettingsStore): McpSessionRegistry {
++        // 目标地址 127.0.0.1:1 永远拒绝连接，但必须保证连接失败是“快失败”：
++        // callTimeout 给整次调用封顶（连接/读/等 SSE endpoint 事件都在内），
++        // NO_PROXY 排除测试 JVM 继承到的任何代理配置把回环连接劫走后静默挂起。
++        val okHttp =
++            OkHttpClient.Builder()
++                .proxy(java.net.Proxy.NO_PROXY)
++                .connectTimeout(2, TimeUnit.SECONDS)
++                .readTimeout(2, TimeUnit.SECONDS)
++                .callTimeout(2, TimeUnit.SECONDS)
++                .build()
++        val ktorClient =
++            HttpClient(OkHttp) {
++                engine { preconfigured = okHttp }
++                install(ContentNegotiation) {
++                    json(Json { prettyPrint = true; isLenient = true })
++                }
++                install(SSE)
++            }
++        val coordinator =
++            McpOAuthCoordinator(
++                settingsStore = store,
++                appScope = AppScope(),
++                oauthClient = OAuthHttpClient(okHttp),
++                discoveryClient = McpOAuthDiscoveryClient(okHttp),
++                callbackServer = OAuthLoopbackCallbackServer(),
++                authorizationLauncher = OAuthAuthorizationLauncher { _, _ -> },
++                updateStatus = { _, _ -> },
++            )
++        return McpSessionRegistry(store, AppScope(), ktorClient, coordinator, McpStatusStore())
++    }
++
++    private fun setupWithConfigA() {
++        val provider = SyntheticSettingsSecurityProvider()
++        securityProvider = provider
++        Security.insertProviderAt(provider, 1)
++        SyntheticSettingsKeyStore.key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
++        SyntheticSettingsKeyStore.unavailable = false
++        stopKoin()
++        startKoin { modules(module { single { PebbleEngine.Builder().build() } }) }
++        try {
++            val context: Application = RuntimeEnvironment.getApplication()
++            settingsFile = File(context.filesDir, "datastore/mcp-lock-test-${serverId}.preferences_pb")
++            val seedScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++            activeDataStoreScope = seedScope
++            dataStore = PreferenceDataStoreFactory.create(scope = seedScope, produceFile = { settingsFile })
++            perform {
++                dataStore.edit { values ->
++                    values.clear()
++                    values[SettingsStore.MCP_SERVERS] =
++                        JsonInstant.encodeToString<List<McpServerConfig>>(listOf(configA()))
++                }
++            }.getOrThrow()
++            store = openStore()
++            assertTrue("seeded store initializes", perform { store.awaitInitialized() }.isSuccess)
++            perform {
++                store.settingsFlow.first { it.mcpServers.any { server -> server.id == serverId } }
++            }.getOrThrow()
++            registry = buildRegistry(store)
++            // 127.0.0.1:1 直接拒绝连接：addClient 走完一次失败的 connect 即返回，session 留在表里。
++            perform { registry.addClient(configA()) }.getOrThrow()
++            assertEquals("s1", configOf(sessionOf(serverId)).commonOptions.name)
++        } catch (e: Throwable) {
++            teardown()
++            throw e
++        }
++    }
++
++    private fun teardown() {
++        runCatching { stopCollector() }
++        runCatching { stopDataStoreScope() }
++        runCatching { stopKoin() }
++        runCatching { workers.cancel() }
++        SyntheticSettingsKeyStore.key = null
++        SyntheticSettingsKeyStore.unavailable = false
++        securityProvider?.let { Security.removeProvider(it.name) }
++        securityProvider = null
++    }
++
++    private fun sessionOf(id: Uuid): Any {
++        val field = McpSessionRegistry::class.java.getDeclaredField("sessions").apply { isAccessible = true }
++        val sessions = field.get(registry) as? ConcurrentHashMap<*, *>
++            ?: error("sessions field is not a map")
++        return sessions[id] ?: error("No session for $id")
++    }
++
++    private fun configOf(session: Any): McpServerConfig {
++        val field = session.javaClass.getDeclaredField("config").apply { isAccessible = true }
++        return field.get(session) as McpServerConfig
++    }
++
++    private fun lockOf(session: Any): Mutex {
++        val field = session.javaClass.getDeclaredField("lifecycleMutex").apply { isAccessible = true }
++        return field.get(session) as Mutex
++    }
++
++    /**
++     * 从一个协程里占住 [mutex] 直到调用方放行（Mutex 必须由加锁的协程解锁，
++     * 所以不能由测试线程直接 lock）。
++     */
++    private fun holdLock(mutex: Mutex): Pair<Job, CountDownLatch> {
++        val locked = CountDownLatch(1)
++        val release = CountDownLatch(1)
++        val holder =
++            workers.launch {
++                mutex.withLock {
++                    locked.countDown()
++                    release.await()
++                }
++            }
++        assertTrue("test setup: lock holder never acquired the lock", locked.await(5, TimeUnit.SECONDS))
++        return holder to release
++    }
++
++    private fun pollUntil(timeoutMs: Long, check: () -> Boolean): Boolean {
++        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
++        while (System.nanoTime() < deadline) {
++            if (check()) return true
++            Thread.sleep(20)
++        }
++        return check()
++    }
++
++    private suspend fun invokeReconnectAfterDelay(session: Any, delayMs: Long) {
++        val method =
++            McpSessionRegistry::class.java.getDeclaredMethod(
++                "reconnectAfterDelay",
++                session.javaClass,
++                Long::class.javaPrimitiveType,
++                Continuation::class.java,
++            ).apply { isAccessible = true }
++        suspendCoroutine<Unit> { cont ->
++            try {
++                method.invoke(registry, session, delayMs, cont)
++            } catch (cancelled: CancellationException) {
++                throw cancelled
++            } catch (e: Throwable) {
++                cont.resumeWithException(e)
++            }
++        }
++    }
++
++    private fun switchSettingsToConfigB() {
++        perform {
++            dataStore.edit { values ->
++                values[SettingsStore.MCP_SERVERS] =
++                    JsonInstant.encodeToString<List<McpServerConfig>>(listOf(configB()))
++            }
++        }.getOrThrow()
++        perform {
++            store.settingsFlow.first { settings ->
++                settings.mcpServers.any { it.id == serverId && it.commonOptions.name == "s1-renamed" }
++            }
++        }.getOrThrow()
++    }
++
++    @Test
++    fun `forceResync waits for the lifecycle lock before adopting the new config`() {
++        setupWithConfigA()
++        try {
++            switchSettingsToConfigB()
++            val session = sessionOf(serverId)
++            val (holder, release) = holdLock(lockOf(session))
++            try {
++                val job = workers.async { registry.forceResync(serverId) }
++                val becameB =
++                    pollUntil(timeoutMs = 1000) {
++                        configOf(session).commonOptions.name == "s1-renamed"
++                    }
++                assertFalse("config must not change while the lifecycle lock is held", becameB)
++                assertTrue("forceResync must still be waiting for the lock", job.isActive)
++                release.countDown()
++                perform { job.await() }.getOrThrow()
++                assertEquals("s1-renamed", configOf(session).commonOptions.name)
++            } finally {
++                release.countDown()
++                perform { holder.join() }.getOrThrow()
++            }
++        } finally {
++            teardown()
++        }
++    }
++
++    @Test
++    fun `reconnectAfterDelay waits for the lifecycle lock before adopting the latest config`() {
++        setupWithConfigA()
++        try {
++            switchSettingsToConfigB()
++            val session = sessionOf(serverId)
++            val (holder, release) = holdLock(lockOf(session))
++            try {
++                val job = workers.async { invokeReconnectAfterDelay(session, 0L) }
++                val becameB =
++                    pollUntil(timeoutMs = 1000) {
++                        configOf(session).commonOptions.name == "s1-renamed"
++                    }
++                assertFalse("config must not change while the lifecycle lock is held", becameB)
++                assertTrue("reconnectAfterDelay must still be waiting for the lock", job.isActive)
++                release.countDown()
++                perform { job.await() }.getOrThrow()
++                assertEquals("s1-renamed", configOf(session).commonOptions.name)
++            } finally {
++                release.countDown()
++                perform { holder.join() }.getOrThrow()
++            }
++        } finally {
++            teardown()
++        }
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/datastore/SettingsQuarantineTest.kt b/app/src/test/java/me/rerere/rikkahub/data/datastore/SettingsQuarantineTest.kt
+new file mode 100644
+index 000000000..483905f08
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/datastore/SettingsQuarantineTest.kt
+@@ -0,0 +1,223 @@
++package me.rerere.rikkahub.data.datastore
++
++import android.app.Application
++import android.os.Looper
++import androidx.datastore.core.DataStore
++import androidx.datastore.preferences.core.MutablePreferences
++import androidx.datastore.preferences.core.PreferenceDataStoreFactory
++import androidx.datastore.preferences.core.Preferences
++import androidx.datastore.preferences.core.edit
++import io.pebbletemplates.pebble.PebbleEngine
++import java.io.File
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.cancel
++import kotlinx.coroutines.cancelAndJoin
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.runBlocking
++import me.rerere.rikkahub.AppScope
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.koin.core.context.startKoin
++import org.koin.core.context.stopKoin
++import org.koin.dsl.module
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++
++/**
++ * 深挖-E1：单个已存字段损坏时整库不再停在 warm seed 上——
++ * 坏字段被隔离（用默认值）、原始值快照到恢复目录、其余字段照常解码；
++ * 内存基线仍是 warm seed 时 persistSettings 拒绝落盘（防覆盖用户真实设置）。
++ * 只用真实 SettingsStore 与临时 DataStore 文件，不涉及 Room 与设备端。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [35], manifest = Config.NONE, application = Application::class)
++class SettingsQuarantineTest {
++    private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private var activeScope: AppScope? = null
++    private var activeDataStoreScope: CoroutineScope? = null
++    private lateinit var dataStore: DataStore<Preferences>
++    private lateinit var settingsFile: File
++
++    /** Pump Android Main while real DataStore work proceeds on IO. No coroutine implementation is mocked. */
++    private fun <T> perform(block: suspend () -> T): Result<T> {
++        val task = workers.async { block() }
++        val deadline = System.nanoTime() + 30_000_000_000L
++        while (!task.isCompleted && System.nanoTime() < deadline) {
++            shadowOf(Looper.getMainLooper()).idle()
++            Thread.sleep(5)
++        }
++        check(task.isCompleted) { "Synthetic settings operation timed out" }
++        return runCatching { runBlocking { task.await() } }
++    }
++
++    private fun stopCollector() {
++        activeScope?.let { scope -> perform { scope.coroutineContext[Job]!!.cancelAndJoin() }.getOrThrow() }
++        activeScope = null
++    }
++
++    private fun stopDataStoreScope() {
++        activeDataStoreScope?.let { scope -> perform { scope.coroutineContext[Job]!!.cancelAndJoin() }.getOrThrow() }
++        activeDataStoreScope = null
++    }
++
++    private fun openStore(fileName: String, seed: (MutablePreferences) -> Unit = {}): SettingsStore {
++        stopKoin()
++        startKoin { modules(module { single { PebbleEngine.Builder().build() } }) }
++        val context: Application = RuntimeEnvironment.getApplication()
++        settingsFile = File(context.filesDir, "datastore/$fileName")
++        val seedScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++        activeDataStoreScope = seedScope
++        dataStore = PreferenceDataStoreFactory.create(scope = seedScope, produceFile = { settingsFile })
++        perform {
++            dataStore.edit { values ->
++                values.clear()
++                values[SettingsStore.TITLE_PROMPT] = "Synthetic original title prompt"
++                seed(values)
++            }
++        }.getOrThrow()
++        val scope = AppScope()
++        activeScope = scope
++        return SettingsStore(context, scope, dataStore)
++    }
++
++    private fun teardown() {
++        runCatching { stopCollector() }
++        runCatching { stopDataStoreScope() }
++        runCatching { stopKoin() }
++        runCatching { workers.cancel() }
++    }
++
++    @Test
++    fun `one corrupt field is quarantined and the rest still loads`() {
++        val store =
++            openStore("quarantine-single.preferences_pb") { values ->
++                values[SettingsStore.ASSISTANTS] = "not-json"
++            }
++        try {
++            assertTrue("store initializes despite the corrupt field", perform { store.awaitInitialized() }.isSuccess)
++            val quarantined =
++                perform {
++                    store.quarantinedFields.first { it.isNotEmpty() }
++                }.getOrThrow()
++            assertEquals("only the corrupt field is quarantined", listOf("assistants"), quarantined.map { it.keyName })
++            assertEquals(
++                "title prompt survives the quarantine",
++                "Synthetic original title prompt",
++                store.settingsFlow.value.titlePrompt,
++            )
++            assertEquals(
++                "quarantined assistants fall back to the seeded defaults",
++                DEFAULT_ASSISTANTS,
++                store.settingsFlow.value.assistants,
++            )
++            val snapshot =
++                perform {
++                    store.quarantineSnapshot.first { it != null }
++                }.getOrThrow()
++            assertTrue("snapshot file exists", snapshot!!.exists())
++            assertTrue("snapshot keeps the raw corrupt value", snapshot.readText().contains("not-json"))
++        } finally {
++            teardown()
++        }
++    }
++
++    @Test
++    fun `two corrupt fields are both quarantined`() {
++        val store =
++            openStore("quarantine-double.preferences_pb") { values ->
++                values[SettingsStore.ASSISTANTS] = "not-json"
++                values[SettingsStore.SELECT_MODEL] = "not-a-uuid"
++            }
++        try {
++            assertTrue("store initializes despite two corrupt fields", perform { store.awaitInitialized() }.isSuccess)
++            val quarantined =
++                perform {
++                    store.quarantinedFields.first { it.size >= 2 }
++                }.getOrThrow()
++            assertEquals(
++                // 隔离记录记的是 Preferences.Key 的名字：SELECT_MODEL 的键名是 chat_model。
++                listOf("assistants", "chat_model"),
++                quarantined.map { it.keyName }.sorted(),
++            )
++            assertEquals(
++                "corrupt model id falls back to the auto model",
++                DEFAULT_AUTO_MODEL_ID,
++                store.settingsFlow.value.chatModelId,
++            )
++            assertEquals(
++                "title prompt survives the quarantine",
++                "Synthetic original title prompt",
++                store.settingsFlow.value.titlePrompt,
++            )
++        } finally {
++            teardown()
++        }
++    }
++
++    /**
++     * 加密字段坏值不隔离、仍 fail-loud：解密失败可能是暂时的（错 key / key 不可用），
++     * 密文本身可能完好；默认回退 + 随后写盘会销毁可恢复的密文。钉死
++     * `MediaGenerationSettingsPersistenceTest` 的同一契约在 quarantine 侧。
++     */
++    @Test
++    fun `corrupt media ciphertext stays fail-loud instead of being quarantined`() {
++        val store =
++            openStore("quarantine-encrypted-media.preferences_pb") { values ->
++                values[SettingsStore.MEDIA_GENERATION_PROVIDERS] = "synthetic-not-json-or-valid-base64!"
++            }
++        try {
++            assertTrue("corrupt media ciphertext must fail initialization", perform { store.awaitInitialized() }.isFailure)
++            assertTrue("no field is quarantined on the fail-loud path", store.quarantinedFields.value.isEmpty())
++            assertTrue("store stays on the warm seed", store.settingsFlow.value.init)
++        } finally {
++            teardown()
++        }
++    }
++
++    @Test
++    fun `corrupt providers value stays fail-loud instead of being quarantined`() {
++        val store =
++            openStore("quarantine-encrypted-providers.preferences_pb") { values ->
++                values[SettingsStore.PROVIDERS] = "not-json"
++            }
++        try {
++            assertTrue("corrupt providers value must fail initialization", perform { store.awaitInitialized() }.isFailure)
++            assertTrue("no field is quarantined on the fail-loud path", store.quarantinedFields.value.isEmpty())
++            assertTrue("store stays on the warm seed", store.settingsFlow.value.init)
++        } finally {
++            teardown()
++        }
++    }
++
++    @Test
++    fun `persistSettings refuses a warm-seed baseline instead of overwriting real settings`() {
++        val store = openStore("quarantine-guard.preferences_pb")
++        try {
++            assertTrue("store initializes", perform { store.awaitInitialized() }.isSuccess)
++            val good = store.settingsFlow.value
++            assertTrue("seeded settings are initialized", !good.init)
++            // 模拟“磁盘从未成功解码、内存仍是 warm seed”的状态。
++            store.settingsFlow.value = Settings.dummy()
++            val failure = perform { store.replaceSettings(good) }
++            assertTrue("persist must fail loudly", failure.isFailure)
++            assertTrue(
++                "failure names the warm-seed baseline, not a generic error",
++                failure.exceptionOrNull().toString().contains("warm-seed"),
++            )
++            assertTrue(
++                "no partial mutation: memory still holds the dummy baseline",
++                store.settingsFlow.value.init,
++            )
++        } finally {
++            teardown()
++        }
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/service/FinishInterruptedPendingToolsTest.kt b/app/src/test/java/me/rerere/rikkahub/service/FinishInterruptedPendingToolsTest.kt
+new file mode 100644
+index 000000000..f85213590
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/service/FinishInterruptedPendingToolsTest.kt
+@@ -0,0 +1,94 @@
++package me.rerere.rikkahub.service
++
++import me.rerere.ai.core.MessageRole
++import me.rerere.ai.ui.ToolApprovalState
++import me.rerere.ai.ui.UIMessage
++import me.rerere.ai.ui.UIMessagePart
++import me.rerere.rikkahub.data.model.Conversation
++import me.rerere.rikkahub.data.model.toMessageNode
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.uuid.Uuid
++
++/**
++ * [Conversation.finalizeInterruptedPendingTools] 必须走遍全部节点：
++ * 分支 / regenerate 之后 Pending 工具可能落在非末尾节点上，只处理末尾节点
++ * 会让那些工具在历史里永远挂着 Pending（深挖-S2）。
++ */
++class FinishInterruptedPendingToolsTest {
++
++    private fun tool(id: String, state: ToolApprovalState) =
++        UIMessagePart.Tool(
++            toolCallId = id,
++            toolName = "tool_$id",
++            input = "{}",
++            approvalState = state,
++        )
++
++    private fun message(vararg tools: UIMessagePart.Tool) =
++        UIMessage(role = MessageRole.ASSISTANT, parts = tools.toList())
++
++    /** 与生产侧 cancelToolByUser 同款口径：Pending/Approved 改写成 Denied。 */
++    private val finalize: (UIMessagePart.Tool) -> UIMessagePart.Tool = { part ->
++        part.copy(approvalState = ToolApprovalState.Denied("cancelled by user"))
++    }
++
++    private fun conversation(vararg nodes: UIMessage) =
++        Conversation(
++            assistantId = Uuid.random(),
++            messageNodes = nodes.map { it.toMessageNode() },
++        )
++
++    private fun UIMessage.tools() = parts.filterIsInstance<UIMessagePart.Tool>()
++
++    @Test
++    fun `pending tool on a non-last node is finalized`() {
++        val conv =
++            conversation(
++                message(tool("t1", ToolApprovalState.Pending)),
++                message(tool("t2", ToolApprovalState.Pending)),
++            )
++        val updated = conv.finalizeInterruptedPendingTools(finalize)
++        assertNotNull("non-last node must be finalized too", updated)
++        val states =
++            updated!!.messageNodes.flatMap { it.currentMessage.tools() }.map { it.approvalState }
++        assertEquals(2, states.size)
++        assertTrue(states.all { it is ToolApprovalState.Denied })
++    }
++
++    @Test
++    fun `approved tool on a non-last node is finalized`() {
++        val conv =
++            conversation(
++                message(tool("t1", ToolApprovalState.Approved())),
++                message(),
++            )
++        val updated = conv.finalizeInterruptedPendingTools(finalize)
++        assertNotNull(updated)
++        assertTrue(
++            updated!!.messageNodes[0].currentMessage.tools().single().approvalState is ToolApprovalState.Denied,
++        )
++        assertTrue(updated.messageNodes[1].currentMessage.parts.isEmpty())
++    }
++
++    @Test
++    fun `no pending tools returns null so the caller skips the save`() {
++        val conv = conversation(message(tool("t1", ToolApprovalState.Denied("no"))))
++        assertNull(conv.finalizeInterruptedPendingTools(finalize))
++    }
++
++    @Test
++    fun `denied and auto tools are left untouched`() {
++        val conv =
++            conversation(
++                message(
++                    tool("t1", ToolApprovalState.Denied("blocked")),
++                    tool("t2", ToolApprovalState.Auto),
++                ),
++            )
++        assertNull(conv.finalizeInterruptedPendingTools(finalize))
++    }
++}
