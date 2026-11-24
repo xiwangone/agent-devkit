@@ -24,7 +24,7 @@ on:
       base_sha:
         description: "rikkahub-agents base commit"
         required: true
-        default: "494592bf4863f48f56e41565a40a242d1f75e0ed"
+        default: "297bd64b568affad4d1b6a8c11904a5d3d66bf63"
       patch_ref:
         description: "本仓里放 patch 的分支"
         required: true
@@ -53,7 +53,7 @@ jobs:
     env:
       GRADLE_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8"
       _JAVA_OPTIONS: "-Djava.net.preferIPv4Stack=true"
-      BASE_SHA: ${{ github.event.inputs.base_sha || '494592bf4863f48f56e41565a40a242d1f75e0ed' }}
+      BASE_SHA: ${{ github.event.inputs.base_sha || '297bd64b568affad4d1b6a8c11904a5d3d66bf63' }}
       PATCH_REF: ${{ github.event.inputs.patch_ref || github.ref_name }}
       # 注意：dispatch 时 inputs.patch_path 取不到值会用声明的默认值；
       # push 触发时 inputs 整个为空，这里故意不写 || 默认值，
