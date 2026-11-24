@@ -1,0 +1,1952 @@
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/backend/BackendProvider.kt b/ai/src/main/java/me/rerere/ai/provider/providers/backend/BackendProvider.kt
+index 810ba2f15..885a8b345 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/backend/BackendProvider.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/backend/BackendProvider.kt
+@@ -28,6 +28,7 @@ import me.rerere.ai.ui.StreamChunk
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.ai.util.KeyRoulette
++import me.rerere.ai.util.ProviderKeyRefs
+ import me.rerere.ai.util.SHORT_REQUEST_CALL_TIMEOUT_MS
+ import me.rerere.common.log.AppLogger
+ import okhttp3.OkHttpClient
+@@ -64,7 +65,8 @@ class BackendProvider(
+     ) : this(
+         clientFactory = { setting ->
+             BackendApi(
+-                baseUrl = setting.baseUrl,
++                // baseUrl 可能是 $$名字.endpoint 引用：进 client 前先解析（未命中原样返回）
++                baseUrl = ProviderKeyRefs.expand(setting.baseUrl),
+                 username = setting.username,
+                 password = setting.password,
+                 token = setting.token,
+@@ -241,6 +243,7 @@ class BackendProvider(
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): Flow<StreamChunk> = flow {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         when (providerSetting.backendType) {
+             "custom" -> {
+                 streamCustomBackend(providerSetting, messages, params)
+@@ -256,12 +259,12 @@ class BackendProvider(
+         val api = api(providerSetting)
+         val fullInput = buildFullInput(messages)
+             ?: throw IllegalStateException("Backend streamText: no user text in the messages, cannot build the submission")
+-        val endpointLock = mutexForEndpoint(providerSetting.baseUrl)
++        val endpointLock = mutexForEndpoint(baseUrl)
+ 
+         endpointLock.withLock {
+             val sse =
+                 BackendSseClient(
+-                    baseUrl = providerSetting.baseUrl,
++                    baseUrl = baseUrl,
+                     username = providerSetting.username,
+                     password = providerSetting.password,
+                     token = providerSetting.token,
+@@ -320,9 +323,10 @@ class BackendProvider(
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ) {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val openaiSetting =
+             ProviderSetting.OpenAI(
+-                baseUrl = providerSetting.baseUrl,
++                baseUrl = baseUrl,
+                 // 自定义后端可以不设鉴权：空 token 不能原样传给 KeyRoulette（空 key 会直接抛错），
+                 // 给一个占位值，服务端不校验时会被忽略，需要鉴权的服务端仍会返回 401。
+                 apiKey = providerSetting.token.ifBlank { "unused" },
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/claude/ClaudeProvider.kt b/ai/src/main/java/me/rerere/ai/provider/providers/claude/ClaudeProvider.kt
+index f3e57d738..cef2c2902 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/claude/ClaudeProvider.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/claude/ClaudeProvider.kt
+@@ -59,6 +59,7 @@ import me.rerere.ai.ui.metadataAs
+ import me.rerere.ai.ui.toMetadata
+ import me.rerere.ai.util.HttpException
+ import me.rerere.ai.util.KeyRoulette
++import me.rerere.ai.util.ProviderKeyRefs
+ import me.rerere.ai.util.configureReferHeaders
+ import me.rerere.ai.util.configureSessionHeaders
+ import me.rerere.ai.util.encodeBase64
+@@ -308,8 +309,9 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
+ 
+     override suspend fun listModels(providerSetting: ProviderSetting.Claude): List<Model> =
+         withContext(Dispatchers.IO) {
++            val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+             val request = Request.Builder()
+-                .url("${providerSetting.baseUrl}/models")
++                .url("${baseUrl}/models")
+                 .addHeader("x-api-key", keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString()))
+                 .addHeader("anthropic-version", ANTHROPIC_VERSION)
+                 .get()
+@@ -344,7 +346,7 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
+                     logListModelsFailure(providerSetting, request, 200, errMsg)
+                     error("Failed to get models: $errMsg")
+                 }
+-                if (providerSetting.baseUrl.contains("api.minimax.io", ignoreCase = true)) {
++                if (baseUrl.contains("api.minimax.io", ignoreCase = true)) {
+                     AppLogger.w(
+                         TAG,
+                         "listModels: using Minimax fallback model list snapshot " +
+@@ -403,15 +405,16 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): TextGenerationResult {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody = buildMessageRequest(providerSetting, messages, params)
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}/messages")
++            .url("${baseUrl}/messages")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+             .addHeader("x-api-key", keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString()))
+             .addHeader("anthropic-version", ANTHROPIC_VERSION)
+-            .configureReferHeaders(providerSetting.baseUrl)
+-            .configureSessionHeaders(providerSetting.baseUrl, params.sessionId)
++            .configureReferHeaders(baseUrl)
++            .configureSessionHeaders(baseUrl, params.sessionId)
+             .build()
+ 
+         if (Logging.isDebugLoggingEnabled()) {
+@@ -454,16 +457,17 @@ class ClaudeProvider(private val client: OkHttpClient, context: Context? = null)
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): Flow<StreamChunk> = callbackFlow {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody = buildMessageRequest(providerSetting, messages, params, stream = true)
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}/messages")
++            .url("${baseUrl}/messages")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+             .addHeader("x-api-key", keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString()))
+             .addHeader("anthropic-version", ANTHROPIC_VERSION)
+             .addHeader("Content-Type", "application/json")
+-            .configureReferHeaders(providerSetting.baseUrl)
+-            .configureSessionHeaders(providerSetting.baseUrl, params.sessionId)
++            .configureReferHeaders(baseUrl)
++            .configureSessionHeaders(baseUrl, params.sessionId)
+             .build()
+ 
+         if (Logging.isDebugLoggingEnabled()) {
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/google/GoogleProvider.kt b/ai/src/main/java/me/rerere/ai/provider/providers/google/GoogleProvider.kt
+index 348bef501..3643c5236 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/google/GoogleProvider.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/google/GoogleProvider.kt
+@@ -127,9 +127,10 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+         (!vertexAI || (useServiceAccount && location in VERTEX_INTERACTIONS_LOCATIONS))
+ 
+     private fun buildUrl(providerSetting: ProviderSetting.Google, path: String): HttpUrl {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         return if (!providerSetting.vertexAI) {
+-            "${providerSetting.baseUrl}/$path".toHttpUrlOrNull()
+-                ?: throw IllegalArgumentException("Invalid Google baseUrl: '${providerSetting.baseUrl}'")
++            "${baseUrl}/$path".toHttpUrlOrNull()
++                ?: throw IllegalArgumentException("Invalid Google baseUrl: '${baseUrl}'")
+         } else if (providerSetting.useServiceAccount) {
+             // projectId / location 是用户填的值，非法字符直接拼进 URL 会让 toHttpUrl() 抛错：
+             // 先校验，报错时明确指出是哪个字段非法，与非 Vertex 分支的口径一致。
+@@ -273,6 +274,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): TextGenerationResult = withContext(Dispatchers.IO) {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         if (providerSetting.usesInteractionsApi()) {
+             return@withContext interactionsAPI.generateText(providerSetting, messages, params)
+         }
+@@ -297,7 +299,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+                 .post(
+                     json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
+                 )
+-                .configureReferHeaders(providerSetting.baseUrl)
++                .configureReferHeaders(baseUrl)
+                 .build()
+         )
+ 
+@@ -345,6 +347,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): Flow<StreamChunk> = callbackFlow {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody = buildCompletionRequestBody(messages, params)
+ 
+         val url = buildUrl(
+@@ -365,7 +368,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+                 .post(
+                     json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
+                 )
+-                .configureReferHeaders(providerSetting.baseUrl)
++                .configureReferHeaders(baseUrl)
+                 .build()
+         )
+ 
+@@ -950,6 +953,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+         require(providerSetting is ProviderSetting.Google) {
+             "Expected Google provider setting"
+         }
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+ 
+         val items = withContext(Dispatchers.IO) {
+             val requestBody = buildJsonObject {
+@@ -987,7 +991,7 @@ class GoogleProvider(private val client: OkHttpClient, context: Context? = null)
+                     .post(
+                         json.encodeToString(requestBody).toRequestBody("application/json".toMediaType())
+                     )
+-                    .configureReferHeaders(providerSetting.baseUrl)
++                    .configureReferHeaders(baseUrl)
+                     .build()
+             )
+ 
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/google/InteractionsAPI.kt b/ai/src/main/java/me/rerere/ai/provider/providers/google/InteractionsAPI.kt
+index 04ebb2519..56fa8c262 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/google/InteractionsAPI.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/google/InteractionsAPI.kt
+@@ -47,6 +47,7 @@ import me.rerere.ai.ui.UIMessageAnnotation
+ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.ai.ui.metadataAs
+ import me.rerere.ai.ui.toMetadata
++import me.rerere.ai.util.ProviderKeyRefs
+ import me.rerere.ai.util.configureReferHeaders
+ import me.rerere.ai.util.configureSessionHeaders
+ import me.rerere.ai.util.encodeBase64
+@@ -82,7 +83,7 @@ internal val VERTEX_INTERACTIONS_LOCATIONS = setOf("global", "us", "eu")
+  * Vertex 走 `/v1/projects/{project}/locations/{location}/interactions`，us/eu 多区域使用各自的 rep 域名。
+  */
+ internal fun ProviderSetting.Google.interactionsUrl(): String {
+-    if (!vertexAI) return "${baseUrl.trimEnd('/')}/interactions"
++    if (!vertexAI) return "${ProviderKeyRefs.expand(baseUrl).trimEnd('/')}/interactions"
+     val host = if (location == "global") "aiplatform.googleapis.com" else "aiplatform.$location.rep.googleapis.com"
+     return "https://$host/v1/projects/$projectId/locations/$location/interactions"
+ }
+@@ -216,13 +217,14 @@ internal class InteractionsAPI(
+         params: TextGenerationParams,
+         requestBody: JsonObject,
+     ): Request {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val url = providerSetting.interactionsUrl()
+         val request = Request.Builder()
+             .url(url)
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .configureSessionHeaders(url, params.sessionId)
+             .method("POST", json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+-            .configureReferHeaders(providerSetting.baseUrl)
++            .configureReferHeaders(baseUrl)
+             .build()
+         return authorize(providerSetting, request)
+     }
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
+index 6e48bd039..c4be01846 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ChatCompletionsAPI.kt
+@@ -45,6 +45,7 @@ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.ai.ui.metadataAs
+ import me.rerere.ai.util.HttpException
+ import me.rerere.ai.util.KeyRoulette
++import me.rerere.ai.util.ProviderKeyRefs
+ import me.rerere.ai.util.configureReferHeaders
+ import me.rerere.ai.util.configureSessionHeaders
+ import me.rerere.ai.util.encodeBase64
+@@ -87,6 +88,7 @@ class ChatCompletionsAPI(
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): TextGenerationResult = withContext(Dispatchers.IO) {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody =
+             buildChatCompletionRequest(
+                 messages = messages,
+@@ -95,12 +97,12 @@ class ChatCompletionsAPI(
+             )
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
++            .url("${baseUrl}${providerSetting.chatCompletionsPath}")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+             .addHeader("Authorization", "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}")
+-            .configureReferHeaders(providerSetting.baseUrl)
+-            .configureSessionHeaders(providerSetting.baseUrl, params.sessionId)
++            .configureReferHeaders(baseUrl)
++            .configureSessionHeaders(baseUrl, params.sessionId)
+             .build()
+ 
+         if (Logging.isDebugLoggingEnabled()) {
+@@ -140,6 +142,7 @@ class ChatCompletionsAPI(
+         messages: List<UIMessage>,
+         params: TextGenerationParams,
+     ): Flow<StreamChunk> = callbackFlow {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody = buildChatCompletionRequest(
+             messages = messages,
+             params = params,
+@@ -148,13 +151,13 @@ class ChatCompletionsAPI(
+         )
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
++            .url("${baseUrl}${providerSetting.chatCompletionsPath}")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+             .addHeader("Authorization", "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}")
+             .addHeader("Content-Type", "application/json")
+-            .configureReferHeaders(providerSetting.baseUrl)
+-            .configureSessionHeaders(providerSetting.baseUrl, params.sessionId)
++            .configureReferHeaders(baseUrl)
++            .configureSessionHeaders(baseUrl, params.sessionId)
+             .build()
+ 
+         if (Logging.isDebugLoggingEnabled()) {
+@@ -283,7 +286,8 @@ class ChatCompletionsAPI(
+         providerSetting: ProviderSetting.OpenAI,
+         stream: Boolean = false,
+     ): JsonObject {
+-        val host = providerSetting.baseUrl.toHttpUrlOrNull()?.host
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
++        val host = baseUrl.toHttpUrlOrNull()?.host
+         val isOpenRouter = host == "openrouter.ai"
+         // OpenRouter prompt caching: add per-block cache_control breakpoints for every model.
+         // Anthropic/Gemini/Qwen need them explicitly; providers that cache automatically
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt
+index 26c547be0..4d0741ec0 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/OpenAIProvider.kt
+@@ -32,6 +32,7 @@ import me.rerere.ai.ui.ImageGenerationItem
+ import me.rerere.ai.ui.StreamChunk
+ import me.rerere.ai.ui.UIMessage
+ import me.rerere.ai.util.KeyRoulette
++import me.rerere.ai.util.ProviderKeyRefs
+ import me.rerere.ai.util.configureReferHeaders
+ import me.rerere.ai.util.json
+ import me.rerere.ai.util.MAX_LOCAL_READ_BYTES
+@@ -108,16 +109,17 @@ class OpenAIProvider(
+ 
+     override suspend fun listModels(providerSetting: ProviderSetting.OpenAI): List<Model> =
+         withContext(Dispatchers.IO) {
++            val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+             // 短请求单独收紧超时：共享 client 没有 callTimeout，/models 卡住时模型页最长转圈 10 分钟。
+             val shortClient = client.shortRequestClient()
+             val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+             // OpenRouter's /models returns text-output models only by default, which hides the
+             // image-only models (FLUX, Recraft, Seedream, ...) and the video-only models
+             // (Sora, Veo, ...). Ask for text, image and video explicitly.
+-            val modelsUrl = if (providerSetting.baseUrl.contains("openrouter.ai")) {
+-                "${providerSetting.baseUrl}/models?output_modalities=text,image,video"
++            val modelsUrl = if (baseUrl.contains("openrouter.ai")) {
++                "${baseUrl}/models?output_modalities=text,image,video"
+             } else {
+-                "${providerSetting.baseUrl}/models"
++                "${baseUrl}/models"
+             }
+             val request = Request.Builder()
+                 .url(modelsUrl)
+@@ -154,7 +156,7 @@ class OpenAIProvider(
+                     logListModelsFailure(providerSetting, request, 200, errMsg)
+                     error("Failed to get models: $errMsg")
+                 }
+-                if (providerSetting.baseUrl.contains("api.minimax.io", ignoreCase = true)) {
++                if (baseUrl.contains("api.minimax.io", ignoreCase = true)) {
+                     AppLogger.w(
+                         TAG,
+                         "listModels: using Minimax fallback model list snapshot " +
+@@ -167,7 +169,7 @@ class OpenAIProvider(
+                 error("Failed to get models: response has no `data` field")
+             }
+ 
+-            val isOpenRouter = providerSetting.baseUrl.contains("openrouter.ai", ignoreCase = true)
++            val isOpenRouter = baseUrl.contains("openrouter.ai", ignoreCase = true)
+             data.mapNotNull { modelJson ->
+                 val modelObj = modelJson.jsonObject
+                 if (isOpenRouter) {
+@@ -190,13 +192,14 @@ class OpenAIProvider(
+         }
+ 
+     override suspend fun getBalance(providerSetting: ProviderSetting.OpenAI): String = withContext(Dispatchers.IO) {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         // 短请求单独收紧超时（同 listModels）。
+         val shortClient = client.shortRequestClient()
+         val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+         val url = if (providerSetting.balanceOption.apiPath.startsWith("http")) {
+             providerSetting.balanceOption.apiPath
+         } else {
+-            "${providerSetting.baseUrl}${providerSetting.balanceOption.apiPath}"
++            "${baseUrl}${providerSetting.balanceOption.apiPath}"
+         }
+         val request = Request.Builder()
+             .url(url)
+@@ -253,6 +256,7 @@ class OpenAIProvider(
+         providerSetting: ProviderSetting.OpenAI,
+         params: EmbeddingGenerationParams
+     ): EmbeddingGenerationResult = withContext(Dispatchers.IO) {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         require(params.input.isNotEmpty()) { "Embedding input cannot be empty" }
+ 
+         val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+@@ -271,7 +275,7 @@ class OpenAIProvider(
+         )
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}/embeddings")
++            .url("${baseUrl}/embeddings")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .addHeader("Authorization", "Bearer $key")
+             .addHeader("Content-Type", "application/json")
+@@ -307,6 +311,7 @@ class OpenAIProvider(
+         require(providerSetting is ProviderSetting.OpenAI) {
+             "Expected OpenAI provider setting"
+         }
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+ 
+         val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
+ 
+@@ -316,7 +321,7 @@ class OpenAIProvider(
+         // when /images itself 404s/405s (an OpenRouter-compatible proxy without it) - decided
+         // once, on the first attempt, and reused for the rest. Neither path takes `n` (see
+         // buildOpenRouterImagesRequestBody), so count > 1 is emulated with sequential calls.
+-        if (providerSetting.baseUrl.contains("openrouter.ai", ignoreCase = true)) {
++        if (baseUrl.contains("openrouter.ai", ignoreCase = true)) {
+             var useChatCompletionsFallback = false
+             val items = withContext(Dispatchers.IO) {
+                 collectSequentialImages(params.numOfImages.coerceAtLeast(1)) {
+@@ -342,7 +347,7 @@ class OpenAIProvider(
+                 // xAI rejects the OpenAI `size` parameter with a 400 (upstream issue #1602),
+                 // so leave it off for Grok and let the endpoint pick its own dimensions.
+                 // 只匹配 x.ai 本身及其子域名，避免 "xxx-max.ai" 之类的中转域名被误判
+-                val host = providerSetting.baseUrl.toHttpUrlOrNull()?.host?.lowercase()
++                val host = baseUrl.toHttpUrlOrNull()?.host?.lowercase()
+                 val isGrok = host == "x.ai" || host?.endsWith(".x.ai") == true ||
+                     params.model.modelId.contains("grok", ignoreCase = true)
+                 if (!isGrok) {
+@@ -371,12 +376,12 @@ class OpenAIProvider(
+         }
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}/images/generations")
++            .url("${baseUrl}/images/generations")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .addHeader("Authorization", "Bearer $key")
+             .addHeader("Content-Type", "application/json")
+             .post(requestBody.toRequestBody("application/json".toMediaType()))
+-            .configureReferHeaders(providerSetting.baseUrl)
++            .configureReferHeaders(baseUrl)
+             .build()
+ 
+         val items = withContext(Dispatchers.IO) {
+@@ -403,6 +408,7 @@ class OpenAIProvider(
+         key: String,
+         inputReferences: List<String> = emptyList(),
+     ): List<ImageGenerationItem>? {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val body = buildOpenRouterImagesRequestBody(
+             model = params.model,
+             prompt = params.prompt,
+@@ -411,12 +417,12 @@ class OpenAIProvider(
+         ).mergeCustomBody(params.customBody)
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}/images")
++            .url("${baseUrl}/images")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .addHeader("Authorization", "Bearer $key")
+             .addHeader("Content-Type", "application/json")
+             .post(json.encodeToString(body).toRequestBody("application/json".toMediaType()))
+-            .configureReferHeaders(providerSetting.baseUrl)
++            .configureReferHeaders(baseUrl)
+             .build()
+ 
+         val response = client.newCall(request).await()
+@@ -434,6 +440,7 @@ class OpenAIProvider(
+         params: ImageGenerationParams,
+         key: String,
+     ): List<ImageGenerationItem> {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val body = buildOpenRouterChatCompletionsImageBody(
+             modelId = params.model.modelId,
+             prompt = params.prompt,
+@@ -441,12 +448,12 @@ class OpenAIProvider(
+         ).mergeCustomBody(params.customBody)
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
++            .url("${baseUrl}${providerSetting.chatCompletionsPath}")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .addHeader("Authorization", "Bearer $key")
+             .addHeader("Content-Type", "application/json")
+             .post(json.encodeToString(body).toRequestBody("application/json".toMediaType()))
+-            .configureReferHeaders(providerSetting.baseUrl)
++            .configureReferHeaders(baseUrl)
+             .build()
+ 
+         val response = client.newCall(request).await()
+@@ -464,6 +471,7 @@ class OpenAIProvider(
+         key: String,
+         inputReferences: List<String>,
+     ): List<ImageGenerationItem> {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val body = buildOpenRouterChatCompletionsImageBody(
+             modelId = params.model.modelId,
+             prompt = params.prompt,
+@@ -472,12 +480,12 @@ class OpenAIProvider(
+         ).mergeCustomBody(params.customBody)
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
++            .url("${baseUrl}${providerSetting.chatCompletionsPath}")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .addHeader("Authorization", "Bearer $key")
+             .addHeader("Content-Type", "application/json")
+             .post(json.encodeToString(body).toRequestBody("application/json".toMediaType()))
+-            .configureReferHeaders(providerSetting.baseUrl)
++            .configureReferHeaders(baseUrl)
+             .build()
+ 
+         val response = client.newCall(request).await()
+@@ -500,12 +508,13 @@ class OpenAIProvider(
+         }
+ 
+         val key = keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+ 
+         // Same dedicated-endpoint-first, chat-completions-fallback rule as generateImage
+         // (decided once, on the first attempt), with the source images always sent as
+         // input_references (data URIs) - their presence is the edit request itself, not a
+         // capability to gate on. `n` is never sent; count > 1 is sequential calls.
+-        if (providerSetting.baseUrl.contains("openrouter.ai", ignoreCase = true)) {
++        if (baseUrl.contains("openrouter.ai", ignoreCase = true)) {
+             val inputReferences = withContext(Dispatchers.IO) {
+                 params.images.map { path ->
+                     val file = File(path)
+@@ -575,11 +584,11 @@ class OpenAIProvider(
+         }
+ 
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}/images/edits")
++            .url("${baseUrl}/images/edits")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .addHeader("Authorization", "Bearer $key")
+             .post(bodyBuilder.build())
+-            .configureReferHeaders(providerSetting.baseUrl)
++            .configureReferHeaders(baseUrl)
+             .build()
+ 
+         val items = withContext(Dispatchers.IO) {
+diff --git a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt
+index 4ad731d16..185afe942 100644
+--- a/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt
++++ b/ai/src/main/java/me/rerere/ai/provider/providers/openai/ResponseAPI.kt
+@@ -49,6 +49,7 @@ import me.rerere.ai.ui.UIMessagePart
+ import me.rerere.ai.ui.metadataAs
+ import me.rerere.ai.ui.toMetadata
+ import me.rerere.ai.util.KeyRoulette
++import me.rerere.ai.util.ProviderKeyRefs
+ import me.rerere.ai.util.configureReferHeaders
+ import me.rerere.ai.util.configureSessionHeaders
+ import me.rerere.ai.util.encodeBase64
+@@ -195,6 +196,7 @@ class ResponseAPI(
+         messages: List<UIMessage>,
+         params: TextGenerationParams
+     ): TextGenerationResult = withContext(Dispatchers.IO) {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody = buildRequestBody(
+             providerSetting = providerSetting,
+             messages = messages,
+@@ -202,7 +204,7 @@ class ResponseAPI(
+             stream = false,
+         )
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}${providerSetting.responsesPath}")
++            .url("${baseUrl}${providerSetting.responsesPath}")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+             .addHeader(
+@@ -210,8 +212,8 @@ class ResponseAPI(
+                 "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}"
+             )
+             .addHeader("Content-Type", "application/json")
+-            .configureReferHeaders(providerSetting.baseUrl)
+-            .configureSessionHeaders(providerSetting.baseUrl, params.sessionId)
++            .configureReferHeaders(baseUrl)
++            .configureSessionHeaders(baseUrl, params.sessionId)
+             .build()
+ 
+         if (Logging.isDebugLoggingEnabled()) {
+@@ -237,6 +239,7 @@ class ResponseAPI(
+         messages: List<UIMessage>,
+         params: TextGenerationParams
+     ): Flow<StreamChunk> = callbackFlow {
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
+         val requestBody = buildRequestBody(
+             providerSetting = providerSetting,
+             messages = messages,
+@@ -244,15 +247,15 @@ class ResponseAPI(
+             stream = true,
+         )
+         val request = Request.Builder()
+-            .url("${providerSetting.baseUrl}${providerSetting.responsesPath}")
++            .url("${baseUrl}${providerSetting.responsesPath}")
+             .headers(providerSetting.mergeCustomHeaders(params.customHeaders))
+             .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+             .addHeader(
+                 "Authorization",
+                 "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}"
+             )
+-            .configureReferHeaders(providerSetting.baseUrl)
+-            .configureSessionHeaders(providerSetting.baseUrl, params.sessionId)
++            .configureReferHeaders(baseUrl)
++            .configureSessionHeaders(baseUrl, params.sessionId)
+             .build()
+ 
+         if (Logging.isDebugLoggingEnabled()) {
+@@ -434,7 +437,8 @@ class ResponseAPI(
+         params: TextGenerationParams,
+         stream: Boolean
+     ): JsonObject {
+-        val host = providerSetting.baseUrl.toHttpUrlOrNull()?.host
++        val baseUrl = ProviderKeyRefs.expand(providerSetting.baseUrl)
++        val host = baseUrl.toHttpUrlOrNull()?.host
+         val capabilities = resolveResponseProviderCapabilities(host)
+         return buildJsonObject {
+             put("model", params.model.modelId)
+diff --git a/ai/src/test/java/me/rerere/ai/util/ProviderKeyRefsTest.kt b/ai/src/test/java/me/rerere/ai/util/ProviderKeyRefsTest.kt
+index 27b6e44f6..49748836a 100644
+--- a/ai/src/test/java/me/rerere/ai/util/ProviderKeyRefsTest.kt
++++ b/ai/src/test/java/me/rerere/ai/util/ProviderKeyRefsTest.kt
+@@ -108,4 +108,29 @@ class ProviderKeyRefsTest {
+         ProviderKeyRefs.resolve = { null }
+         assertEquals("\$\$MISSING", KeyRoulette.default().next("\$\$MISSING", "p1"))
+     }
++
++    // ── 带字段的引用（`$$名字.endpoint`：端点入库后请求处按它解析）────────────
++
++    @Test
++    fun `dotted field reference resolves through the injected resolver`() {
++        ProviderKeyRefs.resolve = { name ->
++            when (name) {
++                "QINIUYUN.endpoint" -> "https://api.qiniu.com/v1"
++                else -> null
++            }
++        }
++        assertEquals("https://api.qiniu.com/v1", ProviderKeyRefs.expand("\$\$QINIUYUN.endpoint"))
++    }
++
++    @Test
++    fun `unresolved field reference is kept verbatim`() {
++        ProviderKeyRefs.resolve = { null }
++        assertEquals("\$\$QINIUYUN.endpoint", ProviderKeyRefs.expand("\$\$QINIUYUN.endpoint"))
++    }
++
++    @Test
++    fun `plain url is returned as is even with a resolver installed`() {
++        ProviderKeyRefs.resolve = { "SHOULD_NOT_BE_USED" }
++        assertEquals("https://api.openai.com/v1", ProviderKeyRefs.expand("https://api.openai.com/v1"))
++    }
+ }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/backend/BackendInteractionNotifier.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/backend/BackendInteractionNotifier.kt
+index 956db8418..49f0b3ef4 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/backend/BackendInteractionNotifier.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/backend/BackendInteractionNotifier.kt
+@@ -27,6 +27,7 @@ import me.rerere.ai.provider.providers.backend.BackendInteractionHandler
+ import me.rerere.ai.ui.AskQuestion
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.log.AppLog
++import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
+ 
+ /**
+  * Backend 富事件的交互桥：把 serve 的 approval_request / ask_request 转成系统通知，
+@@ -329,7 +330,8 @@ class BackendInteractionNotifier(
+ 
+     private fun api(setting: ProviderSetting.Backend) =
+         BackendApi(
+-            baseUrl = setting.baseUrl,
++            // baseUrl 可能是 $$名字.endpoint 引用：进 client 前先解析（未命中原样返回）
++            baseUrl = VaultProviderKeyRefs.resolveValue(setting.baseUrl),
+             username = setting.username,
+             // 与 token 一致：支持 `$$凭证名` 引用（未命中保持原样，便于暴露配置错误）
+             password = me.rerere.rikkahub.data.vault.VaultProviderKeyRefs.resolveValue(setting.password),
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+index 5606ff0e4..8d555bdf5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/network/NetworkRouting.kt
+@@ -3,6 +3,7 @@ package me.rerere.rikkahub.data.network
+ import kotlinx.serialization.SerialName
+ import kotlinx.serialization.Serializable
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
+ import java.net.URI
+ 
+ /**
+@@ -151,14 +152,14 @@ fun isOnDeviceProvider(provider: ProviderSetting): Boolean = when (provider) {
+  * (on-device inference) return an empty list: they make no network requests.
+  */
+ fun providerEndpointHosts(provider: ProviderSetting): List<String> = when (provider) {
+-    is ProviderSetting.OpenAI -> listOfNotNull(provider.baseUrl.toHostOrNull())
++    is ProviderSetting.OpenAI -> listOfNotNull(VaultProviderKeyRefs.resolveValue(provider.baseUrl).toHostOrNull())
+     is ProviderSetting.Google -> listOfNotNull(
+-        provider.baseUrl.toHostOrNull(),
++        VaultProviderKeyRefs.resolveValue(provider.baseUrl).toHostOrNull(),
+         // Vertex AI and the OAuth token endpoint share the googleapis.com suffix.
+         ".googleapis.com",
+     )
+-    is ProviderSetting.Claude -> listOfNotNull(provider.baseUrl.toHostOrNull())
+-    is ProviderSetting.Backend -> listOfNotNull(provider.baseUrl.toHostOrNull())
++    is ProviderSetting.Claude -> listOfNotNull(VaultProviderKeyRefs.resolveValue(provider.baseUrl).toHostOrNull())
++    is ProviderSetting.Backend -> listOfNotNull(VaultProviderKeyRefs.resolveValue(provider.baseUrl).toHostOrNull())
+     // Account-based providers use fixed SaaS domains (no user-configurable baseUrl).
+     is ProviderSetting.Codex -> listOf("chatgpt.com", "api.openai.com")
+     is ProviderSetting.Grok -> listOf("api.x.ai")
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizer.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizer.kt
+new file mode 100644
+index 000000000..ab04171ea
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizer.kt
+@@ -0,0 +1,93 @@
++package me.rerere.rikkahub.data.vault
++
++import android.icu.text.Transliterator
++import java.text.Normalizer
++
++/**
++ * 凭证名的规范化（纯函数，与仓库解耦，便于单测）。
++ *
++ * 背景：旧的 [CredentialVaultRepository.normalizeName] 用 `[^A-Z0-9_]+` 一刀切，
++ * 中文名整段被换成下划线、最后只剩 `CRED` —— 所有纯中文名导入都撞到同一个名字，
++ * 后一个还会覆盖前一个的值。这里先把中文转拼音再折叠（七牛云 → QINIUYUN），
++ * 只有实在拼不出来的字符才按旧规则丢弃。
++ */
++internal object CredentialNameNormalizer {
++
++    /** 拼音转换覆盖的汉字区段：扩展 A / 统一表意 / 兼容表意。 */
++    private fun Char.isCjk(): Boolean =
++        code in 0x3400..0x4DBF || code in 0x4E00..0x9FFF || code in 0xF900..0xFAFF
++
++    /** Han-Latin 音译器（惰性创建；平台不可用时为 null，调用方回退旧行为，不抛异常）。 */
++    private val hanLatinTransliterator: Transliterator? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
++        runCatching { Transliterator.getInstance("Han-Latin") }.getOrNull()
++    }
++
++    /**
++     * 把中文转成不带声调的拼音（其余字符原样保留）。
++     *
++     * - 无汉字时直接返回原串（不碰音译器：纯 JVM 单测与纯英文名都不受影响）；
++     * - 音译器不可用（纯 JVM 环境）或转换失败时返回原串，由后续正则按旧规则处理；
++     * - [transliterate] 仅供单测注入假音译；生产路径用默认实现。
++     */
++    fun transliterate(raw: String, transliterator: (String) -> String = ::defaultTransliterate): String =
++        transliterator(raw)
++
++    private fun defaultTransliterate(raw: String): String {
++        if (raw.none { it.isCjk() }) return raw
++        val transliterator = hanLatinTransliterator ?: return raw
++        val latin = runCatching { synchronized(transliterator) { transliterator.transliterate(raw) } }.getOrNull()
++            ?: return raw
++        // 去声调：NFD 分解后删掉组合标记（ā → a + ̄ → a；lü → lu）。
++        return Normalizer.normalize(latin, Normalizer.Form.NFD).replace(Regex("\\p{Mn}+"), "")
++    }
++
++    /**
++     * 折叠成大写蛇形片段（不含前缀与空值回退，供编辑器输入时逐字调用）。
++     *
++     * 与旧行为一致：非法字符折成下划线；编辑器里空格同样折成下划线（边输边规范化，
++     * 保存时不再二次变形）。
++     */
++    fun foldNameChars(raw: String, transliterate: (String) -> String = ::defaultTransliterate): String =
++        transliterate(raw).uppercase().replace(Regex("[^A-Z0-9_ ]"), "_").replace(" ", "_")
++
++    /**
++     * 把任意输入规范化成合规凭证名（`^[A-Z][A-Z0-9_]*$`，最长 64 字符）。
++     *
++     * 用于"粘贴即入库"：用户往往直接粘一段描述或小写名，这里统一转拼音 + 大写蛇形，
++     * 非法字符折成下划线；首字符不是字母时补前缀，保证结果始终合法。
++     */
++    fun normalizeName(raw: String, transliterate: (String) -> String = ::defaultTransliterate): String {
++        val folded = foldNameChars(raw, transliterate).replace(Regex("[^A-Z0-9_]+"), "_").trim('_')
++        // 没有任何可用字符（空串 / 纯符号 / 纯中文但音译不可用）→ 明确标"未命名"，
++        // 而不是落到裸 CRED（旧代码的 `CRED_$folded` 再 trim 会把 `CRED_` 削成 `CRED`，
++        // 于是 `CRED_UNNAMED` 这个兜底永远走不到）。
++        if (folded.isEmpty()) return "CRED_UNNAMED"
++        val prefixed = if (!folded[0].isLetter()) "CRED_$folded" else folded
++        return prefixed.take(64).trim('_').ifEmpty { "CRED_UNNAMED" }
++    }
++
++    /**
++     * 是否退化名：输入里没有任何可用字符时 `normalizeName` 的兜底产物。
++     *
++     * `CRED`（空/纯中文/纯符号输入）、`CRED_UNNAMED`，以及同名碰撞后加的数字后缀
++     * （`CRED_2`……）——这类名字不携带任何凭证信息，重导带新名时应被改名而不是复用。
++     */
++    fun isDegenerateName(name: String): Boolean =
++        name == "CRED" || name == "CRED_UNNAMED" || name.matches(Regex("^CRED_[0-9]+$"))
++
++    /**
++     * 在已占用的名字里找一个未被占用的变体（`BASE`、`BASE_2`、`BASE_3`……）。
++     *
++     * 后缀计入 64 字符上限（超长时截断本体再拼后缀，不会超长）。
++     */
++    suspend fun uniqueName(base: String, isTaken: suspend (String) -> Boolean): String {
++        if (!isTaken(base)) return base
++        var n = 2
++        while (true) {
++            val suffix = "_$n"
++            val candidate = base.take((64 - suffix.length).coerceAtLeast(0)).trimEnd('_') + suffix
++            if (!isTaken(candidate)) return candidate
++            n++
++        }
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt
+index 2826e3802..73caed4fb 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/CredentialVaultRepository.kt
+@@ -29,11 +29,16 @@ import me.rerere.rikkahub.data.log.AppLog
+  * @param name 最终使用的凭证名（可能复用已有条目）
+  * @param reusedExisting 是否**复用**了库内已有的同值条目（避免重复入库）
+  * @param type 最终类型（显式传入或自动推断）
++ * @param renamedFrom 同值已存在、但旧名是退化名（`CRED`）时改名的旧名；
++ *   调用方据此同步配置里的引用（`$$旧名` → `$$新名`），否则旧引用静默失效
++ * @param endpointStored 本次是否把端点存进了条目的 `endpoint` 元数据
+  */
+ data class QuickImportResult(
+     val name: String,
+     val reusedExisting: Boolean,
+     val type: String,
++    val renamedFrom: String? = null,
++    val endpointStored: Boolean = false,
+ )
+ 
+ /**
+@@ -192,7 +197,12 @@ class CredentialVaultRepository(
+         rawValue: String,
+         preferredName: String,
+         description: String = "",
+-        group: String = "Other",
++        /** 为空 = 不指定（新建时回退 "Other"，改名时保留旧分组）。 */
++        group: String = "",
++        /** 显式类型（提供商 apiKey 传 "api-key"）；为空则按既有规则推断。 */
++        type: String = "",
++        /** 一并入库的端点（存进 `endpoint` 元数据）；为空不写。 */
++        endpoint: String? = null,
+     ): QuickImportResult {
+         val sanitized = CredentialValueSanitizer.sanitize(rawValue)
+         require(sanitized.isNotBlank()) { "Credential value is empty or only invisible characters" }
+@@ -208,23 +218,79 @@ class CredentialVaultRepository(
+             }
+         }
+ 
++        val desiredBase = CredentialNameNormalizer.normalizeName(preferredName)
++        val endpointMeta = endpoint?.takeIf { it.isNotBlank() }
++
+         // 查重：同值已在库里就直接复用，顺带避免用户重复粘贴造成多份副本
+         val sameName = findSameValueNames(sanitized).firstOrNull()
+         if (sameName != null) {
+             val existing = dao.getByName(sameName)
++            var endpointStored = false
++            // 重导带新端点时并入已有条目的元数据（不改值；与旧键合并，不丢旧元数据）
++            if (endpointMeta != null && existing != null) {
++                val mergedMeta = CredentialMeta.encode(
++                    CredentialMeta.decode(existing.metaJson) + ("endpoint" to endpointMeta),
++                )
++                if (mergedMeta != existing.metaJson) {
++                    save(
++                        name = sameName,
++                        value = "",
++                        description = existing.description,
++                        group = existing.grp,
++                        publicKey = existing.publicKey,
++                        type = existing.type,
++                        metaJson = mergedMeta,
++                    )
++                }
++                endpointStored = true
++            }
++            // 退化名不静默复用：同值已存在、但名字是 CRED 这类兜底产物，且新名字不同时改名。
++            // （旧行为直接复用旧名，于是"改拼音重导还是 CRED"，只能手动删了重导才生效。）
++            if (existing != null && CredentialNameNormalizer.isDegenerateName(sameName) && desiredBase != sameName) {
++                val newName = CredentialNameNormalizer.uniqueName(desiredBase) { dao.getByName(it) != null }
++                val carriedMeta = CredentialMeta.encode(
++                    CredentialMeta.decode(existing.metaJson) +
++                        listOfNotNull(endpointMeta?.let { "endpoint" to it }),
++                )
++                save(
++                    name = newName,
++                    value = sanitized,
++                    description = description.ifBlank { existing.description },
++                    group = group.ifBlank { existing.grp },
++                    publicKey = existing.publicKey,
++                    type = type.ifBlank { existing.type },
++                    metaJson = carriedMeta,
++                )
++                // 引用同步由调用方在 renamedFrom != null 时做（只改库内会让配置里的旧引用失效）
++                delete(existing)
++                logAccess(sameName, "repository", "rename_from")
++                logAccess(newName, "repository", "rename_to")
++                return QuickImportResult(
++                    name = newName,
++                    reusedExisting = true,
++                    type = dao.getByName(newName)?.type.orEmpty(),
++                    renamedFrom = sameName,
++                    endpointStored = endpointStored,
++                )
++            }
+             return QuickImportResult(
+                 name = sameName,
+                 reusedExisting = true,
+                 type = existing?.type.orEmpty(),
++                endpointStored = endpointStored,
+             )
+         }
+ 
+-        val name = normalizeName(preferredName)
+-        save(name = name, value = sanitized, description = description, group = group)
++        // 新建：同名不同值时加 _2/_3 后缀，不再静默覆盖（旧行为直接 save 同名覆盖旧值，
++        // 于是两个中文提供商导入都叫 CRED，后一个的值悄悄顶掉前一个）。
++        val name = CredentialNameNormalizer.uniqueName(desiredBase) { dao.getByName(it) != null }
++        val metaJson = endpointMeta?.let { CredentialMeta.encode(mapOf("endpoint" to it)) }.orEmpty()
++        save(name = name, value = sanitized, description = description, group = group, type = type, metaJson = metaJson)
+         return QuickImportResult(
+             name = name,
+             reusedExisting = false,
+             type = dao.getByName(name)?.type.orEmpty(),
++            endpointStored = endpointMeta != null,
+         )
+     }
+ 
+@@ -666,14 +732,10 @@ class CredentialVaultRepository(
+         /**
+          * 把任意输入规范化成合规凭证名（`^[A-Z][A-Z0-9_]*$`）。
+          *
+-         * 用于"粘贴即入库"：用户往往直接粘一段描述或小写名，这里统一转大写蛇形，
+-         * 非法字符折成下划线；首字符不是字母时补前缀，保证结果始终合法。
++         * 实现见 [CredentialNameNormalizer]：中文先转拼音再折叠（七牛云 → QINIUYUN），
++         * 而不是旧的"非法字符一刀切"（中文整段被换成下划线、最后只剩 `CRED`）。
+          */
+-        fun normalizeName(raw: String): String {
+-            val folded = raw.trim().uppercase().replace(Regex("[^A-Z0-9_]+"), "_").trim('_')
+-            val prefixed = if (folded.isEmpty() || !folded[0].isLetter()) "CRED_$folded" else folded
+-            return prefixed.take(64).trim('_').ifEmpty { "CRED_UNNAMED" }
+-        }
++        fun normalizeName(raw: String): String = CredentialNameNormalizer.normalizeName(raw)
+ 
+         /** 校验凭证名是否合规。空名/小写/连字符/空格/中文均不合规。 */
+         fun validateCredentialName(name: String): Boolean =
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultReferenceSync.kt b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultReferenceSync.kt
+index 7fdffcf1f..82ba2d10c 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/vault/VaultReferenceSync.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/vault/VaultReferenceSync.kt
+@@ -44,9 +44,19 @@ object VaultReferenceSync {
+     /** 提供方配置里与凭证相关的字段，逐个做引用替换（值不做任何其它改动）。 */
+     private fun renameInProvider(provider: ProviderSetting, oldName: String, newName: String): ProviderSetting =
+         when (provider) {
+-            is ProviderSetting.OpenAI -> provider.copy(apiKey = renameInText(provider.apiKey, oldName, newName))
+-            is ProviderSetting.Claude -> provider.copy(apiKey = renameInText(provider.apiKey, oldName, newName))
+-            is ProviderSetting.Google -> provider.copy(apiKey = renameInText(provider.apiKey, oldName, newName))
++            is ProviderSetting.OpenAI -> provider.copy(
++                apiKey = renameInText(provider.apiKey, oldName, newName),
++                // baseUrl 也可能是 $$名字.endpoint 引用（端点入库后），改名时一并同步，否则引用静默失效
++                baseUrl = renameInText(provider.baseUrl, oldName, newName),
++            )
++            is ProviderSetting.Claude -> provider.copy(
++                apiKey = renameInText(provider.apiKey, oldName, newName),
++                baseUrl = renameInText(provider.baseUrl, oldName, newName),
++            )
++            is ProviderSetting.Google -> provider.copy(
++                apiKey = renameInText(provider.apiKey, oldName, newName),
++                baseUrl = renameInText(provider.baseUrl, oldName, newName),
++            )
+             is ProviderSetting.Backend ->
+                 provider.copy(
+                     token = renameInText(provider.token, oldName, newName),
+diff --git a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt
+index f336de138..cd5fa32de 100644
+--- a/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt
++++ b/app/src/main/java/me/rerere/rikkahub/service/ChatServiceSendOps.kt
+@@ -31,6 +31,7 @@ import me.rerere.rikkahub.data.model.Conversation
+ import me.rerere.rikkahub.data.model.localFileUrls
+ import me.rerere.rikkahub.data.model.replaceRegexes
+ import me.rerere.rikkahub.data.model.toMessageNode
++import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
+ import kotlin.uuid.Uuid
+ 
+ 
+@@ -660,7 +661,8 @@ internal suspend fun ChatService.cancelBackendGenerationIfNeeded(conversationId:
+         val target = byExecution ?: byModel ?: return
+         runCatching {
+             me.rerere.ai.provider.providers.backend.BackendApi(
+-                baseUrl = target.baseUrl,
++                // baseUrl 可能是 $$名字.endpoint 引用：进 client 前先解析（未命中原样返回）
++                baseUrl = VaultProviderKeyRefs.resolveValue(target.baseUrl),
+                 username = target.username,
+                 password = target.password,
+                 token = target.token,
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt b/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt
+index 1f328fa02..ebf191f2f 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/components/vault/SecretRefField.kt
+@@ -26,9 +26,13 @@ import me.rerere.hugeicons.stroke.Key01
+ import me.rerere.hugeicons.stroke.View
+ import me.rerere.hugeicons.stroke.ViewOff
+ import me.rerere.rikkahub.R
++import me.rerere.rikkahub.data.datastore.SettingsStore
+ import me.rerere.rikkahub.data.db.entity.VaultCredentialEntity
++import me.rerere.rikkahub.data.repository.SshHostRepository
++import me.rerere.rikkahub.data.telegram.TelegramBotPreferences
+ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+ import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
++import me.rerere.rikkahub.data.vault.VaultReferenceSync
+ import me.rerere.rikkahub.ui.components.setting.bringIntoViewOnFocus
+ import org.koin.compose.koinInject
+ 
+@@ -69,8 +73,28 @@ fun SecretRefField(
+      * 选择器打开时会预筛到该类型，避免跨用途误选。
+      */
+     typeHint: String? = null,
++    /**
++     * 快速入库时的分组提示（提供商 apiKey → `"AI"`；为空则不指定，
++     * 新建时回退 "Other"、改名时保留旧分组）。
++     */
++    groupHint: String = "",
++    /**
++     * 快速入库时的显式类型（提供商 apiKey → `"api-key"`；为空则按既有规则推断）。
++     * 与 [typeHint] 不同：[typeHint] 只筛选择器，[importType] 决定入库类型。
++     */
++    importType: String = "",
++    /** 快速入库时一并存进 `endpoint` 元数据的端点；为空不写。 */
++    endpointHint: String? = null,
++    /**
++     * 端点已入库时的回调（同时带上本次的密钥引用）。
++     * 调用方用一次编辑同时写密钥与端点，避免两次编辑互相覆盖。
++     */
++    onEndpointStored: ((apiKeyRef: String, endpointRef: String) -> Unit)? = null,
+ ) {
+     val repository: CredentialVaultRepository = koinInject()
++    val settingsStore: SettingsStore = koinInject()
++    val sshHostRepository: SshHostRepository = koinInject()
++    val telegramBotPreferences: TelegramBotPreferences = koinInject()
+     val scope = rememberCoroutineScope()
+ 
+     var entries by remember { mutableStateOf<List<VaultCredentialEntity>>(emptyList()) }
+@@ -153,11 +177,40 @@ fun SecretRefField(
+                                         description = description?.takeIf { it.isNotBlank() }
+                                             ?: label?.takeIf { it.isNotBlank() }
+                                             ?: nameHint,
++                                        group = groupHint,
++                                        type = importType,
++                                        endpoint = endpointHint,
+                                     )
+                                 }.onSuccess { r ->
+                                     onValueChange(REF_PREFIX + r.name)
+-                                    // 复用已有条目时用不同符号，让用户知道没有产生重复
+-                                    notice = if (r.reusedExisting) "♻ ${r.name}" else "✅ ${r.name}"
++                                    var syncFailed: String? = null
++                                    // 改名：同步配置里的旧引用（只改库内会让其它位置的 $$旧名 静默失效）
++                                    r.renamedFrom?.let { oldName ->
++                                        runCatching {
++                                            VaultReferenceSync.renameEverywhere(
++                                                settingsStore,
++                                                sshHostRepository,
++                                                telegramBotPreferences,
++                                                oldName,
++                                                r.name,
++                                            )
++                                        }.onFailure { e ->
++                                            if (e is CancellationException) throw e
++                                            syncFailed = e.message
++                                        }
++                                    }
++                                    notice = when {
++                                        syncFailed != null -> "❌ $syncFailed"
++                                        r.renamedFrom != null -> "♻ ${r.renamedFrom} → ${r.name}"
++                                        r.reusedExisting -> "♻ ${r.name}"
++                                        else -> "✅ ${r.name}"
++                                    }
++                                    if (r.endpointStored) {
++                                        onEndpointStored?.invoke(
++                                            REF_PREFIX + r.name,
++                                            "$REF_PREFIX${r.name}.endpoint",
++                                        )
++                                    }
+                                     entries = runCatching { repository.getAll() }.getOrDefault(entries)
+                                 }.onFailure { e ->
+                                     if (e is CancellationException) throw e
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt
+index 0da45a6ca..699ccc6bc 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/VaultCredentialsComponents.kt
+@@ -15,12 +15,14 @@ import androidx.compose.foundation.relocation.bringIntoViewRequester
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.text.input.rememberTextFieldState
+ import androidx.compose.foundation.text.input.setTextAndPlaceCursorAtEnd
++import androidx.compose.foundation.text.selection.SelectionContainer
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.Icon
+ import androidx.compose.material3.IconButton
+ import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.ModalBottomSheet
+ import androidx.compose.material3.OutlinedButton
+ import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.RadioButton
+@@ -67,6 +69,7 @@ import me.rerere.rikkahub.data.vault.CredentialValueSanitizer
+ import me.rerere.rikkahub.data.vault.CredentialVaultRepository
+ import me.rerere.rikkahub.data.vault.SshKeyGenerator
+ import me.rerere.rikkahub.data.vault.CredentialMeta
++import me.rerere.rikkahub.data.vault.CredentialNameNormalizer
+ import me.rerere.rikkahub.data.vault.CredentialType
+ import me.rerere.rikkahub.data.vault.SecretGenerator
+ import me.rerere.rikkahub.data.vault.VaultBiometric
+@@ -109,6 +112,9 @@ internal fun CredentialRow(
+     var biometricEnabled by remember { mutableStateOf(true) }
+     // 导出私钥：弹窗确认后由系统文件选择器选定落地位置
+     var exportDialog by remember { mutableStateOf(false) }
++    // 描述超长时才给展开入口（默认只显示 2 行）；全文在底部卡片里看
++    var descOverflow by remember { mutableStateOf(false) }
++    var showDescSheet by remember { mutableStateOf(false) }
+     var exportContent by remember { mutableStateOf<String?>(null) }
+     val exportLauncher = rememberSafeLauncherForActivityResult(
+         ActivityResultContracts.CreateDocument("application/x-pem-file")
+@@ -206,6 +212,8 @@ internal fun CredentialRow(
+                                 text = groupLabel,
+                                 style = MaterialTheme.typography.labelSmall,
+                                 color = MaterialTheme.colorScheme.onSecondaryContainer,
++                                maxLines = 1,
++                                overflow = TextOverflow.Ellipsis,
+                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                             )
+                         }
+@@ -219,17 +227,37 @@ internal fun CredentialRow(
+                                 text = vaultTypeLabel(context, entry.type),
+                                 style = MaterialTheme.typography.labelSmall,
+                                 color = MaterialTheme.colorScheme.onTertiaryContainer,
++                                maxLines = 1,
++                                overflow = TextOverflow.Ellipsis,
+                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                             )
+                         }
+                     }
+                 }
+                 if (entry.description.isNotBlank()) {
+-                    Text(
+-                        entry.description,
+-                        style = MaterialTheme.typography.bodySmall,
+-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+-                    )
++                    // 描述默认只显示 2 行；超长时点描述区或「展开」弹底部卡片看全文
++                    // （未超长时描述不可点，点行其它位置照常进详情）
++                    Row(
++                        modifier = Modifier.fillMaxWidth(),
++                        verticalAlignment = Alignment.CenterVertically,
++                    ) {
++                        Text(
++                            entry.description,
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant,
++                            maxLines = 2,
++                            overflow = TextOverflow.Ellipsis,
++                            onTextLayout = { descOverflow = it.hasVisualOverflow },
++                            modifier = Modifier
++                                .weight(1f)
++                                .clickable(enabled = descOverflow) { showDescSheet = true },
++                        )
++                        if (descOverflow) {
++                            TextButton(onClick = { showDescSheet = true }) {
++                                Text(stringResource(R.string.vault_desc_expand))
++                            }
++                        }
++                    }
+                 }
+                 // SSH 公钥（明文，公开信息，直接展示；可长按复制）
+                 if (entry.publicKey.isNotBlank()) {
+@@ -292,6 +320,32 @@ internal fun CredentialRow(
+             },
+         )
+     }
++
++    if (showDescSheet) {
++        ModalBottomSheet(onDismissRequest = { showDescSheet = false }) {
++            Column(
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .verticalScroll(rememberScrollState())
++                    .padding(horizontal = 16.dp)
++                    .padding(bottom = 24.dp),
++                verticalArrangement = Arrangement.spacedBy(12.dp),
++            ) {
++                SelectionContainer {
++                    Text(
++                        entry.description,
++                        style = MaterialTheme.typography.bodyMedium,
++                    )
++                }
++                Button(
++                    onClick = {
++                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(entry.description))
++                        android.widget.Toast.makeText(context, resStr(resources, R.string.copied), android.widget.Toast.LENGTH_SHORT).show()
++                    },
++                ) { Text(stringResource(R.string.copy)) }
++            }
++        }
++    }
+ }
+ 
+ /**
+@@ -377,7 +431,9 @@ internal fun CredentialEditorDialog(
+     val valueState = rememberTextFieldState(
+         initialText = (mode as? EditorMode.Edit)?.entry?.let { repository.decryptValue(it) } ?: "",
+     )
+-    var description by remember { mutableStateOf((mode as? EditorMode.Edit)?.entry?.description ?: "") }
++    val descriptionState = rememberTextFieldState(
++        initialText = (mode as? EditorMode.Edit)?.entry?.description ?: "",
++    )
+     val publicKeyState = rememberTextFieldState(
+         initialText = (mode as? EditorMode.Edit)?.entry?.publicKey ?: "",
+     )
+@@ -417,7 +473,8 @@ internal fun CredentialEditorDialog(
+                 OutlinedTextField(
+                     value = name,
+                     onValueChange = {
+-                        name = it.uppercase().replace(Regex("[^A-Z0-9_ ]"), "_").replace(" ", "_")
++                        // 边输边规范化：中文转拼音再折大写蛇形（与 quickImport 同一套规则）
++                        name = CredentialNameNormalizer.foldNameChars(it)
+                         nameError = false
+                     },
+                     label = { Text(stringResource(R.string.vault_editor_name_label)) },
+@@ -464,12 +521,13 @@ internal fun CredentialEditorDialog(
+                         }
+                     }
+                 }
+-                OutlinedTextField(
+-                    value = description,
+-                    onValueChange = { description = it },
+-                    label = { Text(stringResource(R.string.vault_editor_desc_label)) },
+-                    singleLine = true,
+-                    modifier = Modifier.fillMaxWidth(),
++                // 描述多行输入（照值字段的 TextArea：有界高度＋字段内滚动）
++                TextArea(
++                    state = descriptionState,
++                    label = stringResource(R.string.vault_editor_desc_label),
++                    minLines = 2,
++                    maxLines = 6,
++                    modifier = Modifier.then(rememberBringIntoViewModifier()),
+                 )
+                 // SSH 公钥：只对 ssh-key 类型显示（以前无条件渲染 → 每种类型都冒一个公钥框，容易填错）
+                 if (type == CredentialType.SSH_KEY) {
+@@ -625,6 +683,7 @@ internal fun CredentialEditorDialog(
+         onClick = {
+             val value = valueState.text.toString()
+             val publicKey = publicKeyState.text.toString()
++            val description = descriptionState.text.toString()
+             if (name.isBlank()) { nameError = true; return@Button }
+             if (!isEdit && value.isBlank()) { valueError = true; return@Button }
+             // 只含不可见字符的值等于空密钥：与 save/importEntries 同语义，前置拦截
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/BackendProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/BackendProviderConfigure.kt
+index b883a6f98..15e718660 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/BackendProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/BackendProviderConfigure.kt
+@@ -119,6 +119,7 @@ fun BackendProviderConfigure(
+                 onValueChange = { onEdit(provider.copy(token = it.trim())) },
+                 label = stringResource(R.string.backend_token_serve),
+                 nameHint = "BACKEND_TOKEN",
++                groupHint = "Backend",
+             )
+         }
+     }
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
+index 4484a9b1c..a80b5d14a 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigure.kt
+@@ -30,6 +30,8 @@ import me.rerere.hugeicons.stroke.Refresh03
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.datastore.DEFAULT_PROVIDERS
+ import me.rerere.rikkahub.data.datastore.ProviderDescriptors
++import me.rerere.rikkahub.data.vault.CredentialType
++import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
+@@ -365,7 +367,11 @@ private fun String.normalizePath(): String {
+     return path.trimEnd('/')
+ }
+ 
+-internal fun String.isValidBaseUrl(): Boolean = this.toHttpUrlOrNull() != null
++/**
++ * baseUrl 静态校验：`$$名字.endpoint` 引用不是 URL，但解析后才是；
++ * 引用本身的合法性由运行时解析决定，这里不把它标红。
++ */
++internal fun String.isValidBaseUrl(): Boolean = startsWith("\$\$") || this.toHttpUrlOrNull() != null
+ 
+ private const val OPENAI_OFFICIAL_HOST = "api.openai.com"
+ private const val GOOGLE_OFFICIAL_HOST = "generativelanguage.googleapis.com"
+@@ -386,6 +392,8 @@ private fun ProviderConfigureOpenAI(
+ ) {
+     val toaster = LocalToaster.current
+     val responseAPIWarning = stringResource(R.string.setting_provider_page_response_api_warning)
++    // 端点可能是 $$名字.endpoint 引用：host 判断按解析后的地址算（解析不到时原样返回，行为不变）
++    val resolvedBaseUrlHost = VaultProviderKeyRefs.resolveValue(provider.baseUrl).toHttpUrlOrNull()?.host
+ 
+     ProviderDescriptors.get(provider.id).description()
+ 
+@@ -414,6 +422,15 @@ private fun ProviderConfigureOpenAI(
+                 onValueChange = { onEdit(provider.copy(apiKey = it.trim())) },
+                 label = stringResource(R.string.setting_provider_page_api_key),
+                 nameHint = provider.name,
++                groupHint = "AI",
++                importType = CredentialType.API_KEY,
++                // 自定义端点才入库：默认地址不需要存引用（重置后就是它）
++                endpointHint = provider.baseUrl.takeIf {
++                    it.isNotBlank() && it != provider.defaultBaseUrlForReset()
++                },
++                onEndpointStored = { apiKeyRef, endpointRef ->
++                    onEdit(provider.copy(apiKey = apiKeyRef, baseUrl = endpointRef))
++                },
+             )
+         }
+         formItem(
+@@ -455,7 +472,7 @@ private fun ProviderConfigureOpenAI(
+             checked = provider.useResponseApi,
+             onCheckedChange = {
+                 onEdit(provider.copy(useResponseApi = it))
+-                if (it && provider.baseUrl.toHttpUrlOrNull()?.host != "api.openai.com") {
++                if (it && resolvedBaseUrlHost != "api.openai.com") {
+                     toaster.show(message = responseAPIWarning, type = ToastType.Warning)
+                 }
+             },
+@@ -466,7 +483,7 @@ private fun ProviderConfigureOpenAI(
+             onCheckedChange = { onEdit(provider.copy(includeHistoryReasoning = it)) },
+             headlineContent = { Text(stringResource(R.string.setting_provider_page_include_history_reasoning)) },
+         )
+-        if (provider.baseUrl.toHttpUrlOrNull()?.host == "openrouter.ai") {
++        if (resolvedBaseUrlHost == "openrouter.ai") {
+             switchItem(
+                 checked = provider.promptCaching,
+                 onCheckedChange = { onEdit(provider.copy(promptCaching = it)) },
+@@ -475,7 +492,7 @@ private fun ProviderConfigureOpenAI(
+         }
+     }
+ 
+-    if (provider.baseUrl.toHttpUrlOrNull()?.host == "openrouter.ai") {
++    if (resolvedBaseUrlHost == "openrouter.ai") {
+         OpenRouterRoutingSection(
+             routing = provider.routing,
+             onChange = { onEdit(provider.copy(routing = it)) },
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigureCloud.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigureCloud.kt
+index 00ee9cbfe..f95f4f8cc 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigureCloud.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/components/ProviderConfigureCloud.kt
+@@ -21,6 +21,7 @@ import me.rerere.hugeicons.HugeIcons
+ import me.rerere.hugeicons.stroke.FileImport
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.datastore.ProviderDescriptors
++import me.rerere.rikkahub.data.vault.CredentialType
+ import me.rerere.rikkahub.ui.components.ui.CardGroup
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceButtons
+ import me.rerere.rikkahub.ui.components.ui.ConnectedChoiceLabel
+@@ -61,6 +62,14 @@ internal fun ProviderConfigureClaude(
+                 onValueChange = { onEdit(provider.copy(apiKey = it.trim())) },
+                 label = stringResource(R.string.setting_provider_page_api_key),
+                 nameHint = provider.name,
++                groupHint = "AI",
++                importType = CredentialType.API_KEY,
++                endpointHint = provider.baseUrl.takeIf {
++                    it.isNotBlank() && it != provider.defaultBaseUrlForReset()
++                },
++                onEndpointStored = { apiKeyRef, endpointRef ->
++                    onEdit(provider.copy(apiKey = apiKeyRef, baseUrl = endpointRef))
++                },
+             )
+         }
+         formItem(
+@@ -181,6 +190,14 @@ internal fun ProviderConfigureGoogle(
+                     onValueChange = { onEdit(provider.copy(apiKey = it.trim())) },
+                     label = stringResource(R.string.setting_provider_page_api_key),
+                     nameHint = provider.name,
++                    groupHint = "AI",
++                    importType = CredentialType.API_KEY,
++                    endpointHint = provider.baseUrl.takeIf {
++                        it.isNotBlank() && it != provider.defaultBaseUrlForReset()
++                    },
++                    onEndpointStored = { apiKeyRef, endpointRef ->
++                        onEdit(provider.copy(apiKey = apiKeyRef, baseUrl = endpointRef))
++                    },
+                 )
+             }
+         }
+@@ -193,11 +210,11 @@ internal fun ProviderConfigureGoogle(
+                     onValueChange = { onEdit(provider.copy(baseUrl = it.trim())) },
+                     modifier = Modifier.fillMaxWidth(),
+                     isError =
+-                        provider.baseUrl.isNotBlank() && (
++                        provider.baseUrl.isNotBlank() && !provider.baseUrl.startsWith("\$\$") && (
+                             !provider.baseUrl.isValidBaseUrl() || !provider.baseUrl.endsWith("/v1beta")
+                         ),
+                     supportingText =
+-                        if (!provider.baseUrl.endsWith("/v1beta")) {
++                        if (!provider.baseUrl.startsWith("\$\$") && !provider.baseUrl.endsWith("/v1beta")) {
+                             { Text(stringResource(R.string.setting_provider_page_base_url_v1beta_hint)) }
+                         } else {
+                             null
+diff --git a/app/src/main/java/me/rerere/rikkahub/utils/ProviderIconOverride.kt b/app/src/main/java/me/rerere/rikkahub/utils/ProviderIconOverride.kt
+index ce819cecd..96ee498f5 100644
+--- a/app/src/main/java/me/rerere/rikkahub/utils/ProviderIconOverride.kt
++++ b/app/src/main/java/me/rerere/rikkahub/utils/ProviderIconOverride.kt
+@@ -1,6 +1,7 @@
+ package me.rerere.rikkahub.utils
+ 
+ import me.rerere.ai.provider.ProviderSetting
++import me.rerere.rikkahub.data.vault.VaultProviderKeyRefs
+ 
+ /**
+  * 提供商图标覆盖值的编解码与解析（纯函数，可在 JVM 单测里跑）。
+@@ -95,11 +96,12 @@ fun resolveModelIcon(
+  *
+  * 只有基于 HTTP 的提供商有端点；本地模型（LiteRt / LlamaCpp）没有，
+  * 返回 null 时匹配逻辑会退回按名字匹配。
++ * 端点可能是 `$$名字.endpoint` 引用：先解析再返回，否则域名匹配不到。
+  */
+ fun ProviderSetting.baseUrlOrNull(): String? = when (this) {
+-    is ProviderSetting.OpenAI -> baseUrl
+-    is ProviderSetting.Google -> baseUrl
+-    is ProviderSetting.Claude -> baseUrl
+-    is ProviderSetting.Backend -> baseUrl
++    is ProviderSetting.OpenAI -> VaultProviderKeyRefs.resolveValue(baseUrl)
++    is ProviderSetting.Google -> VaultProviderKeyRefs.resolveValue(baseUrl)
++    is ProviderSetting.Claude -> VaultProviderKeyRefs.resolveValue(baseUrl)
++    is ProviderSetting.Backend -> VaultProviderKeyRefs.resolveValue(baseUrl)
+     else -> null
+ }
+diff --git a/app/src/main/res/values-ar/strings.xml b/app/src/main/res/values-ar/strings.xml
+index a3ee67633..6cb6492dd 100644
+--- a/app/src/main/res/values-ar/strings.xml
++++ b/app/src/main/res/values-ar/strings.xml
+@@ -532,6 +532,7 @@
+   <string name="code_block_collapse">طي</string>
+   <string name="code_block_copy">نسخ الشيفرة</string>
+   <string name="code_block_expand">توسيع</string>
++  <string name="vault_desc_expand">توسيع</string>
+   <string name="code_block_preview">معاينة</string>
+   <string name="collapse_translation">طي الترجمة</string>
+   <string name="confirm">تأكيد</string>
+diff --git a/app/src/main/res/values-b+zh+Hant/strings.xml b/app/src/main/res/values-b+zh+Hant/strings.xml
+index 5678877d1..943ff102c 100644
+--- a/app/src/main/res/values-b+zh+Hant/strings.xml
++++ b/app/src/main/res/values-b+zh+Hant/strings.xml
+@@ -404,6 +404,7 @@
+   <string name="code_block_collapse">摺疊</string>
+   <string name="code_block_copy">複製代碼</string>
+   <string name="code_block_expand">展開</string>
++  <string name="vault_desc_expand">展開</string>
+   <string name="code_block_preview">預覽</string>
+   <string name="collapse_translation">收合翻譯</string>
+   <string name="confirm">確認</string>
+diff --git a/app/src/main/res/values-ja/strings.xml b/app/src/main/res/values-ja/strings.xml
+index f2217850b..fed3e7433 100644
+--- a/app/src/main/res/values-ja/strings.xml
++++ b/app/src/main/res/values-ja/strings.xml
+@@ -414,6 +414,7 @@
+   <string name="code_block_collapse">折りたたむ</string>
+   <string name="code_block_copy">コードをコピー</string>
+   <string name="code_block_expand">展開</string>
++  <string name="vault_desc_expand">展開</string>
+   <string name="code_block_preview">プレビュー</string>
+   <string name="collapse_translation">翻訳を折りたたむ</string>
+   <string name="confirm">確認</string>
+diff --git a/app/src/main/res/values-ko-rKR/strings.xml b/app/src/main/res/values-ko-rKR/strings.xml
+index 707425019..6929b9f43 100644
+--- a/app/src/main/res/values-ko-rKR/strings.xml
++++ b/app/src/main/res/values-ko-rKR/strings.xml
+@@ -414,6 +414,7 @@
+   <string name="code_block_collapse">접기</string>
+   <string name="code_block_copy">코드 복사</string>
+   <string name="code_block_expand">펼치기</string>
++  <string name="vault_desc_expand">펼치기</string>
+   <string name="code_block_preview">미리보기</string>
+   <string name="collapse_translation">번역 접기</string>
+   <string name="confirm">확인</string>
+diff --git a/app/src/main/res/values-ru/strings.xml b/app/src/main/res/values-ru/strings.xml
+index 42384c83f..391961b4c 100644
+--- a/app/src/main/res/values-ru/strings.xml
++++ b/app/src/main/res/values-ru/strings.xml
+@@ -409,6 +409,7 @@
+   <string name="code_block_collapse">Свернуть</string>
+   <string name="code_block_copy">Копировать код</string>
+   <string name="code_block_expand">Развернуть</string>
++  <string name="vault_desc_expand">Развернуть</string>
+   <string name="code_block_preview">Предпросмотр</string>
+   <string name="collapse_translation">Свернуть перевод</string>
+   <string name="confirm">Подтвердить</string>
+diff --git a/app/src/main/res/values-zh/strings.xml b/app/src/main/res/values-zh/strings.xml
+index de030bb81..eb38fed90 100644
+--- a/app/src/main/res/values-zh/strings.xml
++++ b/app/src/main/res/values-zh/strings.xml
+@@ -530,6 +530,7 @@
+   <string name="code_block_collapse">折叠</string>
+   <string name="code_block_copy">复制代码</string>
+   <string name="code_block_expand">展开</string>
++  <string name="vault_desc_expand">展开</string>
+   <string name="code_block_preview">预览</string>
+   <string name="collapse_translation">折叠翻译</string>
+   <string name="confirm">确认</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 22cf6ddda..528b98cee 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -532,6 +532,7 @@
+   <string name="code_block_collapse">Collapse</string>
+   <string name="code_block_copy">Copy Code</string>
+   <string name="code_block_expand">Expand</string>
++  <string name="vault_desc_expand">Expand</string>
+   <string name="code_block_preview">Preview</string>
+   <string name="collapse_translation">Collapse Translation</string>
+   <string name="confirm">Confirm</string>
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizerIcuTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizerIcuTest.kt
+new file mode 100644
+index 000000000..d9a1f5aa2
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizerIcuTest.kt
+@@ -0,0 +1,35 @@
++package me.rerere.rikkahub.data.vault
++
++import android.app.Application
++import org.junit.Assert.assertEquals
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.annotation.Config
++
++/**
++ * 真实 ICU 音译的契约（Robolectric，跑真 `android.icu.text.Transliterator`）。
++ *
++ * 只钉"中文 → 拼音大写蛇形"这一条，不钉具体音节切分之外的任何细节：
++ * 若 ICU 版本变了输出形态（比如音节间不再空格），这里先报错、再按实测改期望，
++ * 而不是让 `normalizeName` 静默退回 CRED。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [35], manifest = Config.NONE, application = Application::class)
++class CredentialNameNormalizerIcuTest {
++
++    @Test
++    fun `qiniu cloud transliterates to pinyin`() {
++        assertEquals("QI_NIU_YUN", CredentialNameNormalizer.normalizeName("七牛云"))
++    }
++
++    @Test
++    fun `shangtang transliterates to pinyin`() {
++        assertEquals("SHANG_TANG", CredentialNameNormalizer.normalizeName("商汤"))
++    }
++
++    @Test
++    fun `mixed chinese and latin transliterates`() {
++        assertEquals("AI_SI_API", CredentialNameNormalizer.normalizeName("爱思API"))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizerTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizerTest.kt
+new file mode 100644
+index 000000000..b4b678532
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/CredentialNameNormalizerTest.kt
+@@ -0,0 +1,118 @@
++package me.rerere.rikkahub.data.vault
++
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * 凭证名规范化的纯函数契约（纯 JVM，不碰 ICU：中文用注入的假音译）。
++ *
++ * 钉住三条：
++ * - 中文先转拼音再折大写蛇形（七牛云 → QI_NIU_YUN），而不是旧的"非法字符一刀切"
++ *   （中文整段被换成下划线、最后只剩 CRED，所有纯中文名撞同一个名字）；
++ * - 退化名（CRED / CRED_UNNAMED / CRED_2）只来自"没有任何可用字符"的输入；
++ * - 重名加 `_2`/`_3` 后缀，不超 64 字符。
++ *
++ * 真实 ICU 的行为（音节间是否空格、声调剥离）由 [CredentialNameNormalizerIcuTest] 钉。
++ */
++class CredentialNameNormalizerTest {
++
++    /** 假音译：按音节拼（空格只留在音节之间，与真实 Han-Latin 的输出形态一致）。 */
++    private val fakeTransliterate: (String) -> String = { raw ->
++        buildString {
++            var pendingSpace = false
++            for (c in raw) {
++                val syllable = when (c) {
++                    '七' -> "qi"
++                    '牛' -> "niu"
++                    '云' -> "yun"
++                    '商' -> "shang"
++                    '汤' -> "tang"
++                    '爱' -> "ai"
++                    '思' -> "si"
++                    else -> null
++                }
++                if (syllable != null) {
++                    if (pendingSpace) append(" ")
++                    append(syllable)
++                    pendingSpace = true
++                } else {
++                    append(c)
++                    pendingSpace = false
++                }
++            }
++        }
++    }
++
++    @Test
++    fun `ascii name is uppercased as before`() {
++        assertEquals("DEEPSEEK_API_KEY", CredentialNameNormalizer.normalizeName("deepseek_api_key"))
++    }
++
++    @Test
++    fun `chinese name becomes pinyin`() {
++        assertEquals("QI_NIU_YUN", CredentialNameNormalizer.normalizeName("七牛云", fakeTransliterate))
++    }
++
++    @Test
++    fun `mixed chinese and latin keeps both`() {
++        assertEquals("QI_NIU_YUNAPI", CredentialNameNormalizer.normalizeName("七牛云API", fakeTransliterate))
++    }
++
++    @Test
++    fun `empty input falls back to unnamed`() {
++        assertEquals("CRED_UNNAMED", CredentialNameNormalizer.normalizeName(""))
++        assertEquals("CRED_UNNAMED", CredentialNameNormalizer.normalizeName("   "))
++    }
++
++    @Test
++    fun `symbols only fall back to unnamed`() {
++        assertEquals("CRED_UNNAMED", CredentialNameNormalizer.normalizeName("!!!"))
++    }
++
++    @Test
++    fun `leading digits get a prefix`() {
++        assertEquals("CRED_123ABC", CredentialNameNormalizer.normalizeName("123abc"))
++    }
++
++    @Test
++    fun `long names truncate to 64 chars`() {
++        val name = CredentialNameNormalizer.normalizeName("a".repeat(100))
++        assertEquals("A".repeat(64), name)
++    }
++
++    @Test
++    fun `fold keeps spaces as underscores for live typing`() {
++        assertEquals("QI_NIU_YUN", CredentialNameNormalizer.foldNameChars("七牛云", fakeTransliterate))
++        assertEquals("ABC_DEF", CredentialNameNormalizer.foldNameChars("abc def"))
++    }
++
++    @Test
++    fun `degenerate names are only the empty-input fallbacks`() {
++        assertTrue(CredentialNameNormalizer.isDegenerateName("CRED"))
++        assertTrue(CredentialNameNormalizer.isDegenerateName("CRED_UNNAMED"))
++        assertTrue(CredentialNameNormalizer.isDegenerateName("CRED_2"))
++        assertFalse(CredentialNameNormalizer.isDegenerateName("QI_NIU_YUN"))
++        assertFalse(CredentialNameNormalizer.isDegenerateName("CRED_ABC"))
++        assertFalse(CredentialNameNormalizer.isDegenerateName("MY_CRED"))
++    }
++
++    @Test
++    fun `unique name appends numeric suffix`() = runBlocking {
++        val taken = mutableSetOf("QI_NIU_YUN")
++        assertEquals("QI_NIU_YUN_2", CredentialNameNormalizer.uniqueName("QI_NIU_YUN") { it in taken })
++        taken += "QI_NIU_YUN_2"
++        assertEquals("QI_NIU_YUN_3", CredentialNameNormalizer.uniqueName("QI_NIU_YUN") { it in taken })
++    }
++
++    @Test
++    fun `unique name keeps a free base and respects the 64 char cap`() = runBlocking {
++        assertEquals("FREE_NAME", CredentialNameNormalizer.uniqueName("FREE_NAME") { false })
++        val longBase = "A".repeat(64)
++        val suffixed = CredentialNameNormalizer.uniqueName(longBase) { it == longBase }
++        assertEquals(64, suffixed.length)
++        assertTrue(suffixed.endsWith("_2"))
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/QuickImportTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/QuickImportTest.kt
+new file mode 100644
+index 000000000..943e1816f
+--- /dev/null
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/QuickImportTest.kt
+@@ -0,0 +1,265 @@
++package me.rerere.rikkahub.data.vault
++
++import android.app.Application
++import android.content.Context
++import android.os.Looper
++import java.security.Security
++import javax.crypto.KeyGenerator
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.SupervisorJob
++import kotlinx.coroutines.async
++import kotlinx.coroutines.runBlocking
++import me.rerere.ai.util.ProviderKeyRefs
++import me.rerere.rikkahub.data.datastore.ProviderCredentialCipher
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsKeyStore
++import me.rerere.rikkahub.data.datastore.SyntheticSettingsSecurityProvider
++import me.rerere.rikkahub.data.db.dao.VaultAuditLogDao
++import me.rerere.rikkahub.data.db.dao.VaultCredentialDao
++import me.rerere.rikkahub.data.db.entity.VaultAuditLogEntity
++import me.rerere.rikkahub.data.db.entity.VaultCredentialEntity
++import org.junit.After
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import org.robolectric.RuntimeEnvironment
++import org.robolectric.Shadows.shadowOf
++import org.robolectric.annotation.Config
++import javax.crypto.spec.SecretKeySpec
++
++/**
++ * `quickImport` 的契约（Robolectric + 内存 fake DAO，跑真加密/真指纹）。
++ *
++ * 钉住本次修的四条：
++ * - 中文名入库不再撞 CRED（七牛云 → QI_NIU_YUN）；
++ * - 同名不同值加 `_2` 后缀，不再静默覆盖旧值；
++ * - 同值重导：非退化名静默复用，退化名（CRED）改名为新名；
++ * - 端点随 key 一起入库（新建写 `endpoint` 元数据，重导合并进已有条目）。
++ *
++ * `save()` 会往全局 [ProviderKeyRefs] 装解析钩子，tearDown 必须还原，
++ * 否则污染其它用例。
++ */
++@RunWith(RobolectricTestRunner::class)
++@Config(sdk = [35], manifest = Config.NONE, application = Application::class)
++class QuickImportTest {
++    private val workers = CoroutineScope(SupervisorJob() + Dispatchers.IO)
++    private val context: Context get() = RuntimeEnvironment.getApplication()
++    private lateinit var securityProvider: SyntheticSettingsSecurityProvider
++
++    /**
++     * 值加密走真 [ProviderCredentialCipher]，密钥源是 AndroidKeyStore——Robolectric 下没有，
++     * 故注册与 `ProviderFieldEncryptionTest` 同款合成 JCA provider（只含测试密钥，无真实凭据），
++     * 让 `KeyStore.getInstance("AndroidKeyStore")` 返回合成密钥。
++     */
++    @Before
++    fun setUp() {
++        securityProvider = SyntheticSettingsSecurityProvider()
++        Security.insertProviderAt(securityProvider, 1)
++        SyntheticSettingsKeyStore.key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
++        SyntheticSettingsKeyStore.unavailable = false
++        ProviderCredentialCipher.clearDegradedStateForTest()
++    }
++
++    /** Pump Android Main while real DataStore work proceeds on IO. No coroutine implementation is mocked. */
++    private fun <T> perform(block: suspend () -> T): T {
++        val task = workers.async { block() }
++        val deadline = System.nanoTime() + 30_000_000_000L
++        while (!task.isCompleted && System.nanoTime() < deadline) {
++            shadowOf(Looper.getMainLooper()).idle()
++            Thread.sleep(5)
++        }
++        check(task.isCompleted) { "QuickImport operation timed out" }
++        return runBlocking { task.await() }
++    }
++
++    /** fake DAO 的读操作也是 suspend，测试体里经此助手读。 */
++    private fun entry(dao: FakeVaultDao, name: String): VaultCredentialEntity? =
++        perform { dao.getByName(name) }
++
++    private class FakeVaultDao : VaultCredentialDao {
++        val store = LinkedHashMap<String, VaultCredentialEntity>()
++        private var nextId = 1L
++
++        override suspend fun getAll(): List<VaultCredentialEntity> =
++            store.values.sortedWith(compareBy({ it.grp }, { it.name }))
++
++        override suspend fun getByName(name: String): VaultCredentialEntity? = store[name]
++
++        override suspend fun upsert(entry: VaultCredentialEntity): Long {
++            val id = if (entry.id == 0L) nextId++ else entry.id
++            store[entry.name] = entry.copy(id = id)
++            return id
++        }
++
++        override suspend fun insertIfAbsent(entry: VaultCredentialEntity): Long {
++            check(!store.containsKey(entry.name)) { "UNIQUE constraint failed: vault_credentials.name" }
++            return upsert(entry)
++        }
++
++        override suspend fun update(entry: VaultCredentialEntity) {
++            store[entry.name] = entry
++        }
++
++        override suspend fun updateAll(entries: List<VaultCredentialEntity>) {
++            entries.forEach { store[it.name] = it }
++        }
++
++        override suspend fun delete(entry: VaultCredentialEntity) {
++            store.remove(entry.name)
++        }
++
++        override suspend fun count(): Int = store.size
++        override suspend fun clearAll() = store.clear()
++    }
++
++    private class FakeAuditDao : VaultAuditLogDao {
++        override suspend fun getRecent(limit: Int): List<VaultAuditLogEntity> = emptyList()
++        override suspend fun queryAudit(
++            credential: String,
++            action: String,
++            sinceMs: Long,
++            limit: Int,
++        ): List<VaultAuditLogEntity> = emptyList()
++
++        override suspend fun insert(entry: VaultAuditLogEntity) = Unit
++        override suspend fun deleteOlderThan(cutoffMs: Long, protectedActions: List<String>) = Unit
++        override suspend fun trimTo(keep: Int, protectedActions: List<String>) = Unit
++        override suspend fun count(): Int = 0
++        override suspend fun findRollupTarget(
++            credentialName: String,
++            caller: String,
++            action: String,
++            conversationId: String?,
++            sinceMs: Long,
++        ): VaultAuditLogEntity? = null
++
++        override suspend fun bumpCount(id: Long, nowMs: Long) = Unit
++        override suspend fun clearAll() = Unit
++    }
++
++    private fun repository(dao: FakeVaultDao): CredentialVaultRepository =
++        CredentialVaultRepository(
++            dao = dao,
++            auditDao = FakeAuditDao(),
++            vaultPreferences = VaultPreferences(context),
++            fingerprintKeyProvider = { SecretKeySpec(ByteArray(32) { 7 }, "HmacSHA256") },
++        )
++
++    @After
++    fun tearDown() {
++        ProviderKeyRefs.resolve = null
++        ProviderKeyRefs.onExpanded = null
++        VaultProviderKeyRefs.replaceCacheForTest(emptyMap())
++        ProviderCredentialCipher.clearDegradedStateForTest()
++        SyntheticSettingsKeyStore.key = null
++        SyntheticSettingsKeyStore.unavailable = false
++        Security.removeProvider(securityProvider.name)
++    }
++
++    @Test
++    fun `chinese name becomes pinyin instead of CRED`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        val result = perform {
++            repo.quickImport("sk-qiniu-1", preferredName = "七牛云", group = "AI", type = "api-key")
++        }
++        assertEquals("QI_NIU_YUN", result.name)
++        assertFalse(result.reusedExisting)
++        perform {
++            val entry = dao.getByName("QI_NIU_YUN")
++            assertEquals("AI", entry?.grp)
++            assertEquals("api-key", entry?.type)
++        }
++    }
++
++    @Test
++    fun `same name different value gets numeric suffix instead of overwriting`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        val first = perform { repo.quickImport("sk-first", preferredName = "七牛云") }
++        val second = perform { repo.quickImport("sk-second", preferredName = "七牛云") }
++        assertEquals("QI_NIU_YUN", first.name)
++        assertEquals("QI_NIU_YUN_2", second.name)
++        assertFalse(second.reusedExisting)
++        perform {
++            assertEquals("sk-first", repo.decryptValue(dao.getByName("QI_NIU_YUN")!!))
++            assertEquals("sk-second", repo.decryptValue(dao.getByName("QI_NIU_YUN_2")!!))
++        }
++    }
++
++    @Test
++    fun `reimport same value reuses a non-degenerate name`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        perform { repo.quickImport("sk-same", preferredName = "七牛云") }
++        val reused = perform { repo.quickImport("sk-same", preferredName = "商汤") }
++        assertTrue(reused.reusedExisting)
++        assertEquals("QI_NIU_YUN", reused.name)
++        assertNull(reused.renamedFrom)
++        assertEquals(1, dao.store.size)
++    }
++
++    @Test
++    fun `reimport with a new name renames a degenerate entry`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        val created = perform { repo.quickImport("sk-rename-1", preferredName = "!!!") }
++        assertEquals("CRED_UNNAMED", created.name)
++        val renamed = perform { repo.quickImport("sk-rename-1", preferredName = "七牛云") }
++        assertEquals("CRED_UNNAMED", renamed.renamedFrom)
++        assertEquals("QI_NIU_YUN", renamed.name)
++        assertTrue(renamed.reusedExisting)
++        perform {
++            assertNull(dao.getByName("CRED_UNNAMED"))
++            assertEquals("sk-rename-1", repo.decryptValue(dao.getByName("QI_NIU_YUN")!!))
++        }
++    }
++
++    @Test
++    fun `endpoint is stored on create and merged on reimport`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        val created = perform {
++            repo.quickImport(
++                "sk-endpoint-1",
++                preferredName = "七牛云",
++                endpoint = "https://api.qiniu.com/v1",
++            )
++        }
++        assertTrue(created.endpointStored)
++        assertEquals("https://api.qiniu.com/v1", CredentialMeta.decode(entry(dao, "QI_NIU_YUN")!!.metaJson)["endpoint"])
++        val merged = perform {
++            repo.quickImport(
++                "sk-endpoint-1",
++                preferredName = "七牛云",
++                endpoint = "https://api2.qiniu.com/v1",
++            )
++        }
++        assertTrue(merged.reusedExisting)
++        assertTrue(merged.endpointStored)
++        val meta = CredentialMeta.decode(entry(dao, "QI_NIU_YUN")!!.metaJson)
++        assertEquals("https://api2.qiniu.com/v1", meta["endpoint"])
++        assertEquals("sk-endpoint-1", repo.decryptValue(entry(dao, "QI_NIU_YUN")!!))
++    }
++
++    @Test
++    fun `group defaults to Other when not specified`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        perform { repo.quickImport("sk-group-1", preferredName = "SOME_KEY") }
++        assertEquals("Other", entry(dao, "SOME_KEY")?.grp)
++    }
++
++    @Test
++    fun `explicit type wins over inference`() {
++        val dao = FakeVaultDao()
++        val repo = repository(dao)
++        perform { repo.quickImport("sk-type-1", preferredName = "QINIUYUN", type = "api-key") }
++        assertEquals("api-key", entry(dao, "QINIUYUN")?.type)
++    }
++}
+diff --git a/app/src/test/java/me/rerere/rikkahub/data/vault/VaultReferenceSyncTest.kt b/app/src/test/java/me/rerere/rikkahub/data/vault/VaultReferenceSyncTest.kt
+index 7a9c99d9f..28e01b5db 100644
+--- a/app/src/test/java/me/rerere/rikkahub/data/vault/VaultReferenceSyncTest.kt
++++ b/app/src/test/java/me/rerere/rikkahub/data/vault/VaultReferenceSyncTest.kt
+@@ -27,6 +27,15 @@ class VaultReferenceSyncTest {
+         )
+     }
+ 
++    @Test
++    fun `renames a dotted field reference`() {
++        // 端点引用 `$$旧名.endpoint`：改名后字段后缀保留，只换名字（baseUrl 改名同步就靠这条）
++        assertEquals(
++            "\$\$NEW_NAME.endpoint",
++            VaultReferenceSync.renameInText("\$\$OLD_NAME.endpoint", "OLD_NAME", "NEW_NAME"),
++        )
++    }
++
+     @Test
+     fun `does not touch a longer name sharing the prefix`() {
+         assertEquals(
